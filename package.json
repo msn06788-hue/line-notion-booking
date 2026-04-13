@@ -1,0 +1,9 @@
+{
+  "name": "line-notion-booking",
+  "version": "1.0.0",
+  "dependencies": {
+    "@line/bot-sdk": "^7.5.2",
+    "@notionhq/client": "^2.2.3",
+    "express": "^4.18.2"
+  }
+}
