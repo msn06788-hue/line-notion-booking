@@ -21,15 +21,15 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text;
 
-        // 1. 觸發價目表
+      // 1. 處理「價目表」
         if (text === '價目表') {
           await client.replyMessage(event.replyToken, {
             type: 'image',
-            originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/%E5%83%B9%E7%9B%AE%E8%A1%A8.png", 
-            previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/%E5%83%B9%E7%9B%AE%E8%A1%A8.png"
+            // 使用新的英文檔名網址
+            originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png", 
+            previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
           });
         }
-
         // 2. 觸發預約功能
         else if (text === '我要預約') {
           await client.replyMessage(event.replyToken, {
