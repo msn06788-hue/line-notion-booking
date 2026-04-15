@@ -1,6 +1,8 @@
+const express = require('express');
 const { Client } = require('@notionhq/client');
 const line = require('@line/bot-sdk');
 
+const app = express();
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 const lineConfig = {
@@ -10,12 +12,13 @@ const lineConfig = {
 
 const client = new line.Client(lineConfig);
 
-module.exports = async (req, res) => {
-  if (req.method === 'POST') {
+// 處理 LINE Webhook
+app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
+  try {
     const events = req.body.events;
-
     for (let event of events) {
-      // 1. 處理「我要預約」暗號 (請確保 LINE 後台動作也是這四個字)
+      
+      // 1. 處理「我要預約」暗號
       if (event.type === 'message' && event.message.text === '我要預約') {
         await client.replyMessage(event.replyToken, {
           type: "template",
@@ -34,30 +37,31 @@ module.exports = async (req, res) => {
         });
       }
 
-      // 2. 處理月曆選完後的結果
+      // 2. 處理月曆選完後的結果 (Postback)
       if (event.type === 'postback') {
         const selectedTime = event.postback.params.datetime.replace('T', ' ');
         
-        try {
-          // 寫入 Notion
-          await notion.pages.create({
-            parent: { database_id: process.env.NOTION_DATABASE_ID },
-            properties: {
-              "名稱": { title: [{ text: { content: "選單預約客戶" } }] },
-              "時間": { rich_text: [{ text: { content: selectedTime } }] }
-            }
-          });
+        // 寫入 Notion
+        await notion.pages.create({
+          parent: { database_id: process.env.NOTION_DATABASE_ID },
+          properties: {
+            "名稱": { title: [{ text: { content: "選單預約客戶" } }] },
+            "時間": { rich_text: [{ text: { content: selectedTime } }] }
+          }
+        });
 
-          // 回覆成功訊息
-          await client.replyMessage(event.replyToken, {
-            type: 'text',
-            text: `✅ 預約登記成功！\n時間：${selectedTime}`
-          });
-        } catch (error) {
-          console.error('Notion 寫入失敗:', error);
-        }
+        // 回覆成功訊息
+        await client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `✅ 預約登記成功！\n時間：${selectedTime}`
+        });
       }
     }
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('發生錯誤:', error);
+    res.status(500).send('Error');
   }
-  res.status(200).send('OK');
-};
+});
+
+module.exports = app;
