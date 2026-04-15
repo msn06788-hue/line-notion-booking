@@ -16,8 +16,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
     const events = req.body.events;
     for (let event of events) {
-      
-      // 1. 文字訊息處理
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text;
         if (text === '價目表') {
@@ -26,8 +24,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
             previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
           });
-        } 
-        else if (text === '我要預約') {
+        } else if (text === '我要預約') {
           await client.replyMessage(event.replyToken, {
             type: "template", altText: "請選擇預約時間",
             template: {
@@ -38,46 +35,40 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         }
       }
 
-      // 2. 預約送出 (Postback) - 關鍵互通邏輯
       if (event.type === 'postback') {
-        const rawTime = event.postback.params.datetime; // 格式: 2026-04-15T10:00
+        const rawTime = event.postback.params.datetime;
         const displayTime = rawTime.replace('T', ' ');
 
-        // --- 防重複檢查 ---
-        const checkDuplicate = await notion.databases.query({
+        // 防撞檢查
+        const query = await notion.databases.query({
           database_id: process.env.NOTION_DATABASE_ID,
-          filter: {
-            property: "時間", // 這裡必須跟你 Notion 的欄位名稱一模一樣
-            date: { equals: rawTime } 
-          }
+          filter: { property: "時間", date: { equals: rawTime } } 
         });
 
-        if (checkDuplicate.results.length > 0) {
+        if (query.results.length > 0) {
           await client.replyMessage(event.replyToken, {
-            type: 'text',
-            text: `⚠️ 抱歉！${displayTime} 已被預約。\n請參考選單中的「預約進度」另選時段。`
+            type: 'text', text: `⚠️ 抱歉！${displayTime} 已被預約。\n請另選時段喔！`
           });
           return;
         }
 
-        // --- 寫入 Notion (日期類型專用格式) ---
+        // 寫入 Notion (日期格式)
         await notion.pages.create({
           parent: { database_id: process.env.NOTION_DATABASE_ID },
           properties: {
             "名稱": { title: [{ text: { content: "客戶預約" } }] },
-            "時間": { date: { start: rawTime } } // 這裡改用 date 格式傳輸
+            "時間": { date: { start: rawTime } } 
           }
         });
 
         await client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: `✅ 預約成功！\n預約時間：${displayTime}\n系統已同步至日曆。`
+          type: 'text', text: `✅ 預約成功！\n時間：${displayTime}`
         });
       }
     }
     res.status(200).send('OK');
   } catch (error) {
-    console.error('錯誤:', error);
+    console.error('Error:', error);
     res.status(500).send('Error');
   }
 });
