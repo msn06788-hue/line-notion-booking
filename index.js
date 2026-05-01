@@ -78,7 +78,6 @@ const HOURLY_SLOTS = [
   { label: '20:00~21:00', period: 'evening' },
 ];
 
-// ── 價格表 ────────────────────────────────────────────────
 const PRICES = {
   fixed: {
     weekday: { morning: 4200, afternoon: 4800, evening: 5400, fullday: 8400 },
@@ -129,18 +128,18 @@ async function getBookedSlots(date) {
   }
 }
 
-// ── 核心修正：將「人數」欄位改為符合 Notion 數字屬性的格式 ──────────────────────────
+// ── 關鍵修復：針對「人數」欄位修改資料類型 ─────────────────────────────────────────
 async function createBooking(booking) {
   try {
     await notion.pages.create({
       parent: { database_id: DATABASE_ID },
       properties: {
         '預約姓名': { title: [{ text: { content: booking.name || '未提供' } }] },
-        '預約日期': { date: { start: booking.date } },
+        '預約日期': { date: { start: booking.date } }, 
         '預約時段': { select: { name: booking.slot } },
         '聯絡電話': { phone_number: booking.phone || '' },
         '預約類型': { select: { name: booking.slotType || '固定時段' } },
-        // 修正點：Notion 數字欄位必須使用 { number: 數值 } 格式
+        // 核心修正點：根據截圖報錯，將 rich_text 改為 number 物件
         '人數':     { number: Number(booking.headcount || 1) }, 
         '備註':     { rich_text: [{ text: { content: booking.note || '' } }] },
         '預約來源': { select: { name: 'LINE' } },
@@ -148,15 +147,26 @@ async function createBooking(booking) {
     });
     return true;
   } catch (e) {
-    // 若出錯，顯示詳細 API 回應
     console.error('[Notion] createBooking Error Details:', e.body || e.message);
     return false;
   }
 }
 
-// ── 工具函式 ───────────────────────────────────────────────
+// ── 日期驗證 ───────────────────────────────────────────────
+function checkDateAllowed(dateStr) {
+  const now = new Date();
+  const twNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  const todayStr = twNow.toISOString().split('T')[0];
+  if (dateStr <= todayStr) return { allowed: false, reason: '⚠️ 不接受當天或過去的日期，請選擇明天以後。' };
+  const diff = (new Date(`${dateStr}T00:00:00+08:00`) - now) / 3600000;
+  if (diff < 12) return { allowed: false, reason: '⚠️ 需提前 12 小時預約，請選擇其他日期。' };
+  return { allowed: true, reason: '' };
+}
+
+// ── 輔助函式 ───────────────────────────────────────────────
 function reply(event, messages) {
-  return client.replyMessage(event.replyToken, Array.isArray(messages) ? messages : [messages]);
+  const msgs = Array.isArray(messages) ? messages : [messages];
+  return client.replyMessage(event.replyToken, msgs);
 }
 
 function row(label, value) {
@@ -173,9 +183,9 @@ function formatPrice(n) {
   return `NT$ ${n.toLocaleString()}`;
 }
 
-// ... 此處包含 buildMainMenu, buildDatePicker, buildPriceMessage 等 UI 模板 (維持原樣) ...
+// ... 此處包含 buildMainMenu, buildDatePicker 等原版 UI 函數 (省略以節省空間) ...
 
-// ── 主要事件處理器 (包含單點時數計算邏輯) ────────────────────────────────────────
+// ── 主要事件處理器 (維持對話與時數計算邏輯) ────────────────────────────────────────
 async function handleEvent(event) {
   const userId = event.source.userId;
 
@@ -185,46 +195,48 @@ async function handleEvent(event) {
 
     if (text === '取消' || text === '重新開始') {
       clearSession(userId);
-      return reply(event, { type: 'text', text: '已取消預約流程。' });
+      return reply(event, { type: 'text', text: '已取消流程。' });
     }
 
-    if (text === '立即預約') {
-      clearSession(userId);
-      setSession(userId, 'pickDate');
-      return reply(event, { type: 'text', text: '請點擊選單選擇預約日期' });
-    }
-
-    // 階段 1：處理單點預約時數
+    // 處理時數 (針對單一鐘點)
     if (step === 'inputDuration') {
       const hours = parseInt(text, 10);
-      if (isNaN(hours) || hours < 1) return reply(event, { type: 'text', text: '請輸入正確的數字（小時）。' });
+      if (isNaN(hours) || hours < 1) return reply(event, { type: 'text', text: '請輸入正確的數字（小時數）。' });
       
       const data = getData(userId);
-      const totalAmount = Number(data.basePrice) * hours;
-      const slotLabel = `${data.slot} (共${hours}小時)`;
-      setSession(userId, 'inputName', { duration: hours, price: totalAmount, slot: slotLabel });
-      return reply(event, { type: 'text', text: `好的，${hours} 小時總金額為 ${formatPrice(totalAmount)}。\n請輸入您的姓名：` });
+      const totalPrice = Number(data.basePrice) * hours;
+      const newSlotName = `${data.slot} (共${hours}小時)`;
+
+      setSession(userId, 'inputName', { 
+        ...data, 
+        duration: hours, 
+        price: totalPrice,
+        slot: newSlotName 
+      });
+
+      return reply(event, { type: 'text', text: `總費用為 ${formatPrice(totalPrice)}。請輸入您的姓名：` });
     }
 
     if (step === 'inputName') {
       setSession(userId, 'inputPhone', { name: text });
-      return reply(event, { type: 'text', text: '請輸入您的聯絡電話：' });
+      return reply(event, { type: 'text', text: '請輸入電話：' });
     }
 
     if (step === 'inputPhone') {
       setSession(userId, 'inputHeadcount', { phone: text });
-      return reply(event, { type: 'text', text: '請問預計人數幾位？' });
+      return reply(event, { type: 'text', text: '請輸入預約人數 (純數字)：' });
     }
 
     if (step === 'inputHeadcount') {
       const n = parseInt(text, 10);
-      if (isNaN(n)) return reply(event, { type: 'text', text: '請輸入數字。' });
+      if (isNaN(n)) return reply(event, { type: 'text', text: '請輸入數字，例如：2' });
       setSession(userId, 'inputNote', { headcount: n });
-      return reply(event, { type: 'text', text: '是否有備註？(無請輸入「略過」)' });
+      return reply(event, { type: 'text', text: '備註內容 (或輸入略過)：' });
     }
 
     if (step === 'inputNote') {
       setSession(userId, 'confirm', { note: text === '略過' ? '' : text });
+      // 這裡應調用 buildInfoConfirm 展示最後確認卡片
       return reply(event, { type: 'text', text: '請確認資訊無誤後，輸入「確認預約」。' });
     }
 
@@ -249,10 +261,9 @@ async function handleEvent(event) {
         return reply(event, { type: 'text', text: `您選擇了單點時段，請問預約幾小時？` });
       } else {
         setSession(userId, 'inputName', { date, slot, slotType, price, holiday: data.holiday });
-        return reply(event, { type: 'text', text: '已選擇固定時段。請輸入您的姓名：' });
+        return reply(event, { type: 'text', text: '請輸入姓名：' });
       }
     }
-    // ... 其他 Postback 處理 (如 pickDate) ...
   }
 }
 
@@ -263,7 +274,7 @@ async function processBooking(event, userId) {
   if (ok) {
     return reply(event, { type: 'text', text: '✅ 預約成功！' });
   } else {
-    return reply(event, { type: 'text', text: '⚠️ 寫入資料庫失敗，請確認 Notion 欄位類型。' });
+    return reply(event, { type: 'text', text: '⚠️ 寫入 Notion 失敗，請確認資料庫屬性類型。' });
   }
 }
 
@@ -273,8 +284,6 @@ app.post('/webhook', line.middleware(lineConfig), (req, res) => {
     .then(result => res.json(result))
     .catch(err => { console.error(err); res.status(500).end(); });
 });
-
-app.get('/', (req, res) => res.send('敘事空域 Bot 運行中 ✅'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ 啟動 Port: ${PORT}`));
