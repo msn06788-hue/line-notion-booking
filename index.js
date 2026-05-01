@@ -1,153 +1,331 @@
+// ============================================================
+//  敘事空域 (Narra Space) - LINE Bot 預約系統
+//  index.js - 主程式入口
+// ============================================================
+
 const express = require('express');
 const line = require('@line/bot-sdk');
-const { Client } = require('@notionhq/client');
 
-// --- 1. 設定與初始化 ---
-const config = {
+const { getBookedSlots, createBooking } = require('./notion');
+const { checkDateAllowed, getAvailableFixedSlots, getAvailableHourlySlots } = require('./slots');
+const { buildSlotFlex, buildConfirmFlex, buildSuccessFlex, buildPriceMessage, buildMainMenu } = require('./messages');
+const { getStep, getData, setSession, clearSession } = require('./state');
+
+// ── 環境變數設定 ──────────────────────────────────────────
+const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 
-const client = new line.Client(config);
-const notion = new Client({ auth: process.env.NOTION_INTEGRATION_TOKEN });
-const DATABASE_ID = process.env.NOTION_DATABASE_ID;
-
+const client = new line.Client(lineConfig);
 const app = express();
 
-// 定義場地固定時段
-const FIXED_SLOTS = ["早上 9:30~12:30", "下午 13:30~17:00", "晚上 18:00~21:30"];
-
-// --- 2. Webhook 接收點 ---
-app.post('/webhook', line.middleware(config), (req, res) => {
+// ── Webhook 路由 ──────────────────────────────────────────
+app.post('/webhook', line.middleware(lineConfig), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
     .then((result) => res.json(result))
     .catch((err) => {
-      console.error("Webhook Error:", err);
+      console.error('[Webhook] 錯誤:', err);
       res.status(500).end();
     });
 });
 
-// --- 3. 事件處理核心 ---
+// 健康檢查路由（Vercel 用）
+app.get('/', (req, res) => res.send('敘事空域 Bot 運行中 ✅'));
+
+// ── 主要事件處理器 ────────────────────────────────────────
 async function handleEvent(event) {
-  // 處理文字訊息 (價目表、立即預約)
+  const userId = event.source.userId;
+
+  // ── 文字訊息 ────────────────────────────────────────────
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
+    const step = getStep(userId);
 
-    if (text === '立即預約') {
-      return client.replyMessage(event.replyToken, {
-        type: 'template',
-        altText: '請選擇預約日期',
-        template: {
-          type: 'buttons',
-          title: '敘事空域 - 預約系統',
-          text: '請點擊下方按鈕選擇日期：',
-          actions: [{
-            type: 'datetimepicker',
-            label: '選擇日期',
-            data: 'action=pickDate',
-            mode: 'date'
-          }]
-        }
-      });
+    // 任何時候輸入「取消」都可重置
+    if (text === '取消' || text === '重新開始') {
+      clearSession(userId);
+      return reply(event, buildMainMenu());
+    }
+
+    // ── 關鍵字觸發（idle 狀態）──────────────────────────
+    if (text === '立即預約' || text === '預約') {
+      clearSession(userId);
+      setSession(userId, 'pickDate');
+      return reply(event, buildDatePicker());
     }
 
     if (text === '價目表') {
-      return client.replyMessage(event.replyToken, {
+      return reply(event, buildPriceMessage());
+    }
+
+    if (text === '選單' || text === 'menu' || text === '你好' || text === 'hi' || text === 'Hello') {
+      return reply(event, buildMainMenu());
+    }
+
+    // ── 對話狀態機流程 ───────────────────────────────────
+    if (step === 'inputName') {
+      setSession(userId, 'inputPhone', { name: text });
+      return reply(event, {
         type: 'text',
-        text: "📜 【敘事空域價目表】\n\n🔹 固定時段：$1,200/場\n🔹 單一鐘點：$500/小時\n\n(回覆「立即預約」開始訂位)"
+        text: `謝謝 ${text} 👋\n請輸入您的聯絡電話：\n（若不提供可輸入「略過」）`,
       });
     }
+
+    if (step === 'inputPhone') {
+      const phone = text === '略過' ? '' : text;
+      setSession(userId, 'inputHeadcount', { phone });
+      return reply(event, {
+        type: 'text',
+        text: '請問這次預約有幾位？（請輸入數字，例如：2）',
+      });
+    }
+
+    if (step === 'inputHeadcount') {
+      const headcount = parseInt(text, 10);
+      if (isNaN(headcount) || headcount < 1) {
+        return reply(event, { type: 'text', text: '請輸入正確的人數（數字），例如：1' });
+      }
+      setSession(userId, 'inputNote', { headcount });
+      return reply(event, {
+        type: 'text',
+        text: '是否有備註或特殊需求？\n（若無請輸入「略過」）',
+      });
+    }
+
+    if (step === 'inputNote') {
+      const note = text === '略過' ? '' : text;
+      setSession(userId, 'confirm', { note });
+
+      // 顯示確認訊息
+      const data = getData(userId);
+      return reply(event, buildFinalConfirm(data));
+    }
+
+    if (step === 'confirm') {
+      if (text === '確認預約' || text === '確認') {
+        return await processBooking(event, userId);
+      }
+      if (text === '重新選擇') {
+        clearSession(userId);
+        return reply(event, {
+          type: 'text',
+          text: '已取消，請重新開始。\n輸入「立即預約」重新選擇時段。',
+        });
+      }
+      return reply(event, {
+        type: 'text',
+        text: '請點選下方按鈕「確認預約」或「重新選擇」',
+      });
+    }
+
+    // 預設回覆
+    return reply(event, buildMainMenu());
   }
 
-  // 處理按鈕回傳 (Postback)
+  // ── Postback 事件（按鈕點擊）────────────────────────────
   if (event.type === 'postback') {
     const params = new URLSearchParams(event.postback.data);
     const action = params.get('action');
 
-    // 步驟 A：用戶選完日期，查詢 Notion 並過濾
+    // 日期選擇器回傳
     if (action === 'pickDate') {
-      const selectedDate = event.postback.params.date;
-      return handleDateSelected(event.replyToken, selectedDate);
+      const date = event.postback.params?.date;
+      if (!date) return;
+
+      // 檢查日期是否合法
+      const { allowed, reason } = checkDateAllowed(date);
+      if (!allowed) {
+        clearSession(userId);
+        return reply(event, {
+          type: 'text',
+          text: `${reason}\n\n請輸入「立即預約」重新選擇。`,
+        });
+      }
+
+      // 查詢 Notion 已預約時段
+      setSession(userId, 'pickSlot', { date });
+      const bookedSlots = await getBookedSlots(date);
+      const fixedSlots = getAvailableFixedSlots(bookedSlots);
+      const hourlySlots = getAvailableHourlySlots(bookedSlots);
+
+      return reply(event, buildSlotFlex(date, fixedSlots, hourlySlots));
     }
 
-    // 步驟 B：用戶點選時段，執行寫入
-    if (action === 'confirm') {
+    // 時段確認
+    if (action === 'confirmSlot') {
       const date = params.get('date');
-      const time = params.get('time');
-      return saveToNotion(event.replyToken, date, time);
+      const slot = decodeURIComponent(params.get('slot'));
+      const slotType = params.get('type');
+
+      setSession(userId, 'inputName', { date, slot, slotType });
+      return reply(event, [
+        buildConfirmFlex(date, slot, slotType),
+        { type: 'text', text: '請輸入您的姓名：' },
+      ]);
     }
+  }
+
+  // ── 追蹤/加入好友事件 ────────────────────────────────────
+  if (event.type === 'follow') {
+    return reply(event, {
+      type: 'text',
+      text: '歡迎加入敘事空域！🏛️\n\n我們提供場地與課程預約服務。\n請輸入「立即預約」開始預約，或輸入「價目表」查看費用。',
+    });
   }
 }
 
-// --- 4. 輔助函數：過濾時段 ---
-async function handleDateSelected(replyToken, date) {
-  try {
-    const response = await notion.databases.query({
-      database_id: DATABASE_ID,
-      filter: {
-        property: "日期", // 請確保 Notion 欄位名稱為「日期」
-        date: { equals: date }
-      }
-    });
-
-    const bookedSlots = response.results.map(page => {
-      // 讀取 Notion 的「預約時段」欄位 (Select 類型)
-      return page.properties["預約時段"].select?.name || "";
-    });
-
-    // 過濾：只保留沒被預訂的時段
-    const availableSlots = FIXED_SLOTS.filter(slot => !bookedSlots.includes(slot));
-
-    if (availableSlots.length === 0) {
-      return client.replyMessage(replyToken, { type: 'text', text: `抱歉，${date} 的時段已全數額滿。` });
-    }
-
-    // 生成可用時段按鈕
-    const buttons = availableSlots.map(slot => ({
-      type: "button",
-      action: {
-        type: "postback",
-        label: slot,
-        data: `action=confirm&date=${date}&time=${slot}`,
-        displayText: `我想預約 ${date} ${slot}`
+// ── 確認頁（最終）─────────────────────────────────────────
+function buildFinalConfirm(data) {
+  const { name, date, slot, phone, headcount, note, slotType } = data;
+  return {
+    type: 'flex',
+    altText: '請確認預約資訊',
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          { type: 'text', text: '📋 請確認預約資訊', weight: 'bold', color: '#FFFFFF', size: 'lg' },
+        ],
+        backgroundColor: '#3D6B8C',
+        paddingAll: 'md',
       },
-      style: "primary",
-      margin: "sm"
-    }));
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        paddingAll: 'md',
+        contents: [
+          infoRow('姓名', name),
+          infoRow('日期', date),
+          infoRow('時段', slot),
+          infoRow('類型', slotType),
+          infoRow('電話', phone || '未提供'),
+          infoRow('人數', `${headcount} 人`),
+          infoRow('備註', note || '無'),
+        ],
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        paddingAll: 'md',
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            color: '#4CAF82',
+            action: { type: 'message', label: '✅ 確認預約', text: '確認預約' },
+          },
+          {
+            type: 'button',
+            style: 'secondary',
+            action: { type: 'message', label: '🔄 重新選擇', text: '重新選擇' },
+          },
+        ],
+      },
+    },
+  };
+}
 
-    return client.replyMessage(replyToken, {
-      type: "flex",
-      altText: "選擇預約時段",
-      contents: {
-        type: "bubble",
-        header: { type: "box", layout: "vertical", contents: [{ type: "text", text: `${date} 可預約時段`, weight: "bold" }] },
-        body: { type: "box", layout: "vertical", contents: buttons }
-      }
+function infoRow(label, value) {
+  return {
+    type: 'box',
+    layout: 'horizontal',
+    contents: [
+      { type: 'text', text: label, color: '#888888', size: 'sm', flex: 3 },
+      { type: 'text', text: String(value || ''), size: 'sm', flex: 7, weight: 'bold', wrap: true },
+    ],
+  };
+}
+
+// ── 日期選擇器 ─────────────────────────────────────────────
+function buildDatePicker() {
+  // 計算最小可選日期（明天，台灣時間）
+  const now = new Date();
+  const twOffset = 8 * 60 * 60 * 1000;
+  const tomorrow = new Date(now.getTime() + twOffset + 24 * 60 * 60 * 1000);
+  const minDate = tomorrow.toISOString().split('T')[0];
+
+  // 最大預約日期：60 天後
+  const maxDate = new Date(now.getTime() + twOffset + 60 * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .split('T')[0];
+
+  return {
+    type: 'template',
+    altText: '請選擇預約日期',
+    template: {
+      type: 'buttons',
+      thumbnailImageUrl: 'https://i.imgur.com/placeholder.png', // 可換成你的場地圖片
+      imageAspectRatio: 'rectangle',
+      imageSize: 'cover',
+      title: '敘事空域 預約',
+      text: '請選擇您想預約的日期：',
+      actions: [
+        {
+          type: 'datetimepicker',
+          label: '📅 選擇日期',
+          data: 'action=pickDate',
+          mode: 'date',
+          min: minDate,
+          max: maxDate,
+        },
+      ],
+    },
+  };
+}
+
+// ── 完成預約流程 ───────────────────────────────────────────
+async function processBooking(event, userId) {
+  const data = getData(userId);
+
+  // 二次確認 Notion 該時段是否已被搶走
+  const bookedSlots = await getBookedSlots(data.date);
+  if (bookedSlots.includes(data.slot)) {
+    clearSession(userId);
+    return reply(event, {
+      type: 'text',
+      text: `😢 非常抱歉，${data.slot} 剛剛已被其他人預約。\n請輸入「立即預約」重新選擇時段。`,
     });
-  } catch (err) {
-    console.error("Notion 查詢失敗:", err);
-    return client.replyMessage(replyToken, { type: 'text', text: "系統繁忙中，請稍後再試。" });
+  }
+
+  // 寫入 Notion
+  const success = await createBooking({
+    name: data.name,
+    date: data.date,
+    slot: data.slot,
+    phone: data.phone,
+    slotType: data.slotType,
+    headcount: data.headcount,
+    note: data.note,
+    source: 'LINE',
+  });
+
+  clearSession(userId);
+
+  if (success) {
+    return reply(event, buildSuccessFlex(data));
+  } else {
+    return reply(event, {
+      type: 'text',
+      text: '⚠️ 系統發生錯誤，請稍後再試或直接聯繫我們。',
+    });
   }
 }
 
-// --- 5. 輔助函數：存入 Notion ---
-async function saveToNotion(replyToken, date, time) {
-  try {
-    await notion.pages.create({
-      parent: { database_id: DATABASE_ID },
-      properties: {
-        "標題": { title: [{ text: { content: "LINE 預約" } }] },
-        "日期": { date: { start: date } },
-        "預約時段": { select: { name: time } }
-      }
-    });
-    return client.replyMessage(replyToken, { type: 'text', text: `✅ 預約完成！\n時間：${date} ${time}\n期待您的光臨。` });
-  } catch (err) {
-    console.error("Notion 寫入失敗:", err);
-    return client.replyMessage(replyToken, { type: 'text', text: "預約失敗，請檢查網路連線。" });
-  }
+// ── 回覆工具函式 ───────────────────────────────────────────
+function reply(event, messages) {
+  const msgs = Array.isArray(messages) ? messages : [messages];
+  return client.replyMessage(event.replyToken, msgs);
 }
 
-// 啟動伺服器
+// ── 啟動伺服器 ────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`✅ 敘事空域 Bot 啟動，Port: ${PORT}`);
+});
+
+module.exports = app;
