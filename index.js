@@ -13,11 +13,12 @@ const lineConfig = {
 
 const client = new line.Client(lineConfig);
 
-// --- 設定區：服務資訊與價格 ---
+// --- 設定區：報價與聯繫資訊 ---
 const SERVICE_INFO = {
   staff: "服務專員：蘇郁翔",
   phone: "服務電話：0939-607-867",
-  bank: "🏦 匯款資訊：\n星展銀行 810 世貿分行\n帳號：602-489-60988\n戶名：鍾沛潔"
+  bank: "🏦 匯款資訊：\n星展銀行 810 世貿分行\n帳號：602-489-60988\n戶名：鍾沛潔",
+  closing: "\n⚠️ 提醒：目前報價僅保留三天，匯款完成後請記得將「帳號後五碼」告知小編唷！感謝您的預訂。😊"
 };
 
 const PRICE_TABLE = {
@@ -29,15 +30,13 @@ const PRICE_TABLE = {
 
 let HOLIDAYS_2026 = [];
 
-/**
- * 區塊：介接政府公開資料 API (預留位置)
- */
+// 介接 API 預留區塊
 async function syncHolidays() {
   try {
     const res = await axios.get('https://raw.githubusercontent.com/the-m-moore/taiwan-holidays/master/data/2026.json');
     HOLIDAYS_2026 = res.data.filter(d => d.isHoliday).map(d => d.date);
   } catch (err) {
-    HOLIDAYS_2026 = ["2026-01-01", "2026-02-17", "2026-05-01"];
+    HOLIDAYS_2026 = ["2026-01-01", "2026-02-17", "2026-05-01"]; 
   }
 }
 syncHolidays();
@@ -50,8 +49,25 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
     const events = req.body.events;
     for (let event of events) {
+      
+      // 1. 文字訊息處理
       if (event.type === 'message' && event.message.type === 'text') {
-        if (event.message.text.includes("預約")) {
+        const text = event.message.text.trim();
+
+        // 【優先判斷：價目表】最頂端確保不漏失
+        if (text === "價目表" || text.includes("價目表")) {
+          await client.replyMessage(event.replyToken, [
+            {
+              type: 'image',
+              originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
+              previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
+            },
+            { type: 'text', text: "這是我們的服務價目表。看過之後，輸入「預約」即可開始安排您的時間喔！" }
+          ]);
+          continue;
+        }
+
+        if (text.includes("預約")) {
           await client.replyMessage(event.replyToken, {
             type: "template",
             altText: "選擇預約方式",
@@ -66,14 +82,10 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         }
       }
 
+      // 2. Postback 按鈕處理
       if (event.type === 'postback') {
         const data = new URLSearchParams(event.postback.data);
-        const act = data.get('act');
-        const m = data.get('m'); // 方式
-        const p = data.get('p'); // 目的
-        const x = data.get('x'); // 人數
-        const d = data.get('d'); // 日期
-        const s = data.get('s'); // 時段代碼
+        const act = data.get('act'), m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), s = data.get('s');
 
         switch (act) {
           case 'mode':
@@ -96,15 +108,15 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
           case 'purp':
             await client.replyMessage(event.replyToken, [
-              { type: "text", text: `目的：${p}` },
+              { type: "text", text: `已選擇目的：${p}` },
               {
-                type: "text", text: "請問預計人數？",
+                type: "text", text: "請問預計人數？\n(⚠️ 提醒：場地建議不超過 40 人)",
                 quickReply: {
                   items: [
                     { type: "action", action: { type: "postback", label: "1-10人", data: `act=pax&m=${m}&p=${p}&x=1-10` } },
                     { type: "action", action: { type: "postback", label: "11-20人", data: `act=pax&m=${m}&p=${p}&x=11-20` } },
                     { type: "action", action: { type: "postback", label: "21-30人", data: `act=pax&m=${m}&p=${p}&x=21-30` } },
-                    { type: "action", action: { type: "postback", label: "30+人", data: `act=pax&m=${m}&p=${p}&x=30+` } }
+                    { type: "action", action: { type: "postback", label: "30-40人", data: `act=pax&m=${m}&p=${p}&x=30-40` } }
                   ]
                 }
               }
@@ -112,15 +124,13 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             break;
 
           case 'pax':
-            let paxMsg = `人數：${x}`;
-            if (x === '30+') paxMsg += "\n⚠️ 提醒：場地建議不超過 35 人。";
             await client.replyMessage(event.replyToken, [
-              { type: "text", text: paxMsg },
+              { type: "text", text: `已選擇人數：${x}` },
               {
                 type: "template",
                 altText: "選擇日期",
                 template: {
-                  type: "buttons", title: "選擇日期", text: "請點選按鈕選取日期：",
+                  type: "buttons", title: "選擇日期", text: "請選取您的預約日期：",
                   actions: [{ type: "datetimepicker", label: "📅 選取日期", data: `act=date&m=${m}&p=${p}&x=${x}`, mode: "date" }]
                 }
               }
@@ -128,24 +138,20 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             break;
 
           case 'date':
-            const selectedDate = event.postback.params.date;
-            await sendSlotButtons(event.replyToken, selectedDate, m, p, x);
+            await sendSlotButtons(event.replyToken, event.postback.params.date, m, p, x);
             break;
 
           case 'final':
-            const pricing = PRICE_TABLE[s];
             if (m === 'p') {
-              // 包時段直接進入最後步驟
               await finalizeBooking(event, data);
             } else {
-              // 計時預約才問時數
               await client.replyMessage(event.replyToken, [
-                { type: "text", text: `時段：${pricing.name}` },
+                { type: "text", text: `已選擇時段：${PRICE_TABLE[s].name}` },
                 {
                   type: "template",
-                  altText: "選擇時長",
+                  altText: "計時時長",
                   template: {
-                    type: "buttons", title: "計時時長", text: "請問預計使用幾小時？",
+                    type: "buttons", title: "預約時長", text: "請問預計使用幾小時？",
                     actions: [
                       { type: "postback", label: "2 小時", data: `${event.postback.data}&act=last&h=2` },
                       { type: "postback", label: "3 小時", data: `${event.postback.data}&act=last&h=3` },
@@ -189,29 +195,29 @@ async function finalizeBooking(event, data) {
     });
 
     await client.replyMessage(event.replyToken, [
-      { type: 'text', text: `✅ 預約成功！\n目的：${p}\n人數：${x}\n時段：${displayTime}\n金額：${amount}元 (${isWknd ? '假日' : '平日'})` },
-      { type: 'text', text: `📢 匯款與聯繫資訊：\n\n${SERVICE_INFO.bank}\n\n${SERVICE_INFO.staff}\n${SERVICE_INFO.phone}` }
+      { type: 'text', text: `✅ 恭喜！預約資訊已送達。\n目的：${p}\n人數：${x}\n預約：${displayTime}\n金額：NT$ ${amount} (${isWknd ? '假日' : '平日'})` },
+      { type: 'text', text: `${SERVICE_INFO.bank}\n${SERVICE_INFO.staff}\n${SERVICE_INFO.phone}${SERVICE_INFO.closing}` }
     ]);
   } catch (err) {
     console.error("Notion Error:", JSON.stringify(err, null, 2));
-    await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 錯誤：請確保 Notion 資料庫中存在「預約時段」、「目的」、「人數」、「金額」欄位，且名稱正確無空格。` });
+    await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 失敗：請檢查 Notion 欄位名稱（預約時段、目的、人數、金額）是否正確。` });
   }
 }
 
 async function sendSlotButtons(replyToken, date, m, p, x) {
   const base = `d=${date}&m=${m}&p=${p}&x=${x}`;
   await client.replyMessage(replyToken, [
-    { type: "text", text: `日期：${date}` },
+    { type: "text", text: `已選日期：${date}` },
     {
       type: "template",
       altText: "選擇時段",
       template: {
-        type: "buttons", title: `${date} 起始時段`, text: "請選擇時段：",
+        type: "buttons", title: `${date} 起始時段`, text: "請選擇您要預約的時段：",
         actions: [
           { type: "postback", label: "早上", data: `act=final&s=m&${base}` },
           { type: "postback", label: "下午", data: `act=final&s=a&${base}` },
           { type: "postback", label: "晚上", data: `act=final&s=e&${base}` },
-          { type: "postback", label: "全天 (8h)", data: `act=final&s=f&${base}` }
+          { type: "postback", label: "全天", data: `act=final&s=f&${base}` }
         ]
       }
     }
