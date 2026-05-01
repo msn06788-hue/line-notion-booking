@@ -12,7 +12,11 @@ const lineConfig = {
 
 const client = new line.Client(lineConfig);
 
-// 清理 Database ID，確保連線穩定
+// --- 設定區 (可自行修改) ---
+const BANK_INFO = "🏦 匯款資訊：\n銀行代碼：000\n帳號：1234-5678-9012\n戶名：敘事空域";
+const STAFF_PHONE = "📞 服務專員：0939-607-887";
+// ------------------------
+
 function getCleanDatabaseId() {
   let dbId = process.env.NOTION_DATABASE_ID || "";
   if (dbId.includes("?")) dbId = dbId.split("?")[0];
@@ -25,35 +29,46 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     const events = req.body.events;
     for (let event of events) {
       
-      // 1. 處理文字訊息
+      // 1. 處理文字訊息 (包含智慧語意判斷)
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text.trim();
 
         if (text.includes("價目表")) {
           await client.replyMessage(event.replyToken, [
-            {
-              type: 'image',
-              originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
-              previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
-            },
+            { type: 'image', originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png", previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png" },
             { type: 'text', text: "看完價目表後，輸入「預約」即可開始安排時間喔！😊" }
           ]);
           continue;
         }
 
         if (text.includes("預約")) {
-          const dateRegex = /(\d{1,2})[/\-月](\d{1,2})/;
-          const match = text.match(dateRegex);
-          if (match) {
-            const targetDate = `2026-${match[1].padStart(2, '0')}-${match[2].padStart(2, '0')}`;
-            await sendSlotButtons(event.replyToken, targetDate);
+          const dateMatch = text.match(/(\d{1,2})[/\-月](\d{1,2})/);
+          
+          if (dateMatch) {
+            const date = `2026-${dateMatch[1].padStart(2, '0')}-${dateMatch[2].padStart(2, '0')}`;
+            let slot = null;
+
+            // 智慧判定時段關鍵字
+            if (text.includes("早上") || text.includes("上午")) slot = 'm';
+            else if (text.includes("下午")) slot = 'a';
+            else if (text.includes("晚上")) slot = 'e';
+            else if (text.includes("全天") || text.includes("整天")) slot = 'f';
+
+            if (slot) {
+              // 如果日期與時段都有，直接執行預約邏輯
+              await handleBookingLogic(event, date, slot);
+            } else {
+              // 有日期但沒時段，才跳時段選單
+              await sendSlotButtons(event.replyToken, date);
+            }
           } else {
+            // 完全沒日期，跳日期選擇器
             await client.replyMessage(event.replyToken, {
               type: "template",
-              altText: "預約日期選擇",
+              altText: "預約系統",
               template: {
                 type: "buttons",
-                title: "預約系統",
+                title: "敘事空域預約",
                 text: "請選擇您要預約的日期：",
                 actions: [{ type: "datetimepicker", label: "📅 選取日期", data: "act=date", mode: "date" }]
               }
@@ -70,60 +85,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           await sendSlotButtons(event.replyToken, event.postback.params.date);
         } else if (data.startsWith("act=final")) {
           const urlParams = new URLSearchParams(data);
-          const date = urlParams.get('d');
-          const slot = urlParams.get('s');
-          let displayTime, slotName;
-
-          switch (slot) {
-            case 'm': displayTime = `${date} 09:30-12:00`; slotName = "早上"; break;
-            case 'a': displayTime = `${date} 13:30-17:00`; slotName = "下午"; break;
-            case 'e': displayTime = `${date} 18:00-21:30`; slotName = "晚上"; break;
-            case 'f': displayTime = `${date} 09:30-17:30`; slotName = "整天"; break;
-          }
-
-          try {
-            const dbId = getCleanDatabaseId();
-
-            // 防撞檢查：確保該時段文字尚未被預約
-            const check = await notion.databases.query({
-              database_id: dbId,
-              filter: { property: "時間", rich_text: { equals: displayTime } }
-            });
-
-            if (check.results.length > 0) {
-              await client.replyMessage(event.replyToken, { type: 'text', text: `⚠️ 抱歉！${displayTime} 已有人預約了。` });
-              continue;
-            }
-
-            // 獲取顧客基本資料 (容錯處理)
-            let customerName = "顧客";
-            try {
-              const profile = await client.getProfile(event.source.userId);
-              customerName = profile.displayName;
-            } catch (pError) {
-              console.log("無法獲取個人檔案:", pError.message);
-            }
-
-            // 寫入 Notion
-            await notion.pages.create({
-              parent: { database_id: dbId },
-              properties: {
-                "名稱": { title: [{ text: { content: `${customerName} (${slotName})` } }] },
-                "時間": { rich_text: [{ text: { content: displayTime } }] }
-              }
-            });
-
-            await client.replyMessage(event.replyToken, { type: 'text', text: `✅ ${customerName} 您好，預約成功！\n預約時段：${displayTime}` });
-
-          } catch (notionError) {
-            // 精確抓取報錯訊息，解決 undefined 問題
-            const errorMsg = notionError.body?.message || notionError.message || "未知原因";
-            console.error("Notion 錯誤內容:", notionError);
-            await client.replyMessage(event.replyToken, { 
-              type: 'text', 
-              text: `❌ 預約失敗\n原因：${errorMsg}` 
-            });
-          }
+          await handleBookingLogic(event, urlParams.get('d'), urlParams.get('s'));
         }
       }
     }
@@ -134,14 +96,67 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   }
 });
 
+/**
+ * 核心預約媒合與寫入邏輯
+ */
+async function handleBookingLogic(event, date, slot) {
+  let displayTime, slotName;
+  switch (slot) {
+    case 'm': displayTime = `${date} 09:30-12:00`; slotName = "早上"; break;
+    case 'a': displayTime = `${date} 13:30-17:00`; slotName = "下午"; break;
+    case 'e': displayTime = `${date} 18:00-21:30`; slotName = "晚上"; break;
+    case 'f': displayTime = `${date} 09:30-17:30`; slotName = "整天"; break;
+  }
+
+  try {
+    const dbId = getCleanDatabaseId();
+
+    // 衝突媒合檢查
+    const check = await notion.databases.query({
+      database_id: dbId,
+      filter: { property: "時間", rich_text: { equals: displayTime } }
+    });
+
+    if (check.results.length > 0) {
+      return client.replyMessage(event.replyToken, { type: 'text', text: `⚠️ 抱歉！${displayTime} 已有人預約了，請選擇其他時段。` });
+    }
+
+    // 獲取顧客資料
+    let userName = "顧客";
+    try {
+      const profile = await client.getProfile(event.source.userId);
+      userName = profile.displayName;
+    } catch (e) {}
+
+    // 寫入 Notion
+    await notion.pages.create({
+      parent: { database_id: dbId },
+      properties: {
+        "名稱": { title: [{ text: { content: `${userName} (${slotName})` } }] },
+        "時間": { rich_text: [{ text: { content: displayTime } }] }
+      }
+    });
+
+    // 成功回覆兩則訊息
+    return client.replyMessage(event.replyToken, [
+      { type: 'text', text: `✅ ${userName} 您好，預約成功！\n預約時段：${displayTime}` },
+      { type: 'text', text: `📢 預約後續通知：\n\n${BANK_INFO}\n\n${STAFF_PHONE}` }
+    ]);
+
+  } catch (err) {
+    const errorMsg = err.body?.message || err.message || "未知原因";
+    return client.replyMessage(event.replyToken, { type: 'text', text: `❌ 預約失敗\n原因：${errorMsg}` });
+  }
+}
+
 async function sendSlotButtons(replyToken, date) {
   await client.replyMessage(replyToken, {
     type: "template",
     altText: "選擇時段",
     template: {
       type: "buttons",
-      title: `${date} 時段選擇`,
-      text: "請選擇預約時段：",
+      title: `${date} 時段`,
+      text: "請點選預約時段：",
       actions: [
         { type: "postback", label: "早上 09:30-12:00", data: `act=final&d=${date}&s=m` },
         { type: "postback", label: "下午 13:30-17:00", data: `act=final&d=${date}&s=a` },
