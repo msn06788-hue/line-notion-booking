@@ -3,7 +3,6 @@ const { Client } = require('@notionhq/client');
 const line = require('@line/bot-sdk');
 
 const app = express();
-// 初始化 Notion 客戶端
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 const lineConfig = {
@@ -17,10 +16,29 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
     const events = req.body.events;
     for (let event of events) {
+      // --- 1. 處理文字訊息 ---
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text.trim();
+        console.log("收到文字訊息:", text);
 
-        // 偵測「預約」與日期
+        // 價目表邏輯 (改用 includes 增加靈敏度)
+        if (text.includes("價目表")) {
+          console.log("觸發價目表回覆...");
+          await client.replyMessage(event.replyToken, [
+            {
+              type: 'image',
+              originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
+              previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
+            },
+            {
+              type: 'text',
+              text: "這是我們最新的價目表！看完之後，輸入「預約」即可開始安排您的時間喔！😊"
+            }
+          ]);
+          continue;
+        }
+
+        // 預約邏輯
         if (text.includes("預約")) {
           const dateRegex = /(\d{1,2})[/\-月](\d{1,2})/;
           const match = text.match(dateRegex);
@@ -29,7 +47,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             const targetDate = `2026-${match[1].padStart(2, '0')}-${match[2].padStart(2, '0')}`;
             await sendSlotButtons(event.replyToken, targetDate);
           } else {
-            // 跳出日期選擇器
             await client.replyMessage(event.replyToken, {
               type: "template",
               altText: "預約日期選擇",
@@ -45,8 +62,11 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         }
       }
 
+      // --- 2. 處理 Postback (按鈕回傳) ---
       if (event.type === 'postback') {
         const data = event.postback.data;
+        console.log("收到按鈕回傳資料:", data);
+
         if (data === "act=date") {
           await sendSlotButtons(event.replyToken, event.postback.params.date);
         } else if (data.includes("act=final")) {
@@ -63,7 +83,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           }
 
           try {
-            // 寫入 Notion
+            console.log(`執行 Notion 寫入... ID: ${process.env.NOTION_DATABASE_ID}`);
             await notion.pages.create({
               parent: { database_id: process.env.NOTION_DATABASE_ID },
               properties: {
@@ -71,19 +91,12 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
                 "時間": { date: { start: startTime, end: endTime } }
               }
             });
-
-            await client.replyMessage(event.replyToken, { type: 'text', text: `✅ 預約成功！\n時段：${slotName}\n系統已更新至 Notion 資料庫。` });
-
+            await client.replyMessage(event.replyToken, { type: 'text', text: `✅ 預約成功！\n時段：${slotName}` });
           } catch (notionError) {
-            console.error("Notion 錯誤內容:", JSON.stringify(notionError, null, 2));
-            // 根據錯誤代碼提供更詳細的中文說明
-            let errorHint = "請確認 Notion 資料庫是否已「新增連線 (Add Connection)」。";
-            if (notionError.status === 401) errorHint = "Notion Token 無效，請檢查環境變數。";
-            if (notionError.status === 404) errorHint = "找不到資料庫 ID，請確認 Vercel 設定。";
-
+            console.error("Notion 寫入失敗詳情:", JSON.stringify(notionError, null, 2));
             await client.replyMessage(event.replyToken, { 
               type: 'text', 
-              text: `❌ 連線失敗\n${errorHint}` 
+              text: `❌ 連線失敗 (代碼：${notionError.status})\n請檢查 Notion 資料庫是否已「新增連線」。` 
             });
           }
         }
@@ -102,7 +115,7 @@ async function sendSlotButtons(replyToken, date) {
     altText: "選擇時段",
     template: {
       type: "buttons",
-      title: `${date} 時段選擇`,
+      title: `${date}`,
       text: "請選擇預約時段：",
       actions: [
         { type: "postback", label: "早上 09:30-12:00", data: `act=final&d=${date}&s=m` },
