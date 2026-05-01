@@ -19,7 +19,7 @@ let holidayCacheYear = null;
 
 async function fetchTaiwanHolidays(year) {
   return new Promise((resolve) => {
-    const url = `https://data.ntpc.gov.tw/api/datasets/308DCD75-6434-45BC-A95F-584DA4FED251/json?size=1000`;
+    const url = 'https://data.ntpc.gov.tw/api/datasets/308DCD75-6434-45BC-A95F-584DA4FED251/json?size=1000';
     https.get(url, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
@@ -65,19 +65,31 @@ const FIXED_SLOTS = [
   { label: '全天 9:00~17:00',  period: 'fullday',    duration: '8小時'   },
 ];
 
-// 單一鐘點：每個時段一個物件
-const HOURLY_SLOTS = [
-  { label: '09:00~10:00', period: 'morning' },
-  { label: '10:00~11:00', period: 'morning' },
-  { label: '11:00~12:00', period: 'morning' },
-  { label: '13:00~14:00', period: 'afternoon' },
-  { label: '14:00~15:00', period: 'afternoon' },
-  { label: '15:00~16:00', period: 'afternoon' },
-  { label: '16:00~17:00', period: 'afternoon' },
-  { label: '18:00~19:00', period: 'evening' },
-  { label: '19:00~20:00', period: 'evening' },
-  { label: '20:00~21:00', period: 'evening' },
-];
+// 整點 + 半點，09:00~21:00
+function generateHourlySlots() {
+  const slots = [];
+  const times = [];
+  for (let h = 9; h <= 20; h++) {
+    times.push({ hour: h, min: 0 });
+    times.push({ hour: h, min: 30 });
+  }
+  // 最後一個結束時間是 21:00，所以起始最晚 20:30
+  for (let i = 0; i < times.length; i++) {
+    const start = times[i];
+    const endH = start.min === 30 ? start.hour + 1 : start.hour;
+    const endM = start.min === 30 ? 0 : 30;
+    const startStr = `${String(start.hour).padStart(2,'0')}:${String(start.min).padStart(2,'0')}`;
+    const endStr   = `${String(endH).padStart(2,'0')}:${String(endM).padStart(2,'0')}`;
+    let period = 'morning';
+    if (start.hour >= 13) period = 'afternoon';
+    if (start.hour >= 18) period = 'evening';
+    // 12:30 開始的歸下午
+    if (start.hour === 12 && start.min === 30) period = 'afternoon';
+    slots.push({ label: `${startStr}~${endStr}`, period });
+  }
+  return slots;
+}
+const HOURLY_SLOTS = generateHourlySlots();
 
 // ── 價格表 ────────────────────────────────────────────────
 const PRICES = {
@@ -97,7 +109,16 @@ function getPrice(type, period, holiday) {
 }
 
 function formatPrice(n) {
-  return `NT$ ${Number(n).toLocaleString()}`;
+  return 'NT$ ' + Number(n).toLocaleString();
+}
+
+function calcHourlyTotal(selectedLabels, holiday) {
+  let total = 0;
+  selectedLabels.forEach(label => {
+    const slot = HOURLY_SLOTS.find(s => s.label === label);
+    if (slot) total += getPrice('hourly', slot.period, holiday);
+  });
+  return total;
 }
 
 // ── 對話狀態機 ─────────────────────────────────────────────
@@ -108,17 +129,28 @@ function getSession(userId) {
   if (Date.now() > s.expireAt) { sessions.delete(userId); return null; }
   return s;
 }
-function setSession(userId, step, data = {}) {
-  const existing = sessions.get(userId) || {};
+function setSession(userId, step, data) {
+  const existing = sessions.get(userId) || { data: {} };
   sessions.set(userId, {
     step,
-    data: { ...existing.data, ...data },
+    data: Object.assign({}, existing.data, data || {}),
     expireAt: Date.now() + 30 * 60 * 1000,
   });
 }
 function clearSession(userId) { sessions.delete(userId); }
 function getStep(userId) { const s = getSession(userId); return s ? s.step : 'idle'; }
 function getData(userId) { const s = getSession(userId); return s ? s.data : {}; }
+
+// ── 取得 LINE 使用者名稱 ───────────────────────────────────
+async function getLineDisplayName(userId) {
+  try {
+    const profile = await client.getProfile(userId);
+    return profile.displayName || '';
+  } catch (e) {
+    console.error('[LINE] getProfile:', e.message);
+    return '';
+  }
+}
 
 // ── Notion 操作 ────────────────────────────────────────────
 async function getBookedSlots(date) {
@@ -144,6 +176,8 @@ async function createBooking(booking) {
         '預約時段': { select: { name: booking.slot } },
         '聯絡電話': { phone_number: booking.phone || '' },
         '預約類型': { select: { name: booking.slotType || '固定時段' } },
+        '舉辦類型': { select: { name: booking.eventType || '其他' } },
+        '金額':     { number: Number(booking.price) || 0 },
         '備註':     { rich_text: [{ text: { content: '人數：' + String(booking.headcount || 1) + ' 人' + (booking.note ? '\n備註：' + booking.note : '') } }] },
         '預約來源': { select: { name: 'LINE' } },
       },
@@ -161,7 +195,7 @@ function checkDateAllowed(dateStr) {
   const twNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
   const todayStr = twNow.toISOString().split('T')[0];
   if (dateStr <= todayStr) return { allowed: false, reason: '⚠️ 不接受當天或過去的日期，請選擇明天以後。' };
-  const diff = (new Date(`${dateStr}T00:00:00+08:00`) - now) / 3600000;
+  const diff = (new Date(dateStr + 'T00:00:00+08:00') - now) / 3600000;
   if (diff < 12) return { allowed: false, reason: '⚠️ 需提前 12 小時預約，請選擇其他日期。' };
   return { allowed: true, reason: '' };
 }
@@ -180,16 +214,6 @@ function row(label, value) {
       { type: 'text', text: String(value || ''), size: 'sm', flex: 7, weight: 'bold', wrap: true },
     ],
   };
-}
-
-// ── 計算鐘點總價（多個時段）────────────────────────────────
-function calcHourlyTotal(selectedSlots, holiday) {
-  let total = 0;
-  selectedSlots.forEach(label => {
-    const slot = HOURLY_SLOTS.find(s => s.label === label);
-    if (slot) total += getPrice('hourly', slot.period, holiday);
-  });
-  return total;
 }
 
 // ── 訊息模板 ──────────────────────────────────────────────
@@ -233,18 +257,19 @@ function buildDatePicker() {
 
 function buildPriceMessage() {
   function priceRows(items) {
-    return items.map(([label, price]) => ({
-      type: 'box', layout: 'horizontal', margin: 'sm',
-      contents: [
-        { type: 'text', text: label, size: 'sm', color: '#555555', flex: 6 },
-        { type: 'text', text: formatPrice(price), size: 'sm', color: '#333333', flex: 4, align: 'end', weight: 'bold' },
-      ],
-    }));
+    return items.map(function(item) {
+      return {
+        type: 'box', layout: 'horizontal', margin: 'sm',
+        contents: [
+          { type: 'text', text: item[0], size: 'sm', color: '#555555', flex: 6 },
+          { type: 'text', text: formatPrice(item[1]), size: 'sm', color: '#333333', flex: 4, align: 'end', weight: 'bold' },
+        ],
+      };
+    });
   }
   function sectionTitle(text) {
-    return { type: 'text', text, weight: 'bold', size: 'sm', color: '#3D6B8C', margin: 'md' };
+    return { type: 'text', text: text, weight: 'bold', size: 'sm', color: '#3D6B8C', margin: 'md' };
   }
-
   return {
     type: 'flex', altText: '敘事空域 價目表',
     contents: {
@@ -259,7 +284,7 @@ function buildPriceMessage() {
           { type: 'text', text: '📌 固定時段', weight: 'bold', size: 'md', color: '#222222' },
           { type: 'separator', margin: 'sm' },
           sectionTitle('平日（週一～五）'),
-          ...priceRows([
+          priceRows([
             ['早上 9:00~12:30', PRICES.fixed.weekday.morning],
             ['下午 13:30~17:00', PRICES.fixed.weekday.afternoon],
             ['晚上 18:00~21:30', PRICES.fixed.weekday.evening],
@@ -267,127 +292,32 @@ function buildPriceMessage() {
           ]),
           { type: 'separator', margin: 'md' },
           sectionTitle('假日（週六日＋連假）'),
-          ...priceRows([
+          priceRows([
             ['早上 9:00~12:30', PRICES.fixed.holiday.morning],
             ['下午 13:30~17:00', PRICES.fixed.holiday.afternoon],
             ['晚上 18:00~21:30', PRICES.fixed.holiday.evening],
             ['全天 9:00~17:00（8小時）', PRICES.fixed.holiday.fullday],
           ]),
           { type: 'separator', margin: 'md' },
-          { type: 'text', text: '⏰ 單一鐘點（每小時）', weight: 'bold', size: 'md', color: '#222222', margin: 'md' },
+          { type: 'text', text: '⏰ 單一鐘點（每30分鐘）', weight: 'bold', size: 'md', color: '#222222', margin: 'md' },
           { type: 'separator', margin: 'sm' },
           sectionTitle('平日（週一～五）'),
-          ...priceRows([
-            ['早上時段（09:00~12:00）', PRICES.hourly.weekday.morning],
-            ['下午時段（13:00~17:00）', PRICES.hourly.weekday.afternoon],
+          priceRows([
+            ['早上時段（09:00~13:00）', PRICES.hourly.weekday.morning],
+            ['下午時段（13:00~18:00）', PRICES.hourly.weekday.afternoon],
             ['晚上時段（18:00~21:00）', PRICES.hourly.weekday.evening],
           ]),
           { type: 'separator', margin: 'md' },
           sectionTitle('假日（週六日＋連假）'),
-          ...priceRows([
-            ['早上時段（09:00~12:00）', PRICES.hourly.holiday.morning],
-            ['下午時段（13:00~17:00）', PRICES.hourly.holiday.afternoon],
+          priceRows([
+            ['早上時段（09:00~13:00）', PRICES.hourly.holiday.morning],
+            ['下午時段（13:00~18:00）', PRICES.hourly.holiday.afternoon],
             ['晚上時段（18:00~21:00）', PRICES.hourly.holiday.evening],
           ]),
           { type: 'separator', margin: 'md' },
           { type: 'text', text: '※ 需提前 12 小時以上預約\n※ 不接受當天預約\n※ 單一鐘點可複選多個時段', size: 'xs', color: '#888888', wrap: true, margin: 'md' },
-        ],
+        ].flat(),
       },
-    },
-  };
-}
-
-function buildFixedSlotFlex(date, availableFixed, holiday) {
-  const dayLabel = holiday ? '假日' : '平日';
-  if (availableFixed.length === 0) {
-    return { type: 'text', text: `😢 ${date} 固定時段已全部預約完畢。` };
-  }
-  const buttons = availableFixed.map(slot => {
-    const price = getPrice('fixed', slot.period, holiday);
-    return {
-      type: 'button', style: 'primary', color: '#5B8DB8', height: 'sm',
-      action: {
-        type: 'postback',
-        label: `${slot.label}　${formatPrice(price)}`,
-        data: `action=confirmSlot&date=${date}&slot=${encodeURIComponent(slot.label)}&type=固定時段&price=${price}`,
-        displayText: `預約 ${date} ${slot.label}`,
-      },
-    };
-  });
-
-  return {
-    type: 'flex', altText: `${date} 固定時段`,
-    contents: {
-      type: 'bubble', size: 'giga',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
-        contents: [
-          { type: 'text', text: '敘事空域 🕘 固定時段', weight: 'bold', color: '#FFFFFF', size: 'lg' },
-          { type: 'text', text: `📅 ${date}　${dayLabel}`, color: '#FFFFFFCC', size: 'sm' },
-        ],
-      },
-      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
-    },
-  };
-}
-
-function buildHourlySlotFlex(date, availableHourly, selectedSlots, holiday) {
-  const dayLabel = holiday ? '假日' : '平日';
-  const total = calcHourlyTotal(selectedSlots, holiday);
-  const selectedCount = selectedSlots.length;
-
-  const buttons = availableHourly.map(slot => {
-    const price = getPrice('hourly', slot.period, holiday);
-    const isSelected = selectedSlots.includes(slot.label);
-    return {
-      type: 'button',
-      style: isSelected ? 'primary' : 'secondary',
-      color: isSelected ? '#E67E22' : undefined,
-      height: 'sm',
-      action: {
-        type: 'postback',
-        label: `${isSelected ? '✓ ' : ''}${slot.label} ${formatPrice(price)}`,
-        data: `action=toggleHourly&date=${date}&slot=${encodeURIComponent(slot.label)}&holiday=${holiday}`,
-        displayText: isSelected ? `取消 ${slot.label}` : `選擇 ${slot.label}`,
-      },
-    };
-  });
-
-  const footerContents = [];
-  if (selectedCount > 0) {
-    footerContents.push({
-      type: 'text',
-      text: `已選 ${selectedCount} 個時段，合計 ${formatPrice(total)}`,
-      size: 'sm', color: '#E67E22', weight: 'bold', align: 'center', margin: 'md',
-    });
-    footerContents.push({
-      type: 'button', style: 'primary', color: '#4CAF82',
-      action: {
-        type: 'postback',
-        label: `✅ 確認選擇（${formatPrice(total)}）`,
-        data: `action=confirmHourly&date=${date}&holiday=${holiday}`,
-        displayText: '確認鐘點時段選擇',
-      },
-    });
-  } else {
-    footerContents.push({
-      type: 'text', text: '請點選上方時段（可複選）', size: 'sm', color: '#888888', align: 'center', margin: 'md',
-    });
-  }
-
-  return {
-    type: 'flex', altText: `${date} 單一鐘點選擇`,
-    contents: {
-      type: 'bubble', size: 'giga',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#8B7355', paddingAll: 'md',
-        contents: [
-          { type: 'text', text: '敘事空域 ⏰ 單一鐘點', weight: 'bold', color: '#FFFFFF', size: 'lg' },
-          { type: 'text', text: `📅 ${date}　${dayLabel}　可複選多個時段`, color: '#FFFFFFCC', size: 'sm' },
-        ],
-      },
-      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
-      footer: { type: 'box', layout: 'vertical', contents: footerContents, paddingAll: 'md', spacing: 'sm' },
     },
   };
 }
@@ -402,7 +332,7 @@ function buildSlotTypePicker(date, holiday) {
         type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
         contents: [
           { type: 'text', text: '敘事空域', weight: 'bold', color: '#FFFFFF', size: 'lg' },
-          { type: 'text', text: `📅 ${date}　${dayLabel}`, color: '#FFFFFFCC', size: 'sm' },
+          { type: 'text', text: '📅 ' + date + '　' + dayLabel, color: '#FFFFFFCC', size: 'sm' },
         ],
       },
       body: {
@@ -411,11 +341,11 @@ function buildSlotTypePicker(date, holiday) {
           { type: 'text', text: '請選擇預約類型：', size: 'sm', color: '#555555' },
           {
             type: 'button', style: 'primary', color: '#5B8DB8',
-            action: { type: 'postback', label: '🕘 固定時段（3.5小時）', data: `action=chooseType&date=${date}&holiday=${holiday}&type=fixed`, displayText: '選擇固定時段' },
+            action: { type: 'postback', label: '🕘 固定時段（3.5小時）', data: 'action=chooseType&date=' + date + '&holiday=' + holiday + '&type=fixed', displayText: '選擇固定時段' },
           },
           {
             type: 'button', style: 'secondary',
-            action: { type: 'postback', label: '⏰ 單一鐘點（可複選）', data: `action=chooseType&date=${date}&holiday=${holiday}&type=hourly`, displayText: '選擇單一鐘點' },
+            action: { type: 'postback', label: '⏰ 單一鐘點（可複選）', data: 'action=chooseType&date=' + date + '&holiday=' + holiday + '&type=hourly', displayText: '選擇單一鐘點' },
           },
         ],
       },
@@ -423,35 +353,123 @@ function buildSlotTypePicker(date, holiday) {
   };
 }
 
-function buildConfirmFlex(date, slot, slotType, price) {
+function buildFixedSlotFlex(date, availableFixed, holiday) {
+  const dayLabel = holiday ? '假日' : '平日';
+  if (availableFixed.length === 0) {
+    return { type: 'text', text: '😢 ' + date + ' 固定時段已全部預約完畢。' };
+  }
+  const buttons = availableFixed.map(function(slot) {
+    const price = getPrice('fixed', slot.period, holiday);
+    return {
+      type: 'button', style: 'primary', color: '#5B8DB8', height: 'sm',
+      action: {
+        type: 'postback',
+        label: slot.label + '　' + formatPrice(price),
+        data: 'action=confirmSlot&date=' + date + '&slot=' + encodeURIComponent(slot.label) + '&type=固定時段&price=' + price,
+        displayText: '預約 ' + date + ' ' + slot.label,
+      },
+    };
+  });
   return {
-    type: 'flex', altText: '確認預約時段',
+    type: 'flex', altText: date + ' 固定時段',
+    contents: {
+      type: 'bubble', size: 'giga',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
+        contents: [
+          { type: 'text', text: '敘事空域 🕘 固定時段', weight: 'bold', color: '#FFFFFF', size: 'lg' },
+          { type: 'text', text: '📅 ' + date + '　' + dayLabel, color: '#FFFFFFCC', size: 'sm' },
+        ],
+      },
+      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
+    },
+  };
+}
+
+function buildHourlySlotFlex(date, availableHourly, selectedSlots, holiday) {
+  const dayLabel = holiday ? '假日' : '平日';
+  const total = calcHourlyTotal(selectedSlots, holiday);
+  const selectedCount = selectedSlots.length;
+
+  const buttons = availableHourly.map(function(slot) {
+    const price = getPrice('hourly', slot.period, holiday);
+    const isSelected = selectedSlots.indexOf(slot.label) !== -1;
+    return {
+      type: 'button',
+      style: isSelected ? 'primary' : 'secondary',
+      color: isSelected ? '#E67E22' : undefined,
+      height: 'sm',
+      action: {
+        type: 'postback',
+        label: (isSelected ? '✓ ' : '') + slot.label + ' ' + formatPrice(price),
+        data: 'action=toggleHourly&date=' + date + '&slot=' + encodeURIComponent(slot.label) + '&holiday=' + holiday,
+        displayText: isSelected ? '取消 ' + slot.label : '選擇 ' + slot.label,
+      },
+    };
+  });
+
+  const footerContents = [];
+  if (selectedCount > 0) {
+    footerContents.push({
+      type: 'text',
+      text: '已選 ' + selectedCount + ' 個時段，合計 ' + formatPrice(total),
+      size: 'sm', color: '#E67E22', weight: 'bold', align: 'center', margin: 'md',
+    });
+    footerContents.push({
+      type: 'button', style: 'primary', color: '#4CAF82',
+      action: {
+        type: 'postback',
+        label: '✅ 確認選擇（' + formatPrice(total) + '）',
+        data: 'action=confirmHourly&date=' + date + '&holiday=' + holiday,
+        displayText: '確認鐘點時段選擇',
+      },
+    });
+  } else {
+    footerContents.push({
+      type: 'text', text: '請點選上方時段（可複選）', size: 'sm', color: '#888888', align: 'center', margin: 'md',
+    });
+  }
+
+  return {
+    type: 'flex', altText: date + ' 單一鐘點選擇',
+    contents: {
+      type: 'bubble', size: 'giga',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: '#8B7355', paddingAll: 'md',
+        contents: [
+          { type: 'text', text: '敘事空域 ⏰ 單一鐘點', weight: 'bold', color: '#FFFFFF', size: 'lg' },
+          { type: 'text', text: '📅 ' + date + '　' + dayLabel + '　可複選多個時段', color: '#FFFFFFCC', size: 'sm' },
+        ],
+      },
+      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
+      footer: { type: 'box', layout: 'vertical', contents: footerContents, paddingAll: 'md', spacing: 'sm' },
+    },
+  };
+}
+
+function buildEventTypePicker() {
+  const types = ['講座', '課程', '活動', '其他'];
+  const buttons = types.map(function(t) {
+    return {
+      type: 'button', style: 'secondary', height: 'sm',
+      action: { type: 'postback', label: t, data: 'action=pickEventType&eventType=' + encodeURIComponent(t), displayText: '舉辦類型：' + t },
+    };
+  });
+  return {
+    type: 'flex', altText: '請選擇舉辦類型',
     contents: {
       type: 'bubble',
       header: {
         type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
-        contents: [{ type: 'text', text: '📋 確認預約時段', weight: 'bold', color: '#FFFFFF', size: 'lg' }],
+        contents: [{ type: 'text', text: '🎯 請選擇舉辦類型', weight: 'bold', color: '#FFFFFF', size: 'lg' }],
       },
-      body: {
-        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
-        contents: [
-          row('日期', date),
-          row('時段', slot),
-          row('類型', slotType),
-          row('費用', formatPrice(Number(price))),
-          { type: 'separator', margin: 'md' },
-          { type: 'text', text: '請輸入您的姓名：', margin: 'md', size: 'sm', color: '#555555' },
-        ],
-      },
+      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
     },
   };
 }
 
 function buildInfoConfirm(data) {
-  const slotDisplay = Array.isArray(data.selectedSlots) && data.selectedSlots.length > 0
-    ? data.selectedSlots.join('、')
-    : data.slot;
-
+  const slotDisplay = (data.selectedSlots && data.selectedSlots.length > 0) ? data.selectedSlots.join('、') : data.slot;
   return {
     type: 'flex', altText: '請確認以下預約資訊',
     contents: {
@@ -467,9 +485,10 @@ function buildInfoConfirm(data) {
           row('日期', data.date),
           row('時段', slotDisplay),
           row('類型', data.slotType),
+          row('舉辦類型', data.eventType),
           row('費用', formatPrice(Number(data.price))),
           row('電話', data.phone),
-          row('人數', `${data.headcount} 人`),
+          row('人數', data.headcount + ' 人'),
           row('備註', data.note || '無'),
         ],
       },
@@ -485,10 +504,7 @@ function buildInfoConfirm(data) {
 }
 
 function buildSuccessMessages(data) {
-  const slotDisplay = Array.isArray(data.selectedSlots) && data.selectedSlots.length > 0
-    ? data.selectedSlots.join('、')
-    : data.slot;
-
+  const slotDisplay = (data.selectedSlots && data.selectedSlots.length > 0) ? data.selectedSlots.join('、') : data.slot;
   const msg1 = {
     type: 'flex', altText: '預約成功！',
     contents: {
@@ -503,16 +519,16 @@ function buildSuccessMessages(data) {
           row('姓名', data.name),
           row('日期', data.date),
           row('時段', slotDisplay),
+          row('舉辦類型', data.eventType),
           row('費用', formatPrice(Number(data.price))),
           row('電話', data.phone),
-          row('人數', `${data.headcount} 人`),
+          row('人數', data.headcount + ' 人'),
           { type: 'separator', margin: 'md' },
           { type: 'text', text: '場域主理人：蘇郁翔\n聯繫電話：0939-607867', size: 'sm', color: '#555555', wrap: true, margin: 'md' },
         ],
       },
     },
   };
-
   const msg2 = {
     type: 'flex', altText: '匯款資訊',
     contents: {
@@ -529,20 +545,13 @@ function buildSuccessMessages(data) {
           row('帳號', '602-489-60988'),
           row('戶名', '鍾沛潔'),
           { type: 'separator', margin: 'md' },
-          {
-            type: 'text', margin: 'md', size: 'sm', color: '#555555', wrap: true,
-            text: '為確保您的預約檔期，請於本報價單發出後 3 個工作日內，匯款「訂金」至以上指定帳戶，並提供匯款帳號後五碼以利對帳。檔期保留將以訂金入帳為準。',
-          },
+          { type: 'text', margin: 'md', size: 'sm', color: '#555555', wrap: true, text: '為確保您的預約檔期，請於本報價單發出後 3 個工作日內，匯款「訂金」至以上指定帳戶，並提供匯款帳號後五碼以利對帳。檔期保留將以訂金入帳為準。' },
           { type: 'separator', margin: 'md' },
-          {
-            type: 'text', margin: 'md', size: 'sm', color: '#3D6B8C', wrap: true, weight: 'bold',
-            text: '感謝您選擇敘事空域 🏛️\n每一個故事，都值得一個好的空間。\n期待與您共創美好時光，若有任何需求請隨時聯繫我們！',
-          },
+          { type: 'text', margin: 'md', size: 'sm', color: '#3D6B8C', wrap: true, weight: 'bold', text: '感謝您選擇敘事空域 🏛️\n每一個故事，都值得一個好的空間。\n期待與您共創美好時光，若有任何需求請隨時聯繫我們！' },
         ],
       },
     },
   };
-
   return [msg1, msg2];
 }
 
@@ -564,16 +573,11 @@ async function handleEvent(event) {
     }
     if (text === '立即預約' || text === '預約') {
       clearSession(userId);
-      setSession(userId, 'pickDate');
+      setSession(userId, 'pickDate', {});
       return reply(event, buildDatePicker());
     }
     if (text === '價目表') return reply(event, buildPriceMessage());
     if (text === '選單' || text === 'menu') return reply(event, buildMainMenu());
-
-    if (step === 'inputName') {
-      setSession(userId, 'inputPhone', { name: text });
-      return reply(event, { type: 'text', text: `謝謝 ${text} 👋\n請輸入您的聯絡電話（必填）：` });
-    }
 
     if (step === 'inputPhone') {
       const cleaned = text.replace(/[-\s]/g, '');
@@ -612,21 +616,19 @@ async function handleEvent(event) {
     const params = new URLSearchParams(event.postback.data);
     const action = params.get('action');
 
-    // 選完日期
     if (action === 'pickDate') {
-      const date = event.postback.params?.date;
+      const date = event.postback.params && event.postback.params.date;
       if (!date) return;
-      const { allowed, reason } = checkDateAllowed(date);
-      if (!allowed) {
+      const check = checkDateAllowed(date);
+      if (!check.allowed) {
         clearSession(userId);
-        return reply(event, { type: 'text', text: `${reason}\n\n請輸入「立即預約」重新選擇。` });
+        return reply(event, { type: 'text', text: check.reason + '\n\n請輸入「立即預約」重新選擇。' });
       }
       const holiday = await isHoliday(date);
-      setSession(userId, 'pickType', { date, holiday, selectedSlots: [] });
+      setSession(userId, 'pickType', { date: date, holiday: holiday, selectedSlots: [] });
       return reply(event, buildSlotTypePicker(date, holiday));
     }
 
-    // 選擇固定或鐘點
     if (action === 'chooseType') {
       const date = params.get('date');
       const holiday = params.get('holiday') === 'true';
@@ -634,87 +636,73 @@ async function handleEvent(event) {
       const booked = await getBookedSlots(date);
 
       if (type === 'fixed') {
-        const available = FIXED_SLOTS.filter(s => !booked.includes(s.label));
+        const available = FIXED_SLOTS.filter(function(s) { return booked.indexOf(s.label) === -1; });
         if (available.length === 0) {
-          return reply(event, { type: 'text', text: `😢 ${date} 固定時段已全部預約完畢，請選擇單一鐘點或其他日期。` });
+          return reply(event, { type: 'text', text: '😢 ' + date + ' 固定時段已全部預約完畢，請選擇單一鐘點或其他日期。' });
         }
-        setSession(userId, 'pickFixed', { date, holiday });
+        setSession(userId, 'pickFixed', { date: date, holiday: holiday });
         return reply(event, buildFixedSlotFlex(date, available, holiday));
       }
 
       if (type === 'hourly') {
-        const available = HOURLY_SLOTS.filter(s => !booked.includes(s.label));
+        const available = HOURLY_SLOTS.filter(function(s) { return booked.indexOf(s.label) === -1; });
         if (available.length === 0) {
-          return reply(event, { type: 'text', text: `😢 ${date} 單一鐘點已全部預約完畢，請選擇固定時段或其他日期。` });
+          return reply(event, { type: 'text', text: '😢 ' + date + ' 單一鐘點已全部預約完畢。' });
         }
-        setSession(userId, 'pickHourly', { date, holiday, selectedSlots: [] });
+        setSession(userId, 'pickHourly', { date: date, holiday: holiday, selectedSlots: [] });
         return reply(event, buildHourlySlotFlex(date, available, [], holiday));
       }
     }
 
-    // 固定時段確認
     if (action === 'confirmSlot') {
       const date = params.get('date');
       const slot = decodeURIComponent(params.get('slot'));
       const slotType = params.get('type');
       const price = params.get('price');
-      setSession(userId, 'inputName', { date, slot, slotType, price, selectedSlots: [] });
+      // 自動帶入 LINE 名稱
+      const lineName = await getLineDisplayName(userId);
+      setSession(userId, 'inputPhone', { date: date, slot: slot, slotType: slotType, price: price, selectedSlots: [], name: lineName });
       return reply(event, [
-        buildConfirmFlex(date, slot, slotType, price),
-        { type: 'text', text: '請輸入您的姓名：' },
+        buildEventTypePicker(),
       ]);
     }
 
-    // 鐘點複選（toggle）
+    if (action === 'pickEventType') {
+      const eventType = decodeURIComponent(params.get('eventType'));
+      setSession(userId, 'inputPhone', { eventType: eventType });
+      const data = getData(userId);
+      return reply(event, { type: 'text', text: 'Hi ' + data.name + '！\n請輸入您的聯絡電話（必填）：' });
+    }
+
     if (action === 'toggleHourly') {
       const date = params.get('date');
       const holiday = params.get('holiday') === 'true';
       const slot = decodeURIComponent(params.get('slot'));
       const data = getData(userId);
-      let selected = data.selectedSlots || [];
-
-      if (selected.includes(slot)) {
-        selected = selected.filter(s => s !== slot);
-      } else {
-        selected = [...selected, slot];
-      }
-
+      let selected = (data.selectedSlots || []).slice();
+      const idx = selected.indexOf(slot);
+      if (idx !== -1) { selected.splice(idx, 1); } else { selected.push(slot); }
       setSession(userId, 'pickHourly', { selectedSlots: selected });
-
       const booked = await getBookedSlots(date);
-      const available = HOURLY_SLOTS.filter(s => !booked.includes(s.label));
+      const available = HOURLY_SLOTS.filter(function(s) { return booked.indexOf(s.label) === -1; });
       return reply(event, buildHourlySlotFlex(date, available, selected, holiday));
     }
 
-    // 鐘點確認完成
     if (action === 'confirmHourly') {
       const date = params.get('date');
       const holiday = params.get('holiday') === 'true';
       const data = getData(userId);
       const selected = data.selectedSlots || [];
-
       if (selected.length === 0) {
         return reply(event, { type: 'text', text: '⚠️ 請至少選擇一個時段！' });
       }
-
-      // 排序時段
-      const sorted = [...selected].sort();
+      const sorted = selected.slice().sort();
       const slotLabel = sorted.join('、');
       const total = calcHourlyTotal(sorted, holiday);
-
-      setSession(userId, 'inputName', {
-        date,
-        slot: slotLabel,
-        slotType: '單一鐘點',
-        price: total,
-        selectedSlots: sorted,
-        holiday,
-      });
-
-      return reply(event, [
-        buildConfirmFlex(date, slotLabel, '單一鐘點', total),
-        { type: 'text', text: '請輸入您的姓名：' },
-      ]);
+      // 自動帶入 LINE 名稱
+      const lineName = await getLineDisplayName(userId);
+      setSession(userId, 'inputPhone', { date: date, slot: slotLabel, slotType: '單一鐘點', price: total, selectedSlots: sorted, holiday: holiday, name: lineName });
+      return reply(event, [buildEventTypePicker()]);
     }
   }
 }
@@ -722,18 +710,12 @@ async function handleEvent(event) {
 async function processBooking(event, userId) {
   const data = getData(userId);
   const booked = await getBookedSlots(data.date);
-
-  // 檢查所有選定時段是否有衝突
-  const slots = data.selectedSlots && data.selectedSlots.length > 0
-    ? data.selectedSlots
-    : [data.slot];
-
-  const conflict = slots.find(s => booked.includes(s));
+  const slots = (data.selectedSlots && data.selectedSlots.length > 0) ? data.selectedSlots : [data.slot];
+  const conflict = slots.find(function(s) { return booked.indexOf(s) !== -1; });
   if (conflict) {
     clearSession(userId);
-    return reply(event, { type: 'text', text: `😢 ${conflict} 剛剛已被預約，請輸入「立即預約」重新選擇。` });
+    return reply(event, { type: 'text', text: '😢 ' + conflict + ' 剛剛已被預約，請輸入「立即預約」重新選擇。' });
   }
-
   const ok = await createBooking(data);
   clearSession(userId);
   if (ok) {
@@ -746,13 +728,13 @@ async function processBooking(event, userId) {
 // ── Webhook ───────────────────────────────────────────────
 app.post('/webhook', line.middleware(lineConfig), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
-    .then(result => res.json(result))
-    .catch(err => { console.error(err); res.status(500).end(); });
+    .then(function(result) { res.json(result); })
+    .catch(function(err) { console.error(err); res.status(500).end(); });
 });
 
 app.get('/', (req, res) => res.send('敘事空域 Bot 運行中 ✅'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ 啟動 Port: ${PORT}`));
+app.listen(PORT, () => console.log('✅ 啟動 Port: ' + PORT));
 
 module.exports = app;
