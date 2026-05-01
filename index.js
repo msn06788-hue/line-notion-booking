@@ -135,11 +135,11 @@ async function createBooking(booking) {
       parent: { database_id: DATABASE_ID },
       properties: {
         '預約姓名': { title: [{ text: { content: booking.name || '未提供' } }] },
-        '預約日期': { date: { start: booking.date } }, 
+        '預預日期': { date: { start: booking.date } }, // 請確保 Notion 上名稱為「預約日期」或與此對應
         '預約時段': { select: { name: booking.slot } },
         '聯絡電話': { phone_number: booking.phone || '' },
         '預約類型': { select: { name: booking.slotType || '固定時段' } },
-        // 核心修正點：根據截圖報錯，將 rich_text 改為 number 物件
+        // 核心修正點：將 rich_text 改為 number
         '人數':     { number: Number(booking.headcount || 1) }, 
         '備註':     { rich_text: [{ text: { content: booking.note || '' } }] },
         '預約來源': { select: { name: 'LINE' } },
@@ -183,8 +183,6 @@ function formatPrice(n) {
   return `NT$ ${n.toLocaleString()}`;
 }
 
-// ... 此處包含 buildMainMenu, buildDatePicker 等原版 UI 函數 (省略以節省空間) ...
-
 // ── 主要事件處理器 (維持對話與時數計算邏輯) ────────────────────────────────────────
 async function handleEvent(event) {
   const userId = event.source.userId;
@@ -195,13 +193,19 @@ async function handleEvent(event) {
 
     if (text === '取消' || text === '重新開始') {
       clearSession(userId);
-      return reply(event, { type: 'text', text: '已取消流程。' });
+      return reply(event, { type: 'text', text: '已為您取消。' });
+    }
+    if (text === '立即預約') {
+      clearSession(userId);
+      setSession(userId, 'pickDate');
+      // 調用日期選擇卡片 (此處假設 buildDatePicker 存在)
+      return reply(event, { type: 'text', text: '請選擇日期' }); 
     }
 
     // 處理時數 (針對單一鐘點)
     if (step === 'inputDuration') {
       const hours = parseInt(text, 10);
-      if (isNaN(hours) || hours < 1) return reply(event, { type: 'text', text: '請輸入正確的數字（小時數）。' });
+      if (isNaN(hours) || hours < 1) return reply(event, { type: 'text', text: '請輸入正確的小時數字。' });
       
       const data = getData(userId);
       const totalPrice = Number(data.basePrice) * hours;
@@ -224,20 +228,19 @@ async function handleEvent(event) {
 
     if (step === 'inputPhone') {
       setSession(userId, 'inputHeadcount', { phone: text });
-      return reply(event, { type: 'text', text: '請輸入預約人數 (純數字)：' });
+      return reply(event, { type: 'text', text: '請輸入預約人數：' });
     }
 
     if (step === 'inputHeadcount') {
       const n = parseInt(text, 10);
-      if (isNaN(n)) return reply(event, { type: 'text', text: '請輸入數字，例如：2' });
+      if (isNaN(n)) return reply(event, { type: 'text', text: '請輸入數字。' });
       setSession(userId, 'inputNote', { headcount: n });
       return reply(event, { type: 'text', text: '備註內容 (或輸入略過)：' });
     }
 
     if (step === 'inputNote') {
       setSession(userId, 'confirm', { note: text === '略過' ? '' : text });
-      // 這裡應調用 buildInfoConfirm 展示最後確認卡片
-      return reply(event, { type: 'text', text: '請確認資訊無誤後，輸入「確認預約」。' });
+      return reply(event, { type: 'text', text: '請確認資訊後回覆「確認預約」' });
     }
 
     if (step === 'confirm' && text === '確認預約') {
@@ -258,7 +261,7 @@ async function handleEvent(event) {
 
       if (slotType === '單一鐘點') {
         setSession(userId, 'inputDuration', { date, slot, slotType, basePrice: price, holiday: data.holiday });
-        return reply(event, { type: 'text', text: `您選擇了單點時段，請問預約幾小時？` });
+        return reply(event, { type: 'text', text: `請問預約幾小時？` });
       } else {
         setSession(userId, 'inputName', { date, slot, slotType, price, holiday: data.holiday });
         return reply(event, { type: 'text', text: '請輸入姓名：' });
@@ -274,7 +277,7 @@ async function processBooking(event, userId) {
   if (ok) {
     return reply(event, { type: 'text', text: '✅ 預約成功！' });
   } else {
-    return reply(event, { type: 'text', text: '⚠️ 寫入 Notion 失敗，請確認資料庫屬性類型。' });
+    return reply(event, { type: 'text', text: '⚠️ 系統寫入失敗，請確認資料庫欄位類型。' });
   }
 }
 
@@ -284,6 +287,8 @@ app.post('/webhook', line.middleware(lineConfig), (req, res) => {
     .then(result => res.json(result))
     .catch(err => { console.error(err); res.status(500).end(); });
 });
+
+app.get('/', (req, res) => res.send('敘事空域 Bot 運行中 ✅'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ 啟動 Port: ${PORT}`));
