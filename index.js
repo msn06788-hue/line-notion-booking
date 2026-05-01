@@ -1,111 +1,151 @@
+require('dotenv').config();
 const express = require('express');
-const { Client } = require('@notionhq/client');
 const line = require('@line/bot-sdk');
+const { Client } = require('@notionhq/client');
 
-const app = express();
-const notion = new Client({ auth: process.env.NOTION_TOKEN });
-
-const lineConfig = {
+// --- 1. 初始化設定 ---
+const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.LINE_CHANNEL_SECRET
+  channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 
-const client = new line.Client(lineConfig);
+const client = new line.Client(config);
+const notion = new Client({ auth: process.env.NOTION_INTEGRATION_TOKEN });
+const DATABASE_ID = process.env.NOTION_DATABASE_ID;
 
-// --- 1. 環境變數與欄位配置 ---
-const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID; // 管理群組 ID
-const COURSE_DB_ID = process.env.COURSE_DATABASE_ID; // 課程管理資料庫 ID
-const BOOKING_DB_ID = process.env.NOTION_DATABASE_ID; // 場地租借資料庫 ID
+const app = express();
 
-// --- 2. 核心功能：全好友課程推播 (Broadcast) ---
-async function broadcastNewCourse(replyToken) {
-  try {
-    // 從 Notion 抓取最新一筆課程資訊
-    const response = await notion.databases.query({
-      database_id: COURSE_DB_ID,
-      sorts: [{ property: '日期', direction: 'ascending' }],
-      page_size: 1
+// --- 2. 時段定義 ---
+const FIXED_SLOTS = ["早上 9:30~12:30", "下午 13:30~17:00", "晚上 18:00~21:30"];
+const HOURLY_SLOTS = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00"];
+
+// --- 3. Webhook 接收點 ---
+app.post('/webhook', line.middleware(config), (req, res) => {
+  Promise.all(req.body.events.map(handleEvent))
+    .then((result) => res.json(result))
+    .catch((err) => {
+      console.error(err);
+      res.status(500).end();
     });
+});
 
-    if (response.results.length === 0) return;
-
-    const course = response.results[0].properties;
-    const courseTitle = course["課程名稱"].title[0].plain_text;
-    const courseImage = course["海報網址"].url;
-    const courseDate = course["日期"].date.start;
-
-    // 發送精美的 Flex Message 給所有好友
-    await client.broadcast({
-      type: "flex",
-      altText: `新課程推薦：${courseTitle}`,
-      contents: {
-        type: "bubble",
-        hero: { type: "image", url: courseImage, size: "full", aspectRatio: "20:13", aspectMode: "cover" },
-        body: {
-          type: "box", layout: "vertical", contents: [
-            { type: "text", text: courseTitle, weight: "bold", size: "xl" },
-            { type: "text", text: `開課日期：${courseDate}`, size: "sm", color: "#666666" }
-          ]
-        },
-        footer: {
-          type: "box", layout: "vertical", contents: [
-            { type: "button", action: { type: "postback", label: "立即報名", data: `act=course_reg&id=${response.results[0].id}` }, style: "primary" }
+// --- 4. 事件處理中心 ---
+async function handleEvent(event) {
+  if (event.type === 'message' && event.message.type === 'text') {
+    const text = event.message.text;
+    
+    if (text === '預約場地') {
+      return client.replyMessage(event.replyToken, {
+        type: 'template',
+        altText: '請選擇預約日期',
+        template: {
+          type: 'buttons',
+          title: '預約場地',
+          text: '請先選擇您想預約的日期：',
+          actions: [
+            {
+              type: 'datetimepicker',
+              label: '選擇日期',
+              data: 'action=pickDate',
+              mode: 'date'
+            }
           ]
         }
-      }
-    });
+      });
+    }
+  }
 
-    await client.replyMessage(replyToken, { type: "text", text: "✅ 課程已成功推播給所有好友！" });
-  } catch (err) {
-    console.error("推播失敗:", err);
+  // 處理日期選擇後的邏輯
+  if (event.type === 'postback') {
+    const data = new URLSearchParams(event.postback.data);
+    const action = data.get('action');
+
+    if (action === 'pickDate') {
+      const selectedDate = event.postback.params.date;
+      return handleDateSelected(event.replyToken, selectedDate);
+    }
+
+    if (action === 'confirmBooking') {
+      const date = data.get('date');
+      const time = data.get('time');
+      return saveToNotion(event.replyToken, date, time);
+    }
   }
 }
 
-// --- 3. Webhook 處理流程 ---
-app.post('/webhook', line.middleware(lineConfig), (req, res) => {
-  res.status(200).send('OK'); // 秒回 200 OK
-  req.body.events.forEach(async (event) => {
-    // 文字觸發邏輯
-    if (event.type === 'message' && event.message.type === 'text') {
-      const text = event.message.text.trim();
-      
-      // 管理員指令：推播課程
-      if (text === "發布新課程") {
-        return await broadcastNewCourse(event.replyToken);
+// --- 5. 核心邏輯：查詢 Notion 並過濾已佔用時段 ---
+async function handleDateSelected(replyToken, date) {
+  try {
+    // A. 查詢 Notion 該日期已有的預約
+    const response = await notion.databases.query({
+      database_id: DATABASE_ID,
+      filter: {
+        property: "日期", // 請確保 Notion 欄位名稱正確
+        date: { equals: date }
       }
+    });
 
-      // 場地租借預約流程啟動
-      if (text.includes("預約")) {
-        return await client.replyMessage(event.replyToken, {
-          type: "template", altText: "預約方式",
-          template: {
-            type: "buttons", title: "預約第一步", text: "請問您的預約方式？",
-            actions: [
-              { type: "postback", label: "📦 場地租借", data: "act=mode&m=p" },
-              { type: "postback", label: "⏱️ 單一鐘點計時", data: "act=mode&m=h" }
-            ]
-          }
-        });
-      }
+    // B. 提取已佔用的時段陣列
+    const bookedSlots = response.results.map(page => {
+      return page.properties["預約時段"].select?.name || page.properties["預約時段"].title[0]?.plain_text;
+    });
+
+    // C. 過濾可用時段 (固定時段)
+    const availableFixed = FIXED_SLOTS.filter(slot => !bookedSlots.includes(slot));
+    
+    // D. 建立 Flex Message 按鈕
+    const buttons = availableFixed.map(slot => ({
+      type: "button",
+      action: {
+        type: "postback",
+        label: slot,
+        data: `action=confirmBooking&date=${date}&time=${slot}`,
+        displayText: `我要預約 ${date} ${slot}`
+      },
+      style: "primary",
+      margin: "sm"
+    }));
+
+    if (buttons.length === 0) {
+      return client.replyMessage(replyToken, { type: 'text', text: `抱歉，${date} 的固定時段已全數被預訂。` });
     }
 
-    // 按鈕 Postback 邏輯 (包含場地預約與課程報名)
-    if (event.type === 'postback') {
-      const data = new URLSearchParams(event.postback.data);
-      const act = data.get('act');
-
-      if (act === 'course_reg') {
-        // 處理課程報名邏輯 (此處將呼叫名額檢查與寫入)
-        await handleCourseRegistration(event, data.get('id'));
+    // E. 回傳動態產生的 Flex Message
+    return client.replyMessage(replyToken, {
+      type: "flex",
+      altText: "選擇時段",
+      contents: {
+        type: "bubble",
+        header: { type: "box", layout: "vertical", contents: [{ type: "text", text: `${date} 可選時段`, weight: "bold" }] },
+        body: { type: "box", layout: "vertical", contents: buttons }
       }
-      // ... 其餘場地預約邏輯 (act=mode, act=date 等) ...
-    }
-  });
-});
+    });
 
-async function handleCourseRegistration(event, courseId) {
-  // 1. 檢查名額 2. 扣除名額 3. 寫入 Notion 報名表 4. 推送通知給管理群組
-  // (此部分程式碼將根據後續名額欄位確認後補完)
+  } catch (error) {
+    console.error("Notion Query Error:", error);
+    return client.replyMessage(replyToken, { type: 'text', text: "系統查詢失敗，請稍後再試。" });
+  }
 }
 
-module.exports = app;
+// --- 6. 寫入 Notion ---
+async function saveToNotion(replyToken, date, time) {
+  try {
+    await notion.pages.create({
+      parent: { database_id: DATABASE_ID },
+      properties: {
+        "標題": { title: [{ text: { content: "新預約" } }] },
+        "日期": { date: { start: date } },
+        "預約時段": { select: { name: time } } // 假設 Notion 欄位是 Select 類型
+      }
+    });
+    return client.replyMessage(replyToken, { type: 'text', text: `✅ 恭喜！您已成功預約 ${date} 的 ${time}。` });
+  } catch (error) {
+    console.error("Notion Write Error:", error);
+    return client.replyMessage(replyToken, { type: 'text', text: "寫入資料庫失敗，請檢查欄位設定。" });
+  }
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
