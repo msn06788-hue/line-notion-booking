@@ -179,7 +179,7 @@ async function createBooking(booking) {
         '預約日期': { date: { start: booking.date } },
         '預約時段': { select: { name: booking.slot } },
         '聯絡電話': { phone_number: booking.phone || '' },
-        '預約類型': { select: { name: booking.slotType || '固定時段' } },
+        '預約類型': { select: { name: booking.slotType || '包場時段' } },
         '舉辦類型': { select: { name: booking.eventType || '其他' } },
         '金額':     { number: Number(booking.price) || 0 },
         '備註':     { rich_text: [{ text: { content: '人數：' + String(booking.headcount || 1) + ' 人' + (booking.note ? '\n備註：' + booking.note : '') } }] },
@@ -290,7 +290,7 @@ function buildPriceMessage() {
       body: {
         type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
         contents: [
-          { type: 'text', text: '📌 固定時段', weight: 'bold', size: 'md', color: '#222222' },
+          { type: 'text', text: '📌 包場時段', weight: 'bold', size: 'md', color: '#222222' },
           { type: 'separator', margin: 'sm' },
           st('平日（週一～五）'),
           ...priceRows([
@@ -372,7 +372,7 @@ function buildSlotTypePicker(date, holiday, bookedSlots) {
           ...warningContents,
           {
             type: 'button', style: fixedAvailCount > 0 ? 'primary' : 'secondary', color: fixedAvailCount > 0 ? '#5B8DB8' : undefined,
-            action: { type: 'postback', label: '🕘 固定時段（3.5小時）' + (fixedAvailCount === 0 ? ' - 已滿' : ''), data: 'action=chooseType&date=' + date + '&holiday=' + holiday + '&type=fixed', displayText: '選擇固定時段' },
+            action: { type: 'postback', label: '🕘 包場時段（3.5小時）' + (fixedAvailCount === 0 ? ' - 已滿' : ''), data: 'action=chooseType&date=' + date + '&holiday=' + holiday + '&type=fixed', displayText: '選擇包場時段' },
           },
           {
             type: 'button', style: 'secondary',
@@ -387,7 +387,7 @@ function buildSlotTypePicker(date, holiday, bookedSlots) {
 function buildFixedSlotFlex(date, availableFixed, holiday) {
   const dayLabel = holiday ? '假日' : '平日';
   if (availableFixed.length === 0) {
-    return { type: 'text', text: '😢 ' + date + ' 固定時段已全部預約完畢。' };
+    return { type: 'text', text: '😢 ' + date + ' 包場時段已全部預約完畢。' };
   }
   const buttons = availableFixed.map(function(slot) {
     const price = getPrice('fixed', slot.period, holiday);
@@ -396,19 +396,19 @@ function buildFixedSlotFlex(date, availableFixed, holiday) {
       action: {
         type: 'postback',
         label: slot.label + '　' + formatPrice(price),
-        data: 'action=confirmSlot&date=' + date + '&slot=' + encodeURIComponent(slot.label) + '&type=固定時段&price=' + price,
+        data: 'action=confirmSlot&date=' + date + '&slot=' + encodeURIComponent(slot.label) + '&type=包場時段&price=' + price,
         displayText: '預約 ' + date + ' ' + slot.label,
       },
     };
   });
   return {
-    type: 'flex', altText: date + ' 固定時段',
+    type: 'flex', altText: date + ' 包場時段',
     contents: {
       type: 'bubble', size: 'giga',
       header: {
         type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
         contents: [
-          { type: 'text', text: '敘事空域 🕘 固定時段', weight: 'bold', color: '#FFFFFF', size: 'lg' },
+          { type: 'text', text: '敘事空域 🏛️ 包場時段', weight: 'bold', color: '#FFFFFF', size: 'lg' },
           { type: 'text', text: '📅 ' + date + '　' + dayLabel, color: '#FFFFFFCC', size: 'sm' },
         ],
       },
@@ -706,7 +706,7 @@ async function handleEvent(event) {
       if (type === 'fixed') {
         const available = FIXED_SLOTS.filter(function(s) { return booked.indexOf(s.label) === -1; });
         if (available.length === 0) {
-          return reply(event, { type: 'text', text: '😢 ' + date + ' 固定時段已全部預約完畢，請選擇單一鐘點或其他日期。' });
+          return reply(event, { type: 'text', text: '😢 ' + date + ' 包場時段已全部預約完畢，請選擇單一鐘點或其他日期。' });
         }
         setSession(userId, 'pickFixed', { date: date, holiday: holiday });
         return reply(event, buildFixedSlotFlex(date, available, holiday));
@@ -734,10 +734,7 @@ async function handleEvent(event) {
       const data = getData(userId);
       return reply(event, {
         type: 'text',
-        text: 'Hi ' + data.name + '！\n請輸入您的聯絡電話（必填）：',
-        quickReply: {
-          items: [{ type: 'action', action: { type: 'uri', label: '📞 輸入電話', uri: 'tel:' } }],
-        },
+        text: 'Hi ' + data.name + '！\n\n請直接輸入您的聯絡電話（必填，10碼數字）：\n例如：0939607867',
       });
     }
 
