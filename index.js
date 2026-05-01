@@ -21,6 +21,7 @@ const SERVICE_INFO = {
   closing: "\n\n感謝您的預訂！😊\n⚠️ 提醒：目前報價僅保留三天，請於期限內完成匯款。匯款完成後，請記得告知小編您的「帳號後五碼」以利對帳，謝謝！"
 };
 
+// 價格表 (p: 包時段, h: 鐘點費)
 const PRICE_TABLE = {
   m: { name: "早上", p_wd: 4200, h_wd: 1500, p_we: 6000, h_we: 2200 },
   a: { name: "下午", p_wd: 4800, h_wd: 1700, p_we: 7200, h_we: 2600 },
@@ -30,7 +31,6 @@ const PRICE_TABLE = {
 
 let HOLIDAYS_2026 = [];
 
-// 介接政府 API 預留區
 async function syncHolidays() {
   try {
     const res = await axios.get('https://raw.githubusercontent.com/the-m-moore/taiwan-holidays/master/data/2026.json');
@@ -51,15 +51,22 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     for (let event of events) {
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text.trim();
-        if (text.includes("價目表")) return await sendPriceList(event.replyToken);
-        if (text.includes("預約")) {
+
+        // 【價目表觸發】
+        if (text === "價目表" || text.includes("價目表")) {
+          return await sendPriceList(event.replyToken);
+        }
+
+        // 【預約觸發】
+        if (text === "預約" || text.includes("立即預約")) {
           return await client.replyMessage(event.replyToken, {
-            type: "template", altText: "選擇方式",
+            type: "template",
+            altText: "選擇預約方式",
             template: {
               type: "buttons", title: "預約第一步", text: "請問您的預約方式？",
               actions: [
                 { type: "postback", label: "📦 包時段", data: "act=mode&m=p" },
-                { type: "postback", label: "⏱️ 計時預約", data: "act=mode&m=h" }
+                { type: "postback", label: "⏱️ 單一鐘點計時", data: "act=mode&m=h" }
               ]
             }
           });
@@ -73,11 +80,11 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         switch (act) {
           case 'mode':
             await client.replyMessage(event.replyToken, [
-              { type: "text", text: `已選擇方式：${m === 'p' ? '包時段' : '計時預約'}` },
+              { type: "text", text: `已選擇方式：${m === 'p' ? '包時段' : '單一鐘點計時'}` },
               {
-                type: "template", altText: "預約目的",
+                type: "template", altText: "舉辦類型",
                 template: {
-                  type: "buttons", title: "預約目的", text: "請問您的使用目的？",
+                  type: "buttons", title: "舉辦類型", text: "請問您的使用目的？",
                   actions: [
                     { type: "postback", label: "🎨 活動", data: `act=purp&m=${m}&p=活動` },
                     { type: "postback", label: "🎤 講座", data: `act=purp&m=${m}&p=講座` },
@@ -90,7 +97,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
           case 'purp':
             await client.replyMessage(event.replyToken, [
-              { type: "text", text: `已選擇目的：${p}` },
+              { type: "text", text: `舉辦類型：${p}` },
               {
                 type: "text", text: "請問預計人數？\n(⚠️ 注意：場地建議不超過 40 人)",
                 quickReply: {
@@ -107,11 +114,11 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
           case 'pax':
             await client.replyMessage(event.replyToken, [
-              { type: "text", text: `已選擇人數：${x}` },
+              { type: "text", text: `預計人數：${x}` },
               {
                 type: "template", altText: "選擇日期",
                 template: {
-                  type: "buttons", title: "選擇日期", text: "請選取您的預約日期：",
+                  type: "buttons", title: "選擇日期", text: "請選取預約日期：",
                   actions: [{ type: "datetimepicker", label: "📅 選取日期", data: `act=date&m=${m}&p=${p}&x=${x}`, mode: "date" }]
                 }
               }
@@ -122,17 +129,15 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             await sendSlotButtons(event.replyToken, event.postback.params.date, m, p, x);
             break;
 
-          case 'final': // 選擇了起始時段後的處理
-            if (m === 'p') {
-              await finalizeBooking(event, data);
-            } else {
-              // 計時預約：詢問單一時數時長，act 改為 last 以跳出循環
+          case 'final':
+            if (m === 'p') await finalizeBooking(event, data);
+            else {
               await client.replyMessage(event.replyToken, [
                 { type: "text", text: `已選時段：${PRICE_TABLE[s].name}` },
                 {
-                  type: "template", altText: "計時時長",
+                  type: "template", altText: "單一鐘點計時",
                   template: {
-                    type: "buttons", title: "計時預約時長", text: "請問預計預約幾小時？",
+                    type: "buttons", title: "預約時長", text: "請問預計預約幾小時？",
                     actions: [
                       { type: "postback", label: "2 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&s=${s}&h=2` },
                       { type: "postback", label: "3 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&s=${s}&h=3` },
@@ -144,7 +149,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             }
             break;
 
-          case 'last': // 最終結算步驟
+          case 'last':
             await finalizeBooking(event, data);
             break;
         }
@@ -158,24 +163,34 @@ async function finalizeBooking(event, data) {
   const m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), s = data.get('s'), h = parseInt(data.get('h') || 1);
   const isWknd = (new Date(d).getDay() === 0 || new Date(d).getDay() === 6) || HOLIDAYS_2026.includes(d);
   const pricing = PRICE_TABLE[s];
-  const amount = (m === 'p' ? (isWknd ? pricing.p_we : pricing.p_wd) : (isWknd ? pricing.h_we : pricing.h_wd) * h);
+  
+  // 【金額計算修復】
+  let amount = 0;
+  if (m === 'p') {
+    amount = isWknd ? pricing.p_we : pricing.p_wd;
+  } else {
+    // 單一鐘點計時邏輯：鐘點費 x 時數
+    const hourlyRate = isWknd ? pricing.h_we : pricing.h_wd;
+    amount = hourlyRate * h;
+  }
+
   const displayTime = `${d} ${pricing.name}${m === 'h' ? ` (${h}小時)` : ''}`;
 
   try {
     const dbId = getCleanDbId();
-    // 【衝突檢查邏輯】
-    const conflictCheck = await notion.databases.query({
+    // 衝突檢查
+    const conflict = await notion.databases.query({
       database_id: dbId,
       filter: { property: "時間", rich_text: { equals: displayTime } }
     });
 
-    if (conflictCheck.results.length > 0) {
+    if (conflict.results.length > 0) {
       return await client.replyMessage(event.replyToken, [
-        { type: "text", text: `⚠️ 預約失敗！\n時段：${displayTime} 已被佔用。` },
+        { type: "text", text: `⚠️ 預約失敗！時段 ${displayTime} 已有人預約。` },
         {
-          type: "template", altText: "重新選擇日期",
+          type: "template", altText: "重選日期",
           template: {
-            type: "buttons", title: "重新選取日期", text: "請改選其他日期或時段：",
+            type: "buttons", title: "請重選日期", text: "請改選其他日期或時段：",
             actions: [{ type: "datetimepicker", label: "📅 改選日期", data: `act=date&m=${m}&p=${p}&x=${x}`, mode: "date" }]
           }
         }
@@ -191,23 +206,23 @@ async function finalizeBooking(event, data) {
         "時間": { rich_text: [{ text: { content: displayTime } }] },
         "金額": { number: amount },
         "人數": { rich_text: [{ text: { content: x } }] },
-        "目的": { select: { name: p } }
+        "舉辦類型": { select: { name: p } } // 【欄位改名：目的 -> 舉辦類型】
       }
     });
 
     await client.replyMessage(event.replyToken, [
-      { type: 'text', text: `✅ 預約成功！\n目的：${p}\n人數：${x}\n預約時段：${displayTime}\n總計金額：NT$ ${amount}` },
+      { type: 'text', text: `✅ 預約成功！\n類型：${p}\n時段：${displayTime}\n總額：NT$ ${amount}` },
       { type: 'text', text: `${SERVICE_INFO.bank}\n${SERVICE_INFO.staff}\n${SERVICE_INFO.phone}${SERVICE_INFO.closing}` }
     ]);
   } catch (err) {
-    await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 錯誤：請確保 Notion 欄位名稱正確無空格。` });
+    await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 錯誤：請確保 Notion 欄位名稱「舉辦類型」正確。` });
   }
 }
 
 async function sendPriceList(replyToken) {
   return await client.replyMessage(replyToken, [
     { type: 'image', originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png", previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png" },
-    { type: 'text', text: "看過價目表後，輸入「預約」即可開始安排喔！" }
+    { type: 'text', text: "看完價目表後，輸入「預約」即可開始安排喔！" }
   ]);
 }
 
