@@ -18,12 +18,20 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     for (let event of events) {
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text;
-        if (text === '價目表') {
-          await client.replyMessage(event.replyToken, {
-            type: 'image',
-            originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
-            previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
-          });
+        // --- 價目表與導購語句修改段落 ---
+if (text === '價目表') {
+  await client.replyMessage(event.replyToken, [
+    {
+      type: 'image',
+      originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
+      previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
+    },
+    {
+      type: 'text',
+      text: "查看完價目表後，想請問您預計在哪個好日子來「敘事空域」坐坐呢？您可以直接回覆日期，或點擊選單中的「我要預約」來選擇時間喔！😊"
+    }
+  ]);
+}
         } else if (text === '我要預約') {
           await client.replyMessage(event.replyToken, {
             type: "template", altText: "請選擇預約時間",
