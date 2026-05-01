@@ -13,10 +13,10 @@ const lineConfig = {
 
 const client = new line.Client(lineConfig);
 
-// --- 1. Notion 欄位名稱定義 ---
+// --- 1. Notion 屬性設定 (請確保與 Notion 標題 100% 一致) ---
 const PROPS = {
   name: "名稱",
-  date: "日期",
+  date: "日期",      // 請確認 Notion 標題沒空格
   time: "時間",
   type: "舉辦類型",
   pax: "人數",
@@ -25,9 +25,9 @@ const PROPS = {
 };
 
 const PRICE_TABLE = {
-  m: { name: "早上", h_wd: 1500, h_we: 2200, p_wd: 4200, p_we: 6000 },
-  a: { name: "下午", h_wd: 1700, h_we: 2600, p_wd: 4800, p_we: 7200 },
-  e: { name: "晚上", h_wd: 2000, h_we: 3100, p_wd: 5400, p_we: 8400 },
+  m: { name: "早上", h_wd: 1500, h_we: 2200 },
+  a: { name: "下午", h_wd: 1700, h_we: 2600 },
+  e: { name: "晚上", h_wd: 2000, h_we: 3100 },
   f: { name: "全天", p_wd: 8400, p_we: 10800 }
 };
 
@@ -35,7 +35,7 @@ const SERVICE_INFO = {
   staff: "服務專員：蘇郁翔",
   phone: "服務電話：0939-607-867",
   bank: "🏦 匯款資訊：星展銀行 810 世貿分行\n帳號：602-489-60988\n戶名：鍾沛潔",
-  closing: "\n\n⚠️ 提醒：報價保留三天，匯款後請告知「帳號後五碼」。"
+  closing: "\n\n⚠️ 提醒：報價保留三天，請完成匯款後告知「帳號後五碼」。"
 };
 
 let HOLIDAYS_2026 = [];
@@ -47,33 +47,28 @@ async function syncHolidays() {
 }
 syncHolidays();
 
-// 強化的資料庫 ID 解析
-function getDbId() { 
-  const urlOrId = process.env.NOTION_DATABASE_ID || "";
-  if (urlOrId.includes("notion.so/")) {
-    return urlOrId.split("?")[0].split("/").pop().replace(/-/g, "");
-  }
-  return urlOrId.replace(/-/g, ""); 
+// 解析資料庫 ID
+function getDbId() {
+  const input = process.env.NOTION_DATABASE_ID || "";
+  return input.includes("notion.so/") ? input.split("?")[0].split("/").pop().replace(/-/g, "") : input.replace(/-/g, "");
 }
 
-// 【核心修復 1】Webhook 路由：非同步背景處理，解決超時卡頓
+// 【修復】非同步回應機制，解決按鈕沒反應的問題
 app.post('/webhook', line.middleware(lineConfig), (req, res) => {
-  // 1. 立刻回應 LINE，告訴它「我收到了」，停止囤積訊息
-  res.status(200).end();
+  // 1. 立刻回應 200 OK，這能防止 LINE 伺服器超時
+  res.status(200).send('OK');
 
-  // 2. 在背景慢慢處理事件
+  // 2. 在背景非同步處理事件
   req.body.events.forEach(async (event) => {
     try {
-      await handleEvent(event);
+      await handleLineEvent(event);
     } catch (err) {
-      console.error("事件處理失敗:", err);
+      console.error("處理失敗:", err);
     }
   });
 });
 
-// 獨立的事件處理函數
-async function handleEvent(event) {
-  // --- 文字訊息 ---
+async function handleLineEvent(event) {
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
     if (text.includes("價目表")) {
@@ -82,7 +77,7 @@ async function handleEvent(event) {
         originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
         previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
       }]);
-    } 
+    }
     if (text.includes("預約")) {
       return client.replyMessage(event.replyToken, {
         type: "template", altText: "預約方式",
@@ -97,10 +92,9 @@ async function handleEvent(event) {
     }
   }
 
-  // --- 按鈕 Postback ---
   if (event.type === 'postback') {
     const data = new URLSearchParams(event.postback.data);
-    const act = data.get('act'), m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), t = data.get('t');
+    const act = data.get('act'), m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), t = data.get('t'), h = data.get('h'), s = data.get('s');
 
     switch (act) {
       case 'mode':
@@ -143,9 +137,8 @@ async function handleEvent(event) {
         await client.replyMessage(event.replyToken, {
           type: "template", altText: "選時長",
           template: {
-            type: "buttons", title: "預約小時數", text: `起始：${t}\n請問預計預約幾小時？`,
+            type: "buttons", title: "預約時數", text: `已選起始：${t}\n請問預計使用幾小時？`,
             actions: [
-              { type: "postback", label: "1 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=1` },
               { type: "postback", label: "2 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=2` },
               { type: "postback", label: "3 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=3` },
               { type: "postback", label: "4 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=4` }
@@ -166,14 +159,11 @@ async function handleDateSelected(event, data) {
   const m = data.get('m'), p = data.get('p'), x = data.get('x');
   
   try {
-    const dbId = getDbId();
-    if (!dbId) throw new Error("環境變數 NOTION_DATABASE_ID 未設定或格式錯誤");
-
     const res = await notion.databases.query({
-      database_id: dbId,
+      database_id: getDbId(),
       filter: { property: PROPS.date, date: { equals: date } }
     });
-
+    
     const booked = res.results.map(page => page.properties[PROPS.time]?.rich_text[0]?.plain_text).filter(Boolean).join(", ");
     const info = booked ? `📅 ${date} 已訂時段：\n${booked}` : `📅 ${date} 目前無預訂。`;
 
@@ -181,7 +171,7 @@ async function handleDateSelected(event, data) {
       await client.replyMessage(event.replyToken, [
         { type: "text", text: info },
         { type: "template", altText: "包時段", template: {
-          type: "buttons", title: "請選取包時段", text: "請選擇：",
+          type: "buttons", title: "請選取時段", text: "請選擇：",
           actions: [
             { type: "postback", label: "早上", data: `act=final&m=${m}&p=${p}&x=${x}&d=${date}&s=m` },
             { type: "postback", label: "下午", data: `act=final&m=${m}&p=${p}&x=${x}&d=${date}&s=a` },
@@ -193,15 +183,11 @@ async function handleDateSelected(event, data) {
     } else {
       const times = ["09:00", "09:30", "10:00", "10:30", "11:00", "11:30", "13:00", "13:30", "14:00", "14:30", "15:00", "15:30", "18:00", "18:30"];
       const qrItems = times.map(t => ({ type: "action", action: { type: "postback", label: t, data: `act=h_start&m=${m}&p=${p}&x=${x}&d=${date}&t=${t}` }}));
-      await client.replyMessage(event.replyToken, [{ type: "text", text: info }, { type: "text", text: "請選取起始時間：", quickReply: { items: qrItems }}]);
+      await client.replyMessage(event.replyToken, [{ type: "text", text: info }, { type: "text", text: "請滑動選取起始時間：", quickReply: { items: qrItems }}]);
     }
-  } catch (err) { 
-    // 【核心修復 2】把真實的錯誤訊息印出來，方便抓錯！
-    console.error("查詢 Notion 失敗:", err);
-    await client.replyMessage(event.replyToken, { 
-      type: "text", 
-      text: `❌ 查詢 Notion 發生錯誤！\n請截圖此訊息給工程師：\n${err.message}` 
-    }); 
+  } catch (err) {
+    // 【修復】直接把真真實實的報錯印出來，不再瞎猜
+    await client.replyMessage(event.replyToken, { type: "text", text: `❌ 查詢 Notion 錯誤！詳細原因：\n${err.message}` });
   }
 }
 
@@ -234,10 +220,9 @@ async function finalizeBooking(event, data) {
         [PROPS.slot]: { rich_text: [{ text: { content: PRICE_TABLE[slotKey].name } }] }
       }
     });
-    await client.replyMessage(event.replyToken, [{ type: 'text', text: `✅ 預約成功！\n時段：${d} ${timeStr}\n金額：NT$ ${amount}` }, { type: 'text', text: SERVICE_INFO.staff + "\n" + SERVICE_INFO.phone + "\n" + SERVICE_INFO.bank + SERVICE_INFO.closing }]);
-  } catch (err) { 
-    console.error("寫入 Notion 失敗:", err);
-    await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 預約寫入失敗！錯誤細節：\n${err.message}` }); 
+    await client.replyMessage(event.replyToken, [{ type: 'text', text: `✅ 預預申請成功！\n時段：${d} ${timeStr}\n金額：NT$ ${amount}` }, { type: 'text', text: SERVICE_INFO.staff + "\n" + SERVICE_INFO.phone + "\n" + SERVICE_INFO.bank + SERVICE_INFO.closing }]);
+  } catch (err) {
+    await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 預約失敗！錯誤原因：\n${err.message}` });
   }
 }
 
