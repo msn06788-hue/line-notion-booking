@@ -13,29 +13,29 @@ const lineConfig = {
 
 const client = new line.Client(lineConfig);
 
-// --- 1. Notion 屬性定義 (請確保與截圖 2026-05-01 下午3.12.11.png 完全一致) ---
-const NOTION_PROPS = {
-  name: "名稱",
-  date: "日期",      // Date 類型
-  time: "時間",      // Text 類型
-  amount: "金額",    // Number 類型
-  pax: "人數",      // Text 類型
-  type: "舉辦類型",  // Select 類型
-  slot: "預約時段"   // Text 類型
+// --- 1. Notion 欄位名稱定義 (與截圖 2026-05-01 下午3.12.11.png 完全一致) ---
+const PROPS = {
+  name: "名稱",       // Title
+  date: "日期",       // Date
+  time: "時間",       // Text
+  type: "舉辦類型",    // Select
+  pax: "人數",        // Text
+  amount: "金額",     // Number
+  slot: "預約時段"     // Text
+};
+
+const PRICE_TABLE = {
+  m: { name: "早上", h_wd: 1500, h_we: 2200, p_wd: 4200, p_we: 6000 },
+  a: { name: "下午", h_wd: 1700, h_we: 2600, p_wd: 4800, p_we: 7200 },
+  e: { name: "晚上", h_wd: 2000, h_we: 3100, p_wd: 5400, p_we: 8400 },
+  f: { name: "全天", p_wd: 8400, p_we: 10800 }
 };
 
 const SERVICE_INFO = {
   staff: "服務專員：蘇郁翔",
   phone: "服務電話：0939-607-867",
-  bank: "🏦 匯款資訊：星展銀行 810 世貿分行 帳號：602-489-60988 戶名：鍾沛潔",
-  closing: "\n\n感謝您的預訂！😊\n⚠️ 提醒：報價保留三天，請完成匯款後告知小編「帳號後五碼」。"
-};
-
-const PRICE_TABLE = {
-  m: { name: "早上", h_wd: 1500, h_we: 2200 },
-  a: { name: "下午", h_wd: 1700, h_we: 2600 },
-  e: { name: "晚上", h_wd: 2000, h_we: 3100 },
-  f: { name: "全天", p_wd: 8400, p_we: 10800 }
+  bank: "🏦 匯款資訊：星展銀行 810 世貿分行\n帳號：602-489-60988\n戶名：鍾沛潔",
+  closing: "\n\n⚠️ 提醒：報價保留三天，匯款後請告知「帳號後五碼」。"
 };
 
 let HOLIDAYS_2026 = [];
@@ -47,19 +47,23 @@ async function syncHolidays() {
 }
 syncHolidays();
 
-function getCleanDbId() {
-  return (process.env.NOTION_DATABASE_ID || "").split("?")[0].split("/").pop().replace(/-/g, "");
-}
+function getDbId() { return (process.env.NOTION_DATABASE_ID || "").split("?")[0].split("/").pop().replace(/-/g, ""); }
 
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
-    const events = req.body.events;
-    for (let event of events) {
+    for (let event of req.body.events) {
+      // --- A. 文字訊息觸發 ---
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text.trim();
-        if (text.includes("預約")) {
+        if (text.includes("價目表")) {
+          await client.replyMessage(event.replyToken, [{
+            type: 'image',
+            originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
+            previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
+          }]);
+        } else if (text.includes("預約")) {
           await client.replyMessage(event.replyToken, {
-            type: "template", altText: "選擇預約方式",
+            type: "template", altText: "預約方式",
             template: {
               type: "buttons", title: "預約第一步", text: "請問您的預約方式？",
               actions: [
@@ -68,101 +72,91 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
               ]
             }
           });
-          continue;
         }
       }
 
+      // --- B. 按鈕 Postback 觸發 ---
       if (event.type === 'postback') {
         const data = new URLSearchParams(event.postback.data);
         const act = data.get('act'), m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), t = data.get('t'), h = data.get('h'), s = data.get('s');
 
         switch (act) {
           case 'mode':
-            await client.replyMessage(event.replyToken, [
-              { type: "text", text: `已選方式：${m === 'p' ? '包時段' : '單一鐘點計時'}` },
-              { type: "template", altText: "類型", template: {
+            await client.replyMessage(event.replyToken, {
+              type: "template", altText: "舉辦類型",
+              template: {
                 type: "buttons", title: "舉辦類型", text: "請問您的使用目的？",
                 actions: [
                   { type: "postback", label: "🎨 活動", data: `act=purp&m=${m}&p=活動` },
                   { type: "postback", label: "🎤 講座", data: `act=purp&m=${m}&p=講座` },
                   { type: "postback", label: "📚 課程", data: `act=purp&m=${m}&p=課程` }
                 ]
-              }}
-            ]);
+              }
+            });
             break;
           case 'purp':
-            await client.replyMessage(event.replyToken, [
-              { type: "text", text: `類型：${p}` },
-              { type: "text", text: "預計人數？\n(⚠️ 建議不超過 40 人)", quickReply: { items: [
+            await client.replyMessage(event.replyToken, {
+              type: "text", text: "請問預計人數？\n(⚠️ 建議不超過 40 人)",
+              quickReply: { items: [
                 { type: "action", action: { type: "postback", label: "1-10人", data: `act=pax&m=${m}&p=${p}&x=1-10` }},
                 { type: "action", action: { type: "postback", label: "11-20人", data: `act=pax&m=${m}&p=${p}&x=11-20` }},
                 { type: "action", action: { type: "postback", label: "21-30人", data: `act=pax&m=${m}&p=${p}&x=21-30` }},
                 { type: "action", action: { type: "postback", label: "31-40人", data: `act=pax&m=${m}&p=${p}&x=31-40` }}
-              ]}}
-            ]);
+              ]}
+            });
             break;
           case 'pax':
-            // 【修復】這裡將資訊傳給日期選擇器
-            await client.replyMessage(event.replyToken, [
-              { type: "text", text: `人數：${x}` },
-              { type: "template", altText: "選日期", template: {
-                type: "buttons", title: "選取日期", text: "請點選下方按鈕開啟日期滾輪：",
-                actions: [{ type: "datetimepicker", label: "📅 日期滾輪", data: `act=date&m=${m}&p=${p}&x=${x}`, mode: "date" }]
-              }}
-            ]);
+            await client.replyMessage(event.replyToken, {
+              type: "template", altText: "選日期",
+              template: {
+                type: "buttons", title: "選擇日期", text: "請點選按鈕選取日期：",
+                actions: [{ type: "datetimepicker", label: "📅 選取日期", data: `act=date&m=${m}&p=${p}&x=${x}`, mode: "date" }]
+              }
+            });
             break;
           case 'date':
-            // 當選完日期滾輪後，進入此 case
-            const selDate = event.postback.params.date;
-            await checkDayBookings(event.replyToken, selDate, m, p, x);
+            await handleDateSelected(event, data);
             break;
           case 'h_start':
-            await client.replyMessage(event.replyToken, [
-              { type: "text", text: `起始：${t}` },
-              { type: "template", altText: "時數", template: {
-                type: "buttons", title: "預約時數", text: "單一鐘點計時，預計使用幾小時？",
+            await client.replyMessage(event.replyToken, {
+              type: "template", altText: "選時長",
+              template: {
+                type: "buttons", title: "預約小時數", text: "請問預計預約幾小時？",
                 actions: [
-                  { type: "postback", label: "1h", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=1` },
-                  { type: "postback", label: "2h", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=2` },
-                  { type: "postback", label: "3h", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=3` },
-                  { type: "postback", label: "4h", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=4` }
+                  { type: "postback", label: "2 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=2` },
+                  { type: "postback", label: "3 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=3` },
+                  { type: "postback", label: "4 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&t=${t}&h=4` }
                 ]
-              }}
-            ]);
-            break;
-          case 'final':
-            await finalizeBooking(event, data);
+              }
+            });
             break;
           case 'last':
+          case 'final':
             await finalizeBooking(event, data);
             break;
         }
       }
     }
     res.status(200).send('OK');
-  } catch (err) { res.status(500).send('Error'); }
+  } catch (err) { res.status(200).send('OK'); } // 確保不阻塞 Webhook
 });
 
-async function checkDayBookings(replyToken, date, m, p, x) {
+async function handleDateSelected(event, data) {
+  const date = event.postback.params.date;
+  const m = data.get('m'), p = data.get('p'), x = data.get('x');
   try {
     const res = await notion.databases.query({
-      database_id: getCleanDbId(),
-      filter: { property: NOTION_PROPS.date, date: { equals: date } }
+      database_id: getDbId(),
+      filter: { property: PROPS.date, date: { equals: date } }
     });
-
-    const booked = res.results.map(page => {
-      const time = page.properties[NOTION_PROPS.time]?.rich_text[0]?.plain_text;
-      return time || null;
-    }).filter(Boolean).join(", ");
-
+    const booked = res.results.map(page => page.properties[PROPS.time]?.rich_text[0]?.plain_text).filter(Boolean).join(", ");
     const info = booked ? `📅 ${date} 已訂時段：\n${booked}` : `📅 ${date} 目前無預訂。`;
-    
+
     if (m === 'p') {
-      // 包時段流程：顯示 早上、下午、晚上、全天
-      await client.replyMessage(replyToken, [
+      await client.replyMessage(event.replyToken, [
         { type: "text", text: info },
-        { type: "template", altText: "時段", template: {
-          type: "buttons", title: "包時段預約", text: "請選取您要的時段：",
+        { type: "template", altText: "包時段", template: {
+          type: "buttons", title: "請選取包時段", text: "請選擇：",
           actions: [
             { type: "postback", label: "早上", data: `act=final&m=${m}&p=${p}&x=${x}&d=${date}&s=m` },
             { type: "postback", label: "下午", data: `act=final&m=${m}&p=${p}&x=${x}&d=${date}&s=a` },
@@ -172,28 +166,24 @@ async function checkDayBookings(replyToken, date, m, p, x) {
         }}
       ]);
     } else {
-      // 單一鐘點流程：顯示 Quick Reply 時間點
       const times = ["09:00", "09:30", "10:00", "10:30", "11:00", "11:30", "13:00", "13:30", "14:00", "14:30", "15:00", "15:30", "18:00", "18:30"];
-      const qrItems = times.map(time => ({ type: "action", action: { type: "postback", label: time, data: `act=h_start&m=${m}&p=${p}&x=${x}&d=${date}&t=${time}` }}));
-      await client.replyMessage(replyToken, [{ type: "text", text: info }, { type: "text", text: "請滑動選取「起始時間」：", quickReply: { items: qrItems }}]);
+      const qrItems = times.map(t => ({ type: "action", action: { type: "postback", label: t, data: `act=h_start&m=${m}&p=${p}&x=${x}&d=${date}&t=${t}` }}));
+      await client.replyMessage(event.replyToken, [{ type: "text", text: info }, { type: "text", text: "請選取起始時間：", quickReply: { items: qrItems }}]);
     }
-  } catch (err) {
-    console.error("Notion 查詢錯誤:", err);
-    await client.replyMessage(replyToken, { type: "text", text: "❌ 查詢日期失敗。原因可能為：Notion 資料庫欄位名稱不符或類型錯誤。" });
-  }
+  } catch (err) { await client.replyMessage(event.replyToken, { type: "text", text: "❌ 查詢 Notion 日期失敗，請確認欄位名稱為「日期」。" }); }
 }
 
 async function finalizeBooking(event, data) {
-  const m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), t = data.get('t'), h = parseInt(data.get('h')), s = data.get('s');
-  let displayTime = "", amount = 0, slotKey = s || 'm';
+  const m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), t = data.get('t'), h = parseInt(data.get('h') || 0), s = data.get('s');
   const isWknd = [0, 6].includes(new Date(d).getDay()) || HOLIDAYS_2026.includes(d);
+  let timeStr = "", amount = 0, slotKey = s || 'm';
 
   if (m === 'p') {
-    displayTime = PRICE_TABLE[s].name;
+    timeStr = PRICE_TABLE[s].name;
     amount = isWknd ? PRICE_TABLE[s].p_we : PRICE_TABLE[s].p_wd;
   } else {
     let [sH, sM] = t.split(':').map(Number);
-    displayTime = `${t}~${String(sH + h).padStart(2, '0')}:${String(sM).padStart(2, '0')}`;
+    timeStr = `${t}~${String(sH + h).padStart(2, '0')}:${String(sM).padStart(2, '0')}`;
     slotKey = sH < 13 ? 'm' : (sH < 18 ? 'a' : 'e');
     amount = PRICE_TABLE[slotKey][`h_${isWknd ? 'we' : 'wd'}`] * h;
   }
@@ -201,20 +191,19 @@ async function finalizeBooking(event, data) {
   try {
     const profile = await client.getProfile(event.source.userId);
     await notion.pages.create({
-      parent: { database_id: getCleanDbId() },
+      parent: { database_id: getDbId() },
       properties: {
-        [NOTION_PROPS.name]: { title: [{ text: { content: profile.displayName } }] },
-        [NOTION_PROPS.date]: { date: { start: d } },
-        [NOTION_PROPS.time]: { rich_text: [{ text: { content: displayTime } }] },
-        [NOTION_PROPS.amount]: { number: amount },
-        [NOTION_PROPS.pax]: { rich_text: [{ text: { content: x } }] },
-        [NOTION_PROPS.type]: { select: { name: p } },
-        [NOTION_PROPS.slot]: { rich_text: [{ text: { content: PRICE_TABLE[slotKey].name } }] }
+        [PROPS.name]: { title: [{ text: { content: profile.displayName } }] },
+        [PROPS.date]: { date: { start: d } },
+        [PROPS.time]: { rich_text: [{ text: { content: timeStr } }] },
+        [PROPS.amount]: { number: amount },
+        [PROPS.pax]: { rich_text: [{ text: { content: x } }] },
+        [PROPS.type]: { select: { name: p } },
+        [PROPS.slot]: { rich_text: [{ text: { content: PRICE_TABLE[slotKey].name } }] }
       }
     });
-    await client.replyMessage(event.replyToken, [{ type: 'text', text: `✅ 預約成功！\n類型：${p}\n日期：${d}\n時間：${displayTime}\n金額：NT$ ${amount}` }, { type: 'text', text: SERVICE_INFO.staff + "\n" + SERVICE_INFO.phone + "\n" + SERVICE_INFO.closing }]);
-  } catch (err) {
-    console.error("Notion 寫入錯誤:", err);
-    await client.replyMessage(event.replyToken, { type: 'text', text: "❌ 預約失敗，請檢查 Notion 欄位名稱是否正確。" });
-  }
+    await client.replyMessage(event.replyToken, [{ type: 'text', text: `✅ 預約成功！\n時段：${d} ${timeStr}\n金額：NT$ ${amount}` }, { type: 'text', text: SERVICE_INFO.staff + "\n" + SERVICE_INFO.phone + "\n" + SERVICE_INFO.bank + SERVICE_INFO.closing }]);
+  } catch (err) { await client.replyMessage(event.replyToken, { type: 'text', text: "❌ 預約寫入失敗，請確認 Notion 欄位名稱是否正確。" }); }
 }
+
+module.exports = app;
