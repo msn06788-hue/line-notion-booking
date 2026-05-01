@@ -13,7 +13,7 @@ const lineConfig = {
 
 const client = new line.Client(lineConfig);
 
-// --- 1. 設定區：報價、服務資訊、假日資料 ---
+// --- 1. 服務資訊與報價設定 ---
 const SERVICE_INFO = {
   staff: "服務專員：蘇郁翔",
   phone: "服務電話：0939-607-867",
@@ -21,7 +21,7 @@ const SERVICE_INFO = {
   closing: "\n\n感謝您的預訂！😊\n⚠️ 提醒：目前報價僅保留三天，請於期限內完成匯款。匯款完成後，請記得告知小編您的「帳號後五碼」以利對帳，謝謝！"
 };
 
-// 價格表 (p: 包時段, h: 鐘點費)
+// 價格表 (p: 包時段總價, h: 每小時鐘點費)
 const PRICE_TABLE = {
   m: { name: "早上", p_wd: 4200, h_wd: 1500, p_we: 6000, h_we: 2200 },
   a: { name: "下午", p_wd: 4800, h_wd: 1700, p_we: 7200, h_we: 2600 },
@@ -31,6 +31,7 @@ const PRICE_TABLE = {
 
 let HOLIDAYS_2026 = [];
 
+// 介接政府 API 預留位置
 async function syncHolidays() {
   try {
     const res = await axios.get('https://raw.githubusercontent.com/the-m-moore/taiwan-holidays/master/data/2026.json');
@@ -51,17 +52,10 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     for (let event of events) {
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text.trim();
-
-        // 【價目表觸發】
-        if (text === "價目表" || text.includes("價目表")) {
-          return await sendPriceList(event.replyToken);
-        }
-
-        // 【預約觸發】
+        if (text.includes("價目表")) return await sendPriceList(event.replyToken);
         if (text === "預約" || text.includes("立即預約")) {
           return await client.replyMessage(event.replyToken, {
-            type: "template",
-            altText: "選擇預約方式",
+            type: "template", altText: "選擇預約方式",
             template: {
               type: "buttons", title: "預約第一步", text: "請問您的預約方式？",
               actions: [
@@ -80,7 +74,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         switch (act) {
           case 'mode':
             await client.replyMessage(event.replyToken, [
-              { type: "text", text: `已選擇方式：${m === 'p' ? '包時段' : '單一鐘點計時'}` },
+              { type: "text", text: `已選方式：${m === 'p' ? '包時段' : '單一鐘點計時'}` },
               {
                 type: "template", altText: "舉辦類型",
                 template: {
@@ -130,14 +124,16 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             break;
 
           case 'final':
-            if (m === 'p') await finalizeBooking(event, data);
-            else {
+            if (m === 'p') {
+              await finalizeBooking(event, data);
+            } else {
+              // 單一鐘點計時：選擇時長後 act 轉為 last 結算
               await client.replyMessage(event.replyToken, [
-                { type: "text", text: `已選時段：${PRICE_TABLE[s].name}` },
+                { type: "text", text: `起始時段：${PRICE_TABLE[s].name}` },
                 {
-                  type: "template", altText: "單一鐘點計時",
+                  type: "template", altText: "選擇時長",
                   template: {
-                    type: "buttons", title: "預約時長", text: "請問預計預約幾小時？",
+                    type: "buttons", title: "單一鐘點計時", text: "請問預約幾小時？",
                     actions: [
                       { type: "postback", label: "2 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&s=${s}&h=2` },
                       { type: "postback", label: "3 小時", data: `act=last&m=${m}&p=${p}&x=${x}&d=${d}&s=${s}&h=3` },
@@ -159,21 +155,16 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   } catch (error) { res.status(500).send('Error'); }
 });
 
+/**
+ * 核心結算：防撞檢查、精確金額計算
+ */
 async function finalizeBooking(event, data) {
   const m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), s = data.get('s'), h = parseInt(data.get('h') || 1);
   const isWknd = (new Date(d).getDay() === 0 || new Date(d).getDay() === 6) || HOLIDAYS_2026.includes(d);
   const pricing = PRICE_TABLE[s];
-  
-  // 【金額計算修復】
-  let amount = 0;
-  if (m === 'p') {
-    amount = isWknd ? pricing.p_we : pricing.p_wd;
-  } else {
-    // 單一鐘點計時邏輯：鐘點費 x 時數
-    const hourlyRate = isWknd ? pricing.h_we : pricing.h_wd;
-    amount = hourlyRate * h;
-  }
 
+  // 金額計算：若是單一鐘點(h)，抓該時段單價 * 時數
+  const amount = (m === 'p' ? (isWknd ? pricing.p_we : pricing.p_wd) : (isWknd ? pricing.h_we : pricing.h_wd) * h);
   const displayTime = `${d} ${pricing.name}${m === 'h' ? ` (${h}小時)` : ''}`;
 
   try {
@@ -186,11 +177,11 @@ async function finalizeBooking(event, data) {
 
     if (conflict.results.length > 0) {
       return await client.replyMessage(event.replyToken, [
-        { type: "text", text: `⚠️ 預約失敗！時段 ${displayTime} 已有人預約。` },
+        { type: "text", text: `⚠️ 預約失敗！時段 ${displayTime} 已有人預訂。` },
         {
           type: "template", altText: "重選日期",
           template: {
-            type: "buttons", title: "請重選日期", text: "請改選其他日期或時段：",
+            type: "buttons", title: "請重選日期", text: "該時段已被佔用，請改選其他：",
             actions: [{ type: "datetimepicker", label: "📅 改選日期", data: `act=date&m=${m}&p=${p}&x=${x}`, mode: "date" }]
           }
         }
@@ -206,12 +197,12 @@ async function finalizeBooking(event, data) {
         "時間": { rich_text: [{ text: { content: displayTime } }] },
         "金額": { number: amount },
         "人數": { rich_text: [{ text: { content: x } }] },
-        "舉辦類型": { select: { name: p } } // 【欄位改名：目的 -> 舉辦類型】
+        "舉辦類型": { select: { name: p } }
       }
     });
 
     await client.replyMessage(event.replyToken, [
-      { type: 'text', text: `✅ 預約成功！\n類型：${p}\n時段：${displayTime}\n總額：NT$ ${amount}` },
+      { type: 'text', text: `✅ 預約成功！\n類型：${p}\n人數：${x}\n時段：${displayTime}\n總額：NT$ ${amount}` },
       { type: 'text', text: `${SERVICE_INFO.bank}\n${SERVICE_INFO.staff}\n${SERVICE_INFO.phone}${SERVICE_INFO.closing}` }
     ]);
   } catch (err) {
@@ -222,14 +213,14 @@ async function finalizeBooking(event, data) {
 async function sendPriceList(replyToken) {
   return await client.replyMessage(replyToken, [
     { type: 'image', originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png", previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png" },
-    { type: 'text', text: "看完價目表後，輸入「預約」即可開始安排喔！" }
+    { type: 'text', text: "看完價目表，輸入「預約」即可開始安排囉！" }
   ]);
 }
 
 async function sendSlotButtons(replyToken, date, m, p, x) {
   const base = `d=${date}&m=${m}&p=${p}&x=${x}`;
   await client.replyMessage(replyToken, [
-    { type: "text", text: `已選日期：${date}` },
+    { type: "text", text: `預約日期：${date}` },
     {
       type: "template", altText: "選擇時段",
       template: {
