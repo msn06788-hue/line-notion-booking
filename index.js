@@ -30,41 +30,27 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
     const events = req.body.events;
     for (let event of events) {
-      
-      // 1. 處理文字訊息 (支援直接輸入日期時段)
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text.trim();
-
-        if (text.includes("價目表")) {
-          await client.replyMessage(event.replyToken, [
-            { type: 'image', originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png", previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png" },
-            { type: 'text', text: "看完價目表後，輸入「預約」即可開始安排時間喔！😊" }
-          ]);
-          continue;
-        }
-
+        // 預約關鍵字判斷
         if (text.includes("預約")) {
           const dateMatch = text.match(/(\d{1,2})[/\-月](\d{1,2})/);
-          
           if (dateMatch) {
             const date = `2026-${dateMatch[1].padStart(2, '0')}-${dateMatch[2].padStart(2, '0')}`;
-            let slot = null;
-
-            // 智慧判定時段
-            if (text.includes("早上") || text.includes("上午")) slot = 'm';
-            else if (text.includes("下午")) slot = 'a';
-            else if (text.includes("晚上")) slot = 'e';
-            else if (text.includes("全天") || text.includes("整天")) slot = 'f';
-
-            if (slot) {
-              // 條件齊全，直接跳過選單進行預約
-              await handleBookingLogic(event, date, slot);
+            // 如果輸入包含「全天」，直接跳時間選擇器
+            if (text.includes("全天") || text.includes("整天")) {
+              await sendFullDayTimePicker(event.replyToken, date);
             } else {
-              // 有日期但沒時段，才跳時段按鈕
-              await sendSlotButtons(event.replyToken, date);
+              // 其他固定時段判斷
+              let slot = null;
+              if (text.includes("早上") || text.includes("上午")) slot = 'm';
+              else if (text.includes("下午")) slot = 'a';
+              else if (text.includes("晚上")) slot = 'e';
+              
+              if (slot) await handleBookingLogic(event, date, slot);
+              else await sendSlotButtons(event.replyToken, date);
             }
           } else {
-            // 完全沒日期，跳日期選擇器
             await client.replyMessage(event.replyToken, {
               type: "template",
               altText: "預約系統",
@@ -80,14 +66,29 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         }
       }
 
-      // 2. 處理 Postback 按鈕回傳
       if (event.type === 'postback') {
         const data = event.postback.data;
+        const params = event.postback.params;
+
         if (data === "act=date") {
-          await sendSlotButtons(event.replyToken, event.postback.params.date);
+          await sendSlotButtons(event.replyToken, params.date);
         } else if (data.startsWith("act=final")) {
           const urlParams = new URLSearchParams(data);
-          await handleBookingLogic(event, urlParams.get('d'), urlParams.get('s'));
+          const slot = urlParams.get('s');
+          const date = urlParams.get('d');
+          
+          if (slot === 'f') {
+            // 點擊「全天」按鈕，觸發時間選擇
+            await sendFullDayTimePicker(event.replyToken, date);
+          } else {
+            await handleBookingLogic(event, date, slot);
+          }
+        } else if (data.startsWith("act=fd_time")) {
+          // 處理全天起始時間回傳
+          const urlParams = new URLSearchParams(data);
+          const date = urlParams.get('d');
+          const startTime = params.time; // 顧客選的時間
+          await handleFullDayBooking(event, date, startTime);
         }
       }
     }
@@ -99,7 +100,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 });
 
 /**
- * 核心預約邏輯：衝突檢查、抓取資料、寫入 Notion、多訊息回覆
+ * 固定時段預約邏輯
  */
 async function handleBookingLogic(event, date, slot) {
   let displayTime, slotName;
@@ -107,12 +108,30 @@ async function handleBookingLogic(event, date, slot) {
     case 'm': displayTime = `${date} 09:30-12:00`; slotName = "早上"; break;
     case 'a': displayTime = `${date} 13:30-17:00`; slotName = "下午"; break;
     case 'e': displayTime = `${date} 18:00-21:30`; slotName = "晚上"; break;
-    case 'f': displayTime = `${date} 09:30-17:30`; slotName = "整天"; break;
   }
+  await finalizeBooking(event, slotName, displayTime);
+}
 
+/**
+ * 全天自訂時間預約邏輯 (自動計算 +8 小時)
+ */
+async function handleFullDayBooking(event, date, startTime) {
+  const [hour, min] = startTime.split(':').map(Number);
+  let endHour = hour + 8;
+  const endMin = min.toString().padStart(2, '0');
+  const startStr = startTime;
+  const endStr = `${endHour.toString().padStart(2, '0')}:${endMin}`;
+  
+  const displayTime = `${date} ${startStr}-${endStr}`;
+  await finalizeBooking(event, "全天", displayTime);
+}
+
+/**
+ * 最終寫入 Notion 與回覆
+ */
+async function finalizeBooking(event, slotName, displayTime) {
   try {
     const dbId = getCleanDatabaseId();
-
     // 衝突檢查
     const check = await notion.databases.query({
       database_id: dbId,
@@ -120,46 +139,31 @@ async function handleBookingLogic(event, date, slot) {
     });
 
     if (check.results.length > 0) {
-      return client.replyMessage(event.replyToken, { 
-        type: 'text', 
-        text: `⚠️ 抱歉！${displayTime} 已有人預約，請選擇其他時段。` 
-      });
+      return client.replyMessage(event.replyToken, { type: 'text', text: `⚠️ 抱歉！${displayTime} 已有人預約。` });
     }
 
-    // 獲取顧客資料
-    let userName = "顧客";
+    let userName = "神秘顧客";
     try {
       const profile = await client.getProfile(event.source.userId);
       userName = profile.displayName;
     } catch (e) {}
 
-    // 寫入 Notion (名稱為 Title, 時間為 Rich Text)
     await notion.pages.create({
       parent: { database_id: dbId },
       properties: {
-        "名稱": { title: [{ text: { content: `${userName} (${slotName})` } }] },
+        "名稱": { title: [{ text: { content: userName } }] },
+        "預約時段": { rich_text: [{ text: { content: slotName } }] },
         "時間": { rich_text: [{ text: { content: displayTime } }] }
       }
     });
 
-    // 成功後立即發送兩則訊息
     return client.replyMessage(event.replyToken, [
-      { 
-        type: 'text', 
-        text: `✅ ${userName} 您好，預約成功！\n預約時段：${displayTime}` 
-      },
-      { 
-        type: 'text', 
-        text: `📢 預約確認通知：\n\n${SERVICE_INFO.bank}\n\n${SERVICE_INFO.staff}\n${SERVICE_INFO.phone}` 
-      }
+      { type: 'text', text: `✅ ${userName} 您好，預約成功！\n時段：${displayTime}` },
+      { type: 'text', text: `📢 預約確認通知：\n\n${SERVICE_INFO.bank}\n\n${SERVICE_INFO.staff}\n${SERVICE_INFO.phone}` }
     ]);
-
   } catch (err) {
     const errorMsg = err.body?.message || err.message || "未知原因";
-    return client.replyMessage(event.replyToken, { 
-      type: 'text', 
-      text: `❌ 預約失敗\n原因：${errorMsg}` 
-    });
+    return client.replyMessage(event.replyToken, { type: 'text', text: `❌ 預約失敗\n原因：${errorMsg}` });
   }
 }
 
@@ -175,8 +179,26 @@ async function sendSlotButtons(replyToken, date) {
         { type: "postback", label: "早上 09:30-12:00", data: `act=final&d=${date}&s=m` },
         { type: "postback", label: "下午 13:30-17:00", data: `act=final&d=${date}&s=a` },
         { type: "postback", label: "晚上 18:00-21:30", data: `act=final&d=${date}&s=e` },
-        { type: "postback", label: "整天 (8小時)", data: `act=final&d=${date}&s=f` }
+        { type: "postback", label: "全天 (自選時間)", data: `act=final&d=${date}&s=f` }
       ]
+    }
+  });
+}
+
+async function sendFullDayTimePicker(replyToken, date) {
+  await client.replyMessage(replyToken, {
+    type: "template",
+    altText: "選擇起始時間",
+    template: {
+      type: "buttons",
+      title: "全天預約 (8小時)",
+      text: `您選擇了 ${date}，請選取您的「起始時間」：`,
+      actions: [{
+        type: "datetimepicker",
+        label: "🕒 設定起始時間",
+        data: `act=fd_time&d=${date}`,
+        mode: "time"
+      }]
     }
   });
 }
