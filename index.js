@@ -13,7 +13,7 @@ const lineConfig = {
 
 const client = new line.Client(lineConfig);
 
-// --- 1. 設定區：報價與聯繫資訊 ---
+// --- 1. 設定區：報價、服務資訊、假日資料 ---
 const SERVICE_INFO = {
   staff: "服務專員：蘇郁翔",
   phone: "服務電話：0939-607-867",
@@ -30,8 +30,8 @@ const PRICE_TABLE = {
 
 let HOLIDAYS_2026 = [];
 
-// 介接政府 API 預留區塊
-async function syncTaiwanHolidays() {
+// 介接政府 API 預留區
+async function syncHolidays() {
   try {
     const res = await axios.get('https://raw.githubusercontent.com/the-m-moore/taiwan-holidays/master/data/2026.json');
     HOLIDAYS_2026 = res.data.filter(d => d.isHoliday).map(d => d.date);
@@ -39,7 +39,7 @@ async function syncTaiwanHolidays() {
     HOLIDAYS_2026 = ["2026-01-01", "2026-02-17", "2026-05-01"]; 
   }
 }
-syncTaiwanHolidays();
+syncHolidays();
 
 function getCleanDbId() {
   return (process.env.NOTION_DATABASE_ID || "").split("?")[0].split("/").pop().replace(/-/g, "");
@@ -50,16 +50,17 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     const events = req.body.events;
     for (let event of events) {
       
-      // 文字訊息事件處理
+      // 文字訊息處理
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text.trim();
 
-        // 【修正：價目表判定】
-        if (text === "價目表" || text.includes("價目表")) {
+        // 【修復：價目表判定】
+        if (text.includes("價目表")) {
           return await sendPriceList(event.replyToken);
         }
 
-        if (text === "預約") {
+        // 【修復：預約判定】
+        if (text.includes("預約")) {
           return await client.replyMessage(event.replyToken, {
             type: "template",
             altText: "選擇預約方式",
@@ -74,14 +75,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         }
       }
 
-      // 按鈕 Postback 事件處理
+      // 按鈕回傳處理
       if (event.type === 'postback') {
-        const dataStr = event.postback.data;
-        
-        // 如果按鈕傳回的是價目表關鍵字
-        if (dataStr.includes("act=price")) return await sendPriceList(event.replyToken);
-
-        const data = new URLSearchParams(dataStr);
+        const data = new URLSearchParams(event.postback.data);
         const act = data.get('act'), m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), s = data.get('s');
 
         switch (act) {
@@ -105,7 +101,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
           case 'purp':
             await client.replyMessage(event.replyToken, [
-              { type: "text", text: `使用目的：${p}` },
+              { type: "text", text: `已選擇目的：${p}` },
               {
                 type: "text", text: "請問預計人數？\n(⚠️ 注意：場地建議不超過 40 人)",
                 quickReply: {
@@ -113,7 +109,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
                     { type: "action", action: { type: "postback", label: "1-10人", data: `act=pax&m=${m}&p=${p}&x=1-10` } },
                     { type: "action", action: { type: "postback", label: "11-20人", data: `act=pax&m=${m}&p=${p}&x=11-20` } },
                     { type: "action", action: { type: "postback", label: "21-30人", data: `act=pax&m=${m}&p=${p}&x=21-30` } },
-                    { type: "action", action: { type: "postback", label: "30-40人", data: `act=pax&m=${m}&p=${p}&x=30-40` } }
+                    { type: "action", action: { type: "postback", label: "31-40人", data: `act=pax&m=${m}&p=${p}&x=31-40` } }
                   ]
                 }
               }
@@ -122,12 +118,12 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
           case 'pax':
             await client.replyMessage(event.replyToken, [
-              { type: "text", text: `預計人數：${x}` },
+              { type: "text", text: `已選擇人數：${x}` },
               {
                 type: "template",
                 altText: "選擇日期",
                 template: {
-                  type: "buttons", title: "選擇日期", text: "請選取預約日期：",
+                  type: "buttons", title: "選擇日期", text: "請點選按鈕選取日期：",
                   actions: [{ type: "datetimepicker", label: "📅 選取日期", data: `act=date&m=${m}&p=${p}&x=${x}`, mode: "date" }]
                 }
               }
@@ -144,12 +140,12 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
               await finalizeBooking(event, data);
             } else {
               await client.replyMessage(event.replyToken, [
-                { type: "text", text: `時段：${PRICE_TABLE[s].name}` },
+                { type: "text", text: `已選擇時段：${PRICE_TABLE[s].name}` },
                 {
                   type: "template",
-                  altText: "選擇時長",
+                  altText: "計時時長",
                   template: {
-                    type: "buttons", title: "計時時長", text: "請問預計使用幾小時？",
+                    type: "buttons", title: "預約時長", text: "請問預計使用幾小時？",
                     actions: [
                       { type: "postback", label: "2 小時", data: `${event.postback.data}&act=last&h=2` },
                       { type: "postback", label: "3 小時", data: `${event.postback.data}&act=last&h=3` },
@@ -171,9 +167,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   } catch (error) { res.status(500).send('Error'); }
 });
 
-/**
- * 核心：重複預訂檢查與結算
- */
 async function finalizeBooking(event, data) {
   const m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), s = data.get('s'), h = parseInt(data.get('h') || 1);
   const isWknd = (new Date(d).getDay() === 0 || new Date(d).getDay() === 6) || HOLIDAYS_2026.includes(d);
@@ -183,24 +176,19 @@ async function finalizeBooking(event, data) {
 
   try {
     const dbId = getCleanDbId();
-
-    // 【重要：衝突檢查邏輯】
+    
+    // 【核心修復：時段衝突檢查】
     const conflictCheck = await notion.databases.query({
       database_id: dbId,
-      filter: {
-        property: "時間",
-        rich_text: { equals: displayTime }
-      }
+      filter: { property: "時間", rich_text: { equals: displayTime } }
     });
 
     if (conflictCheck.results.length > 0) {
       return await client.replyMessage(event.replyToken, {
-        type: "text",
-        text: `⚠️ 預約失敗！\n時段：${displayTime} 已經被其他人預約了。請重新選擇其他日期或時段。`
+        type: "text", text: `⚠️ 預約失敗！\n時段：${displayTime} 已被其他人預約。請重新輸入「預約」並選擇其他時段。`
       });
     }
 
-    // 執行寫入
     const profile = await client.getProfile(event.source.userId);
     await notion.pages.create({
       parent: { database_id: dbId },
@@ -215,12 +203,12 @@ async function finalizeBooking(event, data) {
     });
 
     await client.replyMessage(event.replyToken, [
-      { type: 'text', text: `✅ 預約申請成功！\n\n目的：${p}\n人數：${x}\n日期：${displayTime}\n總額：NT$ ${amount} (${isWknd ? '假日' : '平日'})` },
+      { type: 'text', text: `✅ 預約申請成功！\n\n目的：${p}\n人數：${x}\n預約時段：${displayTime}\n總額：NT$ ${amount} (${isWknd ? '假日' : '平日'})` },
       { type: 'text', text: `${SERVICE_INFO.bank}\n\n${SERVICE_INFO.staff}\n${SERVICE_INFO.phone}\n\n${SERVICE_INFO.closing}` }
     ]);
   } catch (err) {
     console.error("Notion Error:", JSON.stringify(err, null, 2));
-    await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 系統發生錯誤：請檢查 Notion 欄位名稱是否包含「預約時段、目的、人數、金額」且無多餘空格。` });
+    await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 錯誤：請確認 Notion 資料庫欄位名稱（預約時段、目的、人數、金額）正確無誤且無空格。` });
   }
 }
 
