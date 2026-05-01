@@ -219,7 +219,7 @@ async function sendPriceList(replyToken) {
       originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
       previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
     },
-    { type: 'text', text: "這是最新的價目表。看過之後，輸入「預約」即可開始安排喔！" }
+    { type: 'text', text: "這是最新的價目表。看過之後，輸入「預約」或是點選下方立即預約即可開始安排喔！" }
   ]);
 }
 
