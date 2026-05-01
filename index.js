@@ -13,7 +13,7 @@ const lineConfig = {
 
 const client = new line.Client(lineConfig);
 
-// --- 1. 設定區：服務資訊與報價規則 ---
+// --- 1. 報價與服務資訊設定區 ---
 const SERVICE_INFO = {
   staff: "服務專員：蘇郁翔",
   phone: "服務電話：0939-607-867",
@@ -30,8 +30,8 @@ const PRICE_TABLE = {
 
 let HOLIDAYS_2026 = [];
 
-// 區塊：介接政府公開資料 API (預留位置)
-async function syncHolidays() {
+// 介接政府 API 預留區塊
+async function syncTaiwanHolidays() {
   try {
     const res = await axios.get('https://raw.githubusercontent.com/the-m-moore/taiwan-holidays/master/data/2026.json');
     HOLIDAYS_2026 = res.data.filter(d => d.isHoliday).map(d => d.date);
@@ -39,7 +39,7 @@ async function syncHolidays() {
     HOLIDAYS_2026 = ["2026-01-01", "2026-02-17", "2026-05-01"]; 
   }
 }
-syncHolidays();
+syncTaiwanHolidays();
 
 function getCleanDbId() {
   return (process.env.NOTION_DATABASE_ID || "").split("?")[0].split("/").pop().replace(/-/g, "");
@@ -50,24 +50,24 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     const events = req.body.events;
     for (let event of events) {
       
-      // 文字訊息事件
+      // 文字訊息事件處理
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text.trim();
 
-        // 【修復：價目表優先判定】
-        if (text === "價目表" || text.includes("價目表")) {
+        // 【修復：價目表最優先判定】確保點擊按鈕或打字都有回應
+        if (text.includes("價目表")) {
           await client.replyMessage(event.replyToken, [
             {
               type: 'image',
               originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
               previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
             },
-            { type: 'text', text: "這是敘事空域的最新價目表。看過之後，輸入「預約」即可開始安排囉！" }
+            { type: 'text', text: "這是最新的價目表。看完後，輸入「預約」或點擊按鈕即可開始喔！" }
           ]);
           continue;
         }
 
-        if (text === "預約") {
+        if (text.includes("預約")) {
           await client.replyMessage(event.replyToken, {
             type: "template",
             altText: "選擇預約方式",
@@ -83,7 +83,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
         }
       }
 
-      // 按鈕 Postback 事件
+      // 按鈕 Postback 事件處理
       if (event.type === 'postback') {
         const data = new URLSearchParams(event.postback.data);
         const act = data.get('act'), m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), s = data.get('s');
@@ -176,12 +176,15 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   } catch (error) { res.status(500).send('Error'); }
 });
 
+/**
+ * 最終結算與寫入 Notion
+ */
 async function finalizeBooking(event, data) {
   const m = data.get('m'), p = data.get('p'), x = data.get('x'), d = data.get('d'), s = data.get('s'), h = parseInt(data.get('h') || 1);
   const isWknd = (new Date(d).getDay() === 0 || new Date(d).getDay() === 6) || HOLIDAYS_2026.includes(d);
   const pricing = PRICE_TABLE[s];
   
-  // 計算最終金額
+  // 計算總價
   const amount = (m === 'p' ? (isWknd ? pricing.p_we : pricing.p_wd) : (isWknd ? pricing.h_we : pricing.h_wd) * h);
   const displayTime = `${d} ${pricing.name}${m === 'h' ? ` (${h}小時)` : ''}`;
 
@@ -200,12 +203,12 @@ async function finalizeBooking(event, data) {
     });
 
     await client.replyMessage(event.replyToken, [
-      { type: 'text', text: `✅ 預約申請已送出！\n\n目的：${p}\n人數：${x}\n預約時段：${displayTime}\n總計金額：NT$ ${amount} (${isWknd ? '假日' : '平日'})` },
+      { type: 'text', text: `✅ 預約申請成功！\n\n目的：${p}\n人數：${x}\n日期：${displayTime}\n總計金額：NT$ ${amount} (${isWknd ? '假日' : '平日'})` },
       { type: 'text', text: `${SERVICE_INFO.bank}\n\n${SERVICE_INFO.staff}\n${SERVICE_INFO.phone}${SERVICE_INFO.closing}` }
     ]);
   } catch (err) {
-    console.error("Notion 寫入失敗:", JSON.stringify(err, null, 2));
-    await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 失敗：請檢查 Notion 欄位名稱（預約時段、目的、人數、金額）是否完全正確且無空格。` });
+    console.error("Notion Error:", JSON.stringify(err, null, 2));
+    await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 失敗：請檢查 Notion 欄位名稱（預約時段、目的、人數、金額）是否正確且無多餘空格。` });
   }
 }
 
