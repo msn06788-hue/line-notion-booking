@@ -12,7 +12,7 @@ const lineConfig = {
 
 const client = new line.Client(lineConfig);
 
-// 自動清理 Database ID 格式
+// 清理 Database ID，確保連線穩定
 function getCleanDatabaseId() {
   let dbId = process.env.NOTION_DATABASE_ID || "";
   if (dbId.includes("?")) dbId = dbId.split("?")[0];
@@ -25,7 +25,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     const events = req.body.events;
     for (let event of events) {
       
-      // 1. 處理文字訊息 (價目表、預約觸發)
+      // 1. 處理文字訊息
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text.trim();
 
@@ -36,27 +36,34 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
               originalContentUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png",
               previewImageUrl: "https://raw.githubusercontent.com/msn06788-hue/line-notion-booking/main/price_list.png"
             },
-            { type: 'text', text: "看完價目表後，輸入「預約」即可開始安排時間喔！" }
+            { type: 'text', text: "看完價目表後，輸入「預約」即可開始安排時間喔！😊" }
           ]);
           continue;
         }
 
         if (text.includes("預約")) {
-          await client.replyMessage(event.replyToken, {
-            type: "template",
-            altText: "預約日期選擇",
-            template: {
-              type: "buttons",
-              title: "預約系統",
-              text: "請點選下方選取日期：",
-              actions: [{ type: "datetimepicker", label: "📅 選取日期", data: "act=date", mode: "date" }]
-            }
-          });
+          const dateRegex = /(\d{1,2})[/\-月](\d{1,2})/;
+          const match = text.match(dateRegex);
+          if (match) {
+            const targetDate = `2026-${match[1].padStart(2, '0')}-${match[2].padStart(2, '0')}`;
+            await sendSlotButtons(event.replyToken, targetDate);
+          } else {
+            await client.replyMessage(event.replyToken, {
+              type: "template",
+              altText: "預約日期選擇",
+              template: {
+                type: "buttons",
+                title: "預約系統",
+                text: "請選擇您要預約的日期：",
+                actions: [{ type: "datetimepicker", label: "📅 選取日期", data: "act=date", mode: "date" }]
+              }
+            });
+          }
           continue;
         }
       }
 
-      // 2. 處理 Postback 按鈕回傳
+      // 2. 處理 Postback 按鈕
       if (event.type === 'postback') {
         const data = event.postback.data;
         if (data === "act=date") {
@@ -77,36 +84,45 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           try {
             const dbId = getCleanDatabaseId();
 
-            // --- 媒合時間衝突檢查 (防撞邏輯) ---
+            // 防撞檢查：確保該時段文字尚未被預約
             const check = await notion.databases.query({
               database_id: dbId,
               filter: { property: "時間", rich_text: { equals: displayTime } }
             });
 
             if (check.results.length > 0) {
-              await client.replyMessage(event.replyToken, { type: 'text', text: `⚠️ 抱歉！${displayTime} 已經有人預約了，請另選時段。` });
+              await client.replyMessage(event.replyToken, { type: 'text', text: `⚠️ 抱歉！${displayTime} 已有人預約了。` });
               continue;
             }
 
-            // --- 獲取顧客基本資料 (LINE Profile) ---
-            const profile = await client.getProfile(event.source.userId);
-            const customerName = profile.displayName; // 顧客的 LINE 名字
+            // 獲取顧客基本資料 (容錯處理)
+            let customerName = "顧客";
+            try {
+              const profile = await client.getProfile(event.source.userId);
+              customerName = profile.displayName;
+            } catch (pError) {
+              console.log("無法獲取個人檔案:", pError.message);
+            }
 
-            // --- 寫入 Notion ---
+            // 寫入 Notion
             await notion.pages.create({
               parent: { database_id: dbId },
               properties: {
                 "名稱": { title: [{ text: { content: `${customerName} (${slotName})` } }] },
-                "時間": { rich_text: [{ text: { content: displayTime } }] },
-                "標籤": { multi_select: [{ name: "待確認" }] } // 自動標記狀態
+                "時間": { rich_text: [{ text: { content: displayTime } }] }
               }
             });
 
-            await client.replyMessage(event.replyToken, { type: 'text', text: `✅ ${customerName} 您好，預約成功！\n時段：${displayTime}` });
+            await client.replyMessage(event.replyToken, { type: 'text', text: `✅ ${customerName} 您好，預約成功！\n預約時段：${displayTime}` });
 
           } catch (notionError) {
-            const errorMsg = notionError.body ? notionError.body.message : notionError.message;
-            await client.replyMessage(event.replyToken, { type: 'text', text: `❌ 系統忙碌中，請稍後再試。\n原因：${errorMsg}` });
+            // 精確抓取報錯訊息，解決 undefined 問題
+            const errorMsg = notionError.body?.message || notionError.message || "未知原因";
+            console.error("Notion 錯誤內容:", notionError);
+            await client.replyMessage(event.replyToken, { 
+              type: 'text', 
+              text: `❌ 預約失敗\n原因：${errorMsg}` 
+            });
           }
         }
       }
