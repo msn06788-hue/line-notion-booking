@@ -1,4 +1,4 @@
-=const express = require('express');
+const express = require('express');
 const { Client } = require('@notionhq/client');
 const line = require('@line/bot-sdk');
 
@@ -19,9 +19,9 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       
       // 1. 處理文字訊息
       if (event.type === 'message' && event.message.type === 'text') {
-        const text = event.message.text;
+        const text = event.message.text.trim();
 
-        // --- 價目表邏輯 (維持先前功能) ---
+        // 情境 A：查看價目表
         if (text === '價目表') {
           await client.replyMessage(event.replyToken, [
             {
@@ -31,27 +31,27 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             },
             {
               type: 'text',
-              text: "查看完價目表後，想請問您預計在哪天過來呢？您可以直接輸入「我要預約M/D日」來選擇時段喔！😊"
+              text: "查看完價目表後，想請問您預計在哪天過來呢？😊"
             }
           ]);
           continue;
         }
 
-        // --- 自動偵測「我要預約M/D日」 ---
+        // 情境 B：偵測「我要預約 M/D」 (跳出四時段按鈕)
         const dateRegex = /我要預約(\d{1,2})[/\-月](\d{1,2})/;
         const match = text.match(dateRegex);
 
         if (match) {
           const month = match[1].padStart(2, '0');
           const day = match[2].padStart(2, '0');
-          const targetDate = `2026-${month}-${day}`; // 預設 2026 年
+          const targetDate = `2026-${month}-${day}`;
 
           await client.replyMessage(event.replyToken, {
             type: "template",
-            altText: `請選擇 ${month}/${day} 的預約時段`,
+            altText: `選擇 ${month}/${day} 的時段`,
             template: {
               type: "buttons",
-              title: `${month}月${day}日 預約時段`,
+              title: `${month}月${day}日 預約`,
               text: "請選擇您偏好的預約時段：",
               actions: [
                 { type: "postback", label: "早上 09:30-12:00", data: `action=book&date=${targetDate}&slot=morning` },
@@ -63,38 +63,63 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           });
           continue;
         }
+
+        // 情境 C：只打「我要預約」或「立即預約」 (跳出日曆視窗)
+        if (text === '我要預約' || text === '立即預約') {
+          await client.replyMessage(event.replyToken, {
+            type: "template",
+            altText: "請選擇預約日期與時間",
+            template: {
+              type: "buttons",
+              title: "預約日期挑選",
+              text: "請點擊下方按鈕開啟日曆挑選時間：",
+              actions: [
+                {
+                  type: "datetimepicker",
+                  label: "📅 選擇日期與時間",
+                  data: "action=datepicker",
+                  mode: "datetime"
+                }
+              ]
+            }
+          });
+          continue;
+        }
       }
 
-      // 2. 處理時段按鈕點擊 (Postback)
+      // 2. 處理 Postback 事件 (無論是按鈕還是日曆回傳)
       if (event.type === 'postback') {
-        const params = new URLSearchParams(event.postback.data);
-        const date = params.get('date');
-        const slot = params.get('slot');
-
         let startTime, endTime, slotName;
 
-        // 定義時段邏輯
-        switch (slot) {
-          case 'morning':
-            startTime = `${date}T09:30:00`;
-            endTime = `${date}T12:00:00`;
-            slotName = "早上 (09:30-12:00)";
-            break;
-          case 'afternoon':
-            startTime = `${date}T13:30:00`;
-            endTime = `${date}T17:00:00`;
-            slotName = "下午 (13:30-17:00)";
-            break;
-          case 'evening':
-            startTime = `${date}T18:00:00`;
-            endTime = `${date}T21:30:00`;
-            slotName = "晚上 (18:00-21:30)";
-            break;
-          case 'fullday':
-            startTime = `${date}T09:30:00`; // 預設從營業開始
-            endTime = `${date}T17:30:00`;   // 8小時
-            slotName = "整天任選 (8小時)";
-            break;
+        // 如果是來自日曆選擇器 (Datetime Picker)
+        if (event.postback.params && event.postback.params.datetime) {
+          startTime = event.postback.params.datetime;
+          // 預設為預約 1 小時
+          const start = new Date(startTime);
+          const end = new Date(start.getTime() + 60 * 60 * 1000);
+          endTime = end.toISOString().split('.')[0]; 
+          slotName = "自選時段";
+        } 
+        // 如果是來自四時段按鈕
+        else {
+          const params = new URLSearchParams(event.postback.data);
+          const date = params.get('date');
+          const slot = params.get('slot');
+
+          switch (slot) {
+            case 'morning':
+              startTime = `${date}T09:30`; endTime = `${date}T12:00`; slotName = "早上 (09:30-12:00)";
+              break;
+            case 'afternoon':
+              startTime = `${date}T13:30`; endTime = `${date}T17:00`; slotName = "下午 (13:30-17:00)";
+              break;
+            case 'evening':
+              startTime = `${date}T18:00`; endTime = `${date}T21:30`; slotName = "晚上 (18:00-21:30)";
+              break;
+            case 'fullday':
+              startTime = `${date}T09:30`; endTime = `${date}T17:30`; slotName = "整天 (8小時)";
+              break;
+          }
         }
 
         // 寫入 Notion
@@ -108,13 +133,13 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
 
         await client.replyMessage(event.replyToken, {
           type: 'text',
-          text: `✅ 預約成功！\n日期：${date}\n時段：${slotName}\n期待您的光臨！`
+          text: `✅ 預約成功！\n時段：${slotName}\n系統已同步至 Notion 日曆。`
         });
       }
     }
     res.status(200).send('OK');
   } catch (error) {
-    console.error('程式執行出錯:', error);
+    console.error('Error:', error);
     res.status(500).send('Error');
   }
 });
