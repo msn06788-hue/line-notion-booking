@@ -146,7 +146,7 @@ async function createBooking(booking) {
         '預約時段': { select: { name: booking.slot } },
         '聯絡電話': { phone_number: booking.phone || '' },
         '預約類型': { select: { name: booking.slotType || '固定時段' } },
-        '人數':     { number: booking.headcount || 1 },
+        '人數':     { rich_text: [{ text: { content: String(booking.headcount || 1) } }] },
         '備註':     { rich_text: [{ text: { content: booking.note || '' } }] },
         '預約來源': { select: { name: 'LINE' } },
       },
