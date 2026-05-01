@@ -12,7 +12,7 @@ const lineConfig = {
 
 const client = new line.Client(lineConfig);
 
-// 清理 Database ID，確保格式正確
+// 自動清理 Database ID 格式
 function getCleanDatabaseId() {
   let dbId = process.env.NOTION_DATABASE_ID || "";
   if (dbId.includes("?")) dbId = dbId.split("?")[0];
@@ -24,10 +24,12 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   try {
     const events = req.body.events;
     for (let event of events) {
-      // 1. 處理文字訊息
+      
+      // 1. 處理文字訊息 (價目表與預約關鍵字)
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text.trim();
 
+        // 價目表邏輯
         if (text.includes("價目表")) {
           await client.replyMessage(event.replyToken, [
             {
@@ -37,12 +39,13 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             },
             {
               type: 'text',
-              text: "這是我們最新的價目表！看完之後，點擊選單或輸入「預約」即可開始安排時間喔！😊"
+              text: "這是我們最新的價目表！看完後，輸入「預約」即可開始安排時間喔！😊"
             }
           ]);
           continue;
         }
 
+        // 預約邏輯
         if (text.includes("預約")) {
           const dateRegex = /(\d{1,2})[/\-月](\d{1,2})/;
           const match = text.match(dateRegex);
@@ -74,51 +77,49 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
           const urlParams = new URLSearchParams(data);
           const date = urlParams.get('d');
           const slot = urlParams.get('s');
-          let startTime, endTime, slotName;
-
-          // 加入 .000 毫秒以符合最嚴格的 ISO 8601 標準
+          
+          let displayTime, slotName;
+          // 根據選擇的代碼組成純文字時段
           switch (slot) {
-            case 'm': startTime = `${date}T09:30:00.000+08:00`; endTime = `${date}T12:00:00.000+08:00`; slotName = "早上"; break;
-            case 'a': startTime = `${date}T13:30:00.000+08:00`; endTime = `${date}T17:00:00.000+08:00`; slotName = "下午"; break;
-            case 'e': startTime = `${date}T18:00:00.000+08:00`; endTime = `${date}T21:30:00.000+08:00`; slotName = "晚上"; break;
-            case 'f': startTime = `${date}T09:30:00.000+08:00`; endTime = `${date}T17:30:00.000+08:00`; slotName = "整天"; break;
+            case 'm': displayTime = `${date} 09:30-12:00`; slotName = "早上"; break;
+            case 'a': displayTime = `${date} 13:30-17:00`; slotName = "下午"; break;
+            case 'e': displayTime = `${date} 18:00-21:30`; slotName = "晚上"; break;
+            case 'f': displayTime = `${date} 09:30-17:30`; slotName = "整天"; break;
           }
 
           try {
             const dbId = getCleanDatabaseId();
-            
-            // 將準備送出的資料印在 Vercel 中，方便除錯
-            console.log("【準備寫入 Notion 的資料】:", JSON.stringify({
-              database_id: dbId,
-              startTime: startTime,
-              endTime: endTime
-            }));
 
-            // 執行寫入
-            await notion.pages.create({
-              parent: { database_id: dbId },
-              properties: {
-                "名稱": { title: [{ text: { content: `預約 - ${slotName}` } }] },
-                "時間": { date: { start: startTime, end: endTime } }
+            // 防撞檢查：在「文字類型」的欄位中搜尋是否有相同的字串
+            const check = await notion.databases.query({
+              database_id: dbId,
+              filter: {
+                property: "時間",
+                rich_text: { equals: displayTime }
               }
             });
 
-            await client.replyMessage(event.replyToken, { type: 'text', text: `✅ 預約成功！\n日期：${date}\n時段：${slotName}` });
-
-          } catch (notionError) {
-            // 強制解析錯誤原因
-            console.error("【Notion 報錯完整物件】:", JSON.stringify(notionError, null, 2));
-            
-            let exactReason = "未知錯誤，請查看 Vercel Logs";
-            if (notionError.body && notionError.body.message) {
-              exactReason = notionError.body.message; // 官方詳細錯誤
-            } else if (notionError.message) {
-              exactReason = notionError.message; // 套件基礎錯誤
+            if (check.results.length > 0) {
+              await client.replyMessage(event.replyToken, { type: 'text', text: `⚠️ 抱歉！${displayTime} 已經有人預約了。` });
+              continue;
             }
 
+            // 正式寫入 Notion (使用 rich_text 格式)
+            await notion.pages.create({
+              parent: { database_id: dbId },
+              properties: {
+                "名稱": { title: [{ text: { content: `客戶預約 - ${slotName}` } }] },
+                "時間": { rich_text: [{ text: { content: displayTime } }] }
+              }
+            });
+
+            await client.replyMessage(event.replyToken, { type: 'text', text: `✅ 預約成功！\n您的預約時段為：${displayTime}` });
+
+          } catch (notionError) {
+            const errorMsg = notionError.body ? notionError.body.message : notionError.message;
             await client.replyMessage(event.replyToken, { 
               type: 'text', 
-              text: `❌ 連線失敗 (代碼：${notionError.status || 400})\n原因：${exactReason}` 
+              text: `❌ 寫入失敗\n原因：${errorMsg}` 
             });
           }
         }
@@ -131,6 +132,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
   }
 });
 
+// 發送時段選單按鈕
 async function sendSlotButtons(replyToken, date) {
   await client.replyMessage(replyToken, {
     type: "template",
