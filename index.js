@@ -2,6 +2,7 @@ const express = require('express');
 const line = require('@line/bot-sdk');
 const { Client } = require('@notionhq/client');
 const https = require('https');
+const cron = require('node-cron'); // 引入排程套件
 
 // ── 設定 ──────────────────────────────────────────────────
 const lineConfig = {
@@ -59,20 +60,17 @@ async function isHoliday(dateStr) {
 }
 
 // ── 統一時間解析與衝突檢查 ─────────────────────────────────
-// 解析任何時間字串為分鐘數（例如 "18:30" → 1110）
 function timeToMin(t) {
   const parts = t.split(':');
   return parseInt(parts[0]) * 60 + parseInt(parts[1]);
 }
 
-// 提取字串中的時間區間，例如 "早上 09:00~12:30" 或 "全天 10:00~18:00"
 function extractTimeRange(label) {
   const match = label.match(/(\d{1,2}:\d{2})\s*[~～]\s*(\d{1,2}:\d{2})/);
   if (!match) return null;
   return { startMin: timeToMin(match[1]), endMin: timeToMin(match[2]) };
 }
 
-// 將所有已預約的字串，轉換為分鐘區間陣列
 function getBookedRanges(bookedSlots) {
   const ranges = [];
   bookedSlots.forEach(function(slotLabel) {
@@ -82,12 +80,10 @@ function getBookedRanges(bookedSlots) {
   return ranges;
 }
 
-// 檢查 A 區間是否與 B 區間重疊
 function isOverlap(minA, maxA, minB, maxB) {
   return minA < maxB && maxA > minB;
 }
 
-// 統一審核：檢查目標時間是否與任何已預約時間重疊
 function isConflict(testStartMin, testEndMin, bookedRanges) {
   return bookedRanges.some(function(r) {
     return isOverlap(testStartMin, testEndMin, r.startMin, r.endMin);
@@ -101,10 +97,8 @@ const FIXED_SLOTS = [
   { label: '晚上 18:00~21:30', period: 'evening',   duration: '3.5小時' },
 ];
 
-// 休息時段（不接受預約）
 const BREAK_SLOTS = ['12:30~13:30', '17:00~18:00'];
 
-// 產生整點+半點時段，排除休息時段
 function generateHourlySlots() {
   const slots = [];
   for (let totalMin = 9 * 60; totalMin <= 20 * 60 + 30; totalMin += 30) {
@@ -218,7 +212,7 @@ async function createBooking(booking) {
 
     if (ranges.length > 0) {
       const minStart = Math.min(...ranges.map(r => r.startMin));
-      const maxEnd = Math.max(...ranges.map(r => r.endEnd ? r.endEnd : r.endMin)); // fallback
+      const maxEnd = Math.max(...ranges.map(r => r.endMin));
       
       const startH = String(Math.floor(minStart / 60)).padStart(2, '0');
       const startM = String(minStart % 60).padStart(2, '0');
@@ -252,7 +246,7 @@ async function createBooking(booking) {
   }
 }
 
-// ── 日期驗證（24小時前不給預約）─────────────────────────────
+// ── 日期驗證 ───────────────────────────────────────────────
 function checkDateAllowed(dateStr) {
   const now = new Date();
   const twNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
@@ -267,7 +261,6 @@ function checkDateAllowed(dateStr) {
   return { allowed: true, reason: '' };
 }
 
-// ── 工具函式 ───────────────────────────────────────────────
 function reply(event, messages) {
   const msgs = Array.isArray(messages) ? messages : [messages];
   return client.replyMessage(event.replyToken, msgs);
@@ -284,7 +277,6 @@ function row(label, value) {
 }
 
 // ── 訊息模板 ──────────────────────────────────────────────
-
 function buildMainMenu() {
   return {
     type: 'text',
@@ -398,14 +390,11 @@ function buildStartTimeFlex(date, bookedSlots, holiday, duration = 1, isFullDay 
 
   HOURLY_SLOTS.forEach(function(slot) {
     const endMin = slot.startMin + requiredMins;
-    
     if (endMin > 1290) {
       if (!isFullDay) unavailable.push(slot); 
       return; 
     }
-
     const conflict = isConflict(slot.startMin, endMin, bookedRanges);
-    
     if (conflict) {
       unavailable.push(slot);
     } else {
@@ -421,7 +410,6 @@ function buildStartTimeFlex(date, bookedSlots, holiday, duration = 1, isFullDay 
 
   available.forEach(function(slot) {
     const startStr = slot.label.split('~')[0];
-    
     if (isFullDay) {
       const priceFullday = getPrice('fixed', 'fullday', holiday);
       buttons.push({
@@ -741,8 +729,7 @@ function buildSuccessMessages(data) {
 
 // ── 主要事件處理器 ────────────────────────────────────────
 async function handleEvent(event) {
-  // 💡 【新增過濾器】：如果訊息來源不是一對一私訊 (user)，則略過不處理。
-  // 這樣群組內大家聊天，機器人就會安靜不理會。
+  // 💡 【群組靜音過濾器】只處理來自私人訊息 (user) 的對話
   if (event.source.type !== 'user') {
     return Promise.resolve(null);
   }
@@ -1050,6 +1037,87 @@ app.post('/webhook', line.middleware(lineConfig), (req, res) => {
 
 app.get('/', (req, res) => res.send('敘事空域 Bot 運行中 ✅'));
 
+// ── 自動化排程任務 (Cron Jobs) ──────────────────────────────────
+function getTWDateString(addDays = 0) {
+  const now = new Date();
+  const twTime = new Date(now.getTime() + (8 * 60 * 60 * 1000) + (addDays * 86400000));
+  return twTime.toISOString().split('T')[0];
+}
+
+// 📌 功能 1：24小時前通知 (每日早上 08:00 執行，檢查明天的預約)
+cron.schedule('0 8 * * *', async () => {
+  console.log('[排程] 開始執行：明日預約提醒');
+  const tomorrowStr = getTWDateString(1); 
+  
+  try {
+    const res = await notion.databases.query({
+      database_id: DATABASE_ID,
+      filter: { property: '預約日期', date: { equals: tomorrowStr } },
+    });
+
+    if (res.results.length === 0) return;
+
+    const bookingDetails = res.results.map(page => {
+      const name = page.properties['預約姓名']?.title[0]?.text?.content || '未知';
+      const slot = page.properties['預約時段']?.select?.name || '未知時段';
+      const type = page.properties['舉辦類型']?.select?.name || '其他';
+      return `• ${slot} | ${name} (${type})`;
+    }).join('\n');
+
+    await client.pushMessage(NOTIFY_GROUP_ID, {
+      type: 'text',
+      text: `🔔 【明日預約提醒】\n日期：${tomorrowStr}\n\n明日共有 ${res.results.length} 組預約：\n${bookingDetails}\n\n請工作人員留意場地準備！`
+    });
+    console.log('[排程] 明日提醒發送成功');
+  } catch (error) {
+    console.error('[排程] 明日提醒執行失敗:', error.message);
+  }
+});
+
+// 📌 功能 2：每週預訂總表 (每週日晚上 20:00 執行，檢查下週的預約)
+cron.schedule('0 20 * * 0', async () => {
+  console.log('[排程] 開始執行：下週預訂總表');
+  const nextMondayStr = getTWDateString(1); 
+  const nextSundayStr = getTWDateString(7); 
+
+  try {
+    const res = await notion.databases.query({
+      database_id: DATABASE_ID,
+      filter: {
+        and: [
+          { property: '預約日期', date: { on_or_after: nextMondayStr } },
+          { property: '預約日期', date: { on_or_before: nextSundayStr } }
+        ]
+      },
+      sorts: [{ property: '預約日期', direction: 'ascending' }] 
+    });
+
+    let messageText = `📊 【下週預訂總表】\n區間：${nextMondayStr} ~ ${nextSundayStr}\n\n`;
+
+    if (res.results.length === 0) {
+      messageText += '下週目前尚無預約檔期，繼續努力！💪';
+    } else {
+      let totalRevenue = 0;
+      res.results.forEach(page => {
+        const date = page.properties['預約日期']?.date?.start?.split('T')[0] || '';
+        const name = page.properties['預約姓名']?.title[0]?.text?.content || '';
+        const slot = page.properties['預約時段']?.select?.name || '';
+        const price = page.properties['金額']?.number || 0;
+        
+        totalRevenue += price;
+        messageText += `🗓️ ${date}\n└ ${slot} | ${name}\n`;
+      });
+      messageText += `\n💰 下週預估營收：NT$ ${totalRevenue.toLocaleString()}`;
+    }
+
+    await client.pushMessage(NOTIFY_GROUP_ID, { type: 'text', text: messageText });
+    console.log('[排程] 週報發送成功');
+  } catch (error) {
+    console.error('[排程] 週報執行失敗:', error.message);
+  }
+});
+
+// ── 啟動伺服器 ───────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('✅ 啟動 Port: ' + PORT));
 
