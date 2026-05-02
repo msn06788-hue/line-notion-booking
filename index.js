@@ -11,6 +11,7 @@ const lineConfig = {
 const client = new line.Client(lineConfig);
 const notion = new Client({ auth: process.env.NOTION_INTEGRATION_TOKEN });
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;
+const NOTIFY_GROUP_ID = 'C6f36b9fa93777db373fa52dedbc43d66';
 const app = express();
 
 // ── 台灣國定假日快取 ───────────────────────────────────────
@@ -791,7 +792,6 @@ function buildSuccessMessages(data) {
 // ── 主要事件處理器 ────────────────────────────────────────
 async function handleEvent(event) {
   const userId = event.source.userId;
-  console.log('[SOURCE]', JSON.stringify(event.source));
 
   if (event.type === 'follow') {
     return reply(event, { type: 'text', text: '歡迎加入敘事空域！🏛️\n\n輸入「立即預約」開始預約\n輸入「價目表」查看費用' });
@@ -999,6 +999,47 @@ async function handleEvent(event) {
   }
 }
 
+
+// ── 推播預約通知到群組 ─────────────────────────────────────
+async function notifyGroup(booking) {
+  const slotDisplay = (booking.selectedSlots && booking.selectedSlots.length > 0)
+    ? booking.selectedSlots.join('、')
+    : booking.slot;
+
+  const message = {
+    type: 'flex',
+    altText: '新預約通知！',
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: '#E74C3C', paddingAll: 'md',
+        contents: [{ type: 'text', text: '🔔 新預約通知！', weight: 'bold', color: '#FFFFFF', size: 'lg' }],
+      },
+      body: {
+        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
+        contents: [
+          row('姓名', booking.name),
+          row('日期', booking.date),
+          row('時段', slotDisplay),
+          row('類型', booking.slotType),
+          row('舉辦類型', booking.eventType),
+          row('費用', formatPrice(Number(booking.price))),
+          row('電話', booking.phone),
+          row('人數', String(booking.headcount || '') + ' 人'),
+          row('備註', booking.note || '無'),
+        ],
+      },
+    },
+  };
+
+  try {
+    await client.pushMessage(NOTIFY_GROUP_ID, message);
+    console.log('[通知] 群組通知發送成功');
+  } catch (e) {
+    console.error('[通知] 群組通知失敗:', e.message);
+  }
+}
+
 async function processBooking(event, userId) {
   const data = getData(userId);
   const booked = await getBookedSlots(data.date);
@@ -1017,6 +1058,7 @@ async function processBooking(event, userId) {
   const ok = await createBooking(data);
   clearSession(userId);
   if (ok) {
+    await notifyGroup(data);
     return reply(event, buildSuccessMessages(data));
   } else {
     return reply(event, { type: 'text', text: '⚠️ 系統錯誤，請直接電話預約：0939-607867' });
