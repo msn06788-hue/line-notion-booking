@@ -58,7 +58,7 @@ async function isHoliday(dateStr) {
   return holidayCache.has(dateStr);
 }
 
-// ── 統一時間解析與衝突檢查 (升級點 1 & 3) ──────────────────────
+// ── 統一時間解析與衝突檢查 ─────────────────────────────────
 // 解析任何時間字串為分鐘數（例如 "18:30" → 1110）
 function timeToMin(t) {
   const parts = t.split(':');
@@ -99,7 +99,6 @@ const FIXED_SLOTS = [
   { label: '早上 9:00~12:30',  period: 'morning',   duration: '3.5小時' },
   { label: '下午 13:30~17:00', period: 'afternoon', duration: '3.5小時' },
   { label: '晚上 18:00~21:30', period: 'evening',   duration: '3.5小時' },
-  // 移除了固定全天，改由按鈕動態生成 (升級點 2)
 ];
 
 // 休息時段（不接受預約）
@@ -206,10 +205,8 @@ async function getBookedSlots(date) {
 
 async function createBooking(booking) {
   try {
-    // 升級點 4：計算起迄時間，轉換為 Notion 日曆支援的 ISO 8601 格式
     const slotDisplay = (booking.selectedSlots && booking.selectedSlots.length > 0) ? booking.selectedSlots.join('、') : booking.slot;
     
-    // 利用統一的提取功能，把所選字串裡的所有時間抓出來比對
     const ranges = [];
     const timeMatches = slotDisplay.match(/(\d{1,2}:\d{2})\s*[~～]\s*(\d{1,2}:\d{2})/g) || [];
     timeMatches.forEach(match => {
@@ -221,14 +218,13 @@ async function createBooking(booking) {
 
     if (ranges.length > 0) {
       const minStart = Math.min(...ranges.map(r => r.startMin));
-      const maxEnd = Math.max(...ranges.map(r => r.endMin));
+      const maxEnd = Math.max(...ranges.map(r => r.endEnd ? r.endEnd : r.endMin)); // fallback
       
       const startH = String(Math.floor(minStart / 60)).padStart(2, '0');
       const startM = String(minStart % 60).padStart(2, '0');
       const endH = String(Math.floor(maxEnd / 60)).padStart(2, '0');
       const endM = String(maxEnd % 60).padStart(2, '0');
       
-      // 帶入台灣時區 +08:00，讓 Notion Calendar 完美顯示
       dateProp = {
         start: `${booking.date}T${startH}:${startM}:00+08:00`,
         end: `${booking.date}T${endH}:${endM}:00+08:00`
@@ -239,7 +235,7 @@ async function createBooking(booking) {
       parent: { database_id: DATABASE_ID },
       properties: {
         '預約姓名': { title: [{ text: { content: booking.name || '未提供' } }] },
-        '預約日期': { date: dateProp }, // 替換為計算後的時間
+        '預約日期': { date: dateProp },
         '預約時段': { select: { name: booking.slot } },
         '聯絡電話': { phone_number: booking.phone || '' },
         '預約類型': { select: { name: booking.slotType || '包場時段' } },
@@ -393,27 +389,21 @@ function buildPriceMessage() {
   };
 }
 
-// ── 建立開始時間選擇 Flex (升級為支援全天與單一鐘點) ────────────────────
 function buildStartTimeFlex(date, bookedSlots, holiday, duration = 1, isFullDay = false) {
   const dayLabel = holiday ? '假日' : '平日';
-  
-  // 統一拿出現有已被預訂的所有區間
   const bookedRanges = getBookedRanges(bookedSlots);
-
   const available = [];
   const unavailable = [];
-  const requiredMins = duration * 60; // 1小時或8小時
+  const requiredMins = duration * 60; 
 
   HOURLY_SLOTS.forEach(function(slot) {
     const endMin = slot.startMin + requiredMins;
     
-    // 如果是全天包場，往後推 8 小時不能超過營業時間 21:30 (1290分)
     if (endMin > 1290) {
-      if (!isFullDay) unavailable.push(slot); // 單一鐘點超過也算不可用
+      if (!isFullDay) unavailable.push(slot); 
       return; 
     }
 
-    // 檢查這個起迄時間，是否與任何已預訂的區間衝突
     const conflict = isConflict(slot.startMin, endMin, bookedRanges);
     
     if (conflict) {
@@ -433,7 +423,6 @@ function buildStartTimeFlex(date, bookedSlots, holiday, duration = 1, isFullDay 
     const startStr = slot.label.split('~')[0];
     
     if (isFullDay) {
-      // 全天包場按鈕
       const priceFullday = getPrice('fixed', 'fullday', holiday);
       buttons.push({
         type: 'button', style: 'primary', color: '#8B7355', height: 'sm',
@@ -445,7 +434,6 @@ function buildStartTimeFlex(date, bookedSlots, holiday, duration = 1, isFullDay 
         },
       });
     } else {
-      // 單一鐘點按鈕
       const price1hr = getPrice('hourly', slot.period, holiday);
       buttons.push({
         type: 'button', style: 'primary', color: '#5B8DB8', height: 'sm',
@@ -459,7 +447,6 @@ function buildStartTimeFlex(date, bookedSlots, holiday, duration = 1, isFullDay 
     }
   });
 
-  // 為了版面乾淨，全天包場不印出那些被佔用的灰色按鈕
   if (!isFullDay) {
     unavailable.forEach(function(slot) {
       const startStr = slot.label.split('~')[0];
@@ -491,7 +478,6 @@ function buildStartTimeFlex(date, bookedSlots, holiday, duration = 1, isFullDay 
   };
 }
 
-// ── 建立時數選擇 Flex ──────────────────────────────────────
 function buildDurationFlex(date, startMin, period, holiday) {
   const dayLabel = holiday ? '假日' : '平日';
   const startH = Math.floor(startMin / 60);
@@ -559,10 +545,8 @@ function buildDurationFlex(date, startMin, period, holiday) {
 
 function buildSlotTypePicker(date, holiday, bookedSlots) {
   const dayLabel = holiday ? '假日' : '平日';
-
   const bookedRanges = getBookedRanges(bookedSlots);
 
-  // 檢查是否還有包場空間 (只要該包場的時段沒有被預訂範圍涵蓋)
   const availableFixed = FIXED_SLOTS.filter(s => {
     const r = extractTimeRange(s.label);
     return r && !isConflict(r.startMin, r.endMin, bookedRanges);
@@ -757,6 +741,12 @@ function buildSuccessMessages(data) {
 
 // ── 主要事件處理器 ────────────────────────────────────────
 async function handleEvent(event) {
+  // 💡 【新增過濾器】：如果訊息來源不是一對一私訊 (user)，則略過不處理。
+  // 這樣群組內大家聊天，機器人就會安靜不理會。
+  if (event.source.type !== 'user') {
+    return Promise.resolve(null);
+  }
+
   const userId = event.source.userId;
 
   if (event.type === 'follow') {
@@ -870,12 +860,10 @@ async function handleEvent(event) {
 
       if (type === 'hourly') {
         setSession(userId, 'pickStartTime', { date: date, holiday: holiday });
-        // 呼叫支援全天與鐘點共用的 Time Picker
         return reply(event, buildStartTimeFlex(date, booked, holiday, 1, false));
       }
     }
 
-    // 處理「全天包場」的開始時間選擇
     if (action === 'pickStartTime') {
       const date = params.get('date');
       const holiday = params.get('holiday') === 'true';
@@ -906,7 +894,6 @@ async function handleEvent(event) {
       });
     }
 
-    // 選擇開始時間 (單一鐘點用)
     if (action === 'pickDuration') {
       const date = params.get('date');
       const startMin = parseInt(params.get('startMin'), 10);
@@ -916,7 +903,6 @@ async function handleEvent(event) {
       return reply(event, buildDurationFlex(date, startMin, period, holiday));
     }
 
-    // 確認時數（全天與單一鐘點共用流程）
     if (action === 'confirmHourlyNew') {
       const date = params.get('date');
       const startMin = parseInt(params.get('startMin'), 10);
@@ -1027,15 +1013,12 @@ async function notifyGroup(booking) {
 async function processBooking(event, userId) {
   const data = getData(userId);
   
-  // 1. 取得當下 Notion 最新預約，轉為分鐘數
   const bookedSlots = await getBookedSlots(data.date);
   const bookedRanges = getBookedRanges(bookedSlots);
   
-  // 2. 解析目前準備預約的時段
   const slotsToBook = (data.selectedSlots && data.selectedSlots.length > 0) ? data.selectedSlots : [data.slot];
   const newRanges = getBookedRanges(slotsToBook);
 
-  // 3. 雙重確認碰撞
   let hasConflict = false;
   newRanges.forEach(function(nr) {
     if (isConflict(nr.startMin, nr.endMin, bookedRanges)) {
@@ -1048,7 +1031,6 @@ async function processBooking(event, userId) {
     return reply(event, { type: 'text', text: '😢 很抱歉，您選擇的時段剛剛已被他人搶先預約。\n請輸入「立即預約」重新選擇時段。' });
   }
 
-  // 4. 無衝突，寫入 Notion
   const ok = await createBooking(data);
   clearSession(userId);
   if (ok) {
