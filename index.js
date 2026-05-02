@@ -791,6 +791,7 @@ function buildSuccessMessages(data) {
 // ── 主要事件處理器 ────────────────────────────────────────
 async function handleEvent(event) {
   const userId = event.source.userId;
+  console.log('[SOURCE]', JSON.stringify(event.source));
 
   if (event.type === 'follow') {
     return reply(event, { type: 'text', text: '歡迎加入敘事空域！🏛️\n\n輸入「立即預約」開始預約\n輸入「價目表」查看費用' });
