@@ -534,30 +534,112 @@ function buildSuccessMessages(data) {
 }
 
 // ── 我的預約清單 ───────────────────────────────────────────
+
+// ── 取消/改期政策工具 ──────────────────────────────────────
+function calcDaysUntil(dateStr) {
+  const now = new Date();
+  const target = new Date(dateStr + 'T00:00:00+08:00');
+  return Math.ceil((target - now) / 86400000);
+}
+
+function getCancelPolicy(dateStr, price) {
+  const days = calcDaysUntil(dateStr);
+  let refundRate = 0, refundNote = '';
+  if (days >= 14) {
+    refundRate = 100;
+    refundNote = '訂金全額退還（扣除轉帳手續費）';
+  } else if (days >= 7) {
+    refundRate = 50;
+    refundNote = '退還 50% 訂金（NT$ ' + Math.floor(price * 0.5).toLocaleString() + '）';
+  } else {
+    refundRate = 0;
+    refundNote = '7天內取消，恕不退還訂金';
+  }
+  return { days, refundRate, refundNote };
+}
+
+function getReschedulePolicy(dateStr) {
+  const days = calcDaysUntil(dateStr);
+  let fee = 0, feeNote = '', allowed = true;
+  if (days >= 14) {
+    feeNote = '免費改期（限一次，新檔期須於原訂日期 3 個月內使用）';
+  } else if (days >= 7) {
+    fee = 20;
+    feeNote = '7~13天內改期，酌收場地總費用 20% 作為補償金';
+  } else {
+    allowed = false;
+    feeNote = '7天內提出改期，視同取消，訂金恕不退還，需重新預約';
+  }
+  return { days, fee, feeNote, allowed };
+}
+
+const CANCEL_POLICY_TEXT = '📋 預約取消政策\n\n' +
+  '• 14天前取消：訂金全額退還（扣除轉帳手續費）\n' +
+  '• 7~13天前取消：退還 50% 訂金\n' +
+  '• 7天內取消：恕不退還訂金\n\n' +
+  '📋 改期規範\n\n' +
+  '• 每筆預約免費改期乙次為限\n' +
+  '• 新檔期須於原訂日期 3 個月內使用\n' +
+  '• 7~13天內改期：酌收總費用 20% 補償金\n' +
+  '• 7天內改期：視同取消，訂金不退\n' +
+  '• 颱風/地震等天災（依台北市停班停課公告）：可免費改期或全額退訂金';
+
 function buildMyBookings(pages, action) {
-  if (pages.length === 0) return { type: 'text', text: '目前沒有未來的預約記錄。' };
-  const items = pages.map(p => {
-    const name = p.properties['預約姓名']?.title?.[0]?.plain_text || '';
-    const dateObj = p.properties['預約日期']?.date;
-    const date = dateObj?.start?.split('T')[0] || '';
+  if (pages.length === 0) return { type: 'text', text: action === 'cancel' ? '目前沒有可取消的預約。' : '目前沒有可改期的預約。' };
+  const items = pages.map(function(p) {
+    const date = (p.properties['預約日期']?.date?.start || '').split('T')[0];
     const slot = p.properties['預約時段']?.select?.name || '';
     const price = p.properties['金額']?.number || 0;
-    const label = action === 'cancel' ? '❌ 取消此預約' : '🔄 改期此預約';
-    const postbackAction = action === 'cancel' ? 'requestCancel' : 'requestReschedule';
+    const slotType = p.properties['預約類型']?.select?.name || '';
+
+    let policyRow, btnColor, btnLabel, btnData;
+
+    if (action === 'cancel') {
+      const pol = getCancelPolicy(date, price);
+      policyRow = { type: 'box', layout: 'vertical', backgroundColor: '#FFF3CD', cornerRadius: 'md', paddingAll: 'sm', margin: 'md',
+        contents: [
+          { type: 'text', text: '距活動 ' + pol.days + ' 天', size: 'xs', weight: 'bold', color: '#856404' },
+          { type: 'text', text: pol.refundNote, size: 'xs', color: '#856404', wrap: true },
+        ]
+      };
+      btnColor = '#C0392B';
+      btnLabel = '❌ 確認取消此預約';
+      btnData = 'requestCancel&pageId=' + p.id + '&date=' + date + '&slot=' + encodeURIComponent(slot) + '&price=' + price;
+    } else {
+      const pol = getReschedulePolicy(date);
+      policyRow = { type: 'box', layout: 'vertical', backgroundColor: pol.allowed ? '#E8F4FD' : '#FFF3CD', cornerRadius: 'md', paddingAll: 'sm', margin: 'md',
+        contents: [
+          { type: 'text', text: '距活動 ' + pol.days + ' 天', size: 'xs', weight: 'bold', color: pol.allowed ? '#1A5276' : '#856404' },
+          { type: 'text', text: pol.feeNote, size: 'xs', color: pol.allowed ? '#1A5276' : '#856404', wrap: true },
+        ]
+      };
+      btnColor = pol.allowed ? '#2980B9' : '#888888';
+      btnLabel = pol.allowed ? '🔄 確認改期此預約' : '⛔ 無法改期（視同取消）';
+      btnData = pol.allowed
+        ? 'requestReschedule&pageId=' + p.id + '&date=' + date + '&slot=' + encodeURIComponent(slot) + '&price=' + price
+        : 'action=alreadyBooked';
+    }
+
     return {
       type: 'bubble',
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'sm', contents: [{ type: 'text', text: date + '　' + slotType, weight: 'bold', color: '#FFFFFF', size: 'sm' }] },
       body: {
         type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
-        contents: [row('日期', date), row('時段', slot), row('費用', formatPrice(price))],
+        contents: [
+          row('時段', slot),
+          row('費用', formatPrice(price)),
+          policyRow,
+        ],
       },
       footer: {
         type: 'box', layout: 'vertical', paddingAll: 'md',
-        contents: [{ type: 'button', style: action === 'cancel' ? 'secondary' : 'primary', color: action === 'cancel' ? '#E74C3C' : '#3D6B8C', action: { type: 'postback', label, data: postbackAction + '&pageId=' + p.id + '&date=' + date + '&slot=' + encodeURIComponent(slot), displayText: label } }],
+        contents: [{ type: 'button', style: 'primary', color: btnColor, height: 'sm', action: { type: 'postback', label: btnLabel, data: 'action=' + btnData, displayText: btnLabel } }],
       },
     };
   });
+
   return {
-    type: 'flex', altText: action === 'cancel' ? '選擇要取消的預約' : '選擇要改期的預約',
+    type: 'flex', altText: action === 'cancel' ? '請選擇要取消的預約' : '請選擇要改期的預約',
     contents: { type: 'carousel', contents: items },
   };
 }
@@ -661,15 +743,21 @@ async function handleEvent(event) {
     // 取消預約入口
     if (text === '取消預約') {
       const pages = await getUserBookings(userId);
-      if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有可取消的預約。' });
-      return reply(event, buildMyBookings(pages, 'cancel'));
+      if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有可取消的預約。\n\n如需協助請聯繫：0939-607867' });
+      return reply(event, [
+        { type: 'text', text: CANCEL_POLICY_TEXT },
+        buildMyBookings(pages, 'cancel'),
+      ]);
     }
 
     // 改期入口
     if (text === '改期') {
       const pages = await getUserBookings(userId);
-      if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有可改期的預約。' });
-      return reply(event, buildMyBookings(pages, 'reschedule'));
+      if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有可改期的預約。\n\n如需協助請聯繫：0939-607867' });
+      return reply(event, [
+        { type: 'text', text: CANCEL_POLICY_TEXT },
+        buildMyBookings(pages, 'reschedule'),
+      ]);
     }
 
     // 輸入驗證碼
@@ -680,10 +768,17 @@ async function handleEvent(event) {
       clearCode(userId);
       clearSession(userId);
       if (v.action === 'cancel') {
+        const data = getData(userId);
+        const pol = getCancelPolicy(v.date || '', data.cancelPrice || 0);
         const ok = await cancelBooking(v.pageId);
         if (ok) {
-          await notifyGroup({ name: '', date: v.date, slot: v.slot, phone: '' }, 'cancel');
-          return reply(event, { type: 'text', text: '✅ 預約已取消。\n\n如需重新預約請輸入「立即預約」。' });
+          await notifyGroup({ name: '', date: v.date || '', slot: data.cancelSlot || '', phone: '' }, 'cancel');
+          const cancelMsg = '✅ 預約已取消\n\n' +
+            '日期：' + (v.date || '') + '\n' +
+            '退款說明：' + pol.refundNote + '\n\n' +
+            '退款將於 5~7 個工作天內處理。\n如有疑問請聯繫：0939-607867\n\n' +
+            '如需重新預約請輸入「立即預約」。';
+          return reply(event, { type: 'text', text: cancelMsg });
         } else {
           return reply(event, { type: 'text', text: '⚠️ 取消失敗，請聯繫主理人：0939-607867' });
         }
@@ -875,10 +970,16 @@ async function handleEvent(event) {
       const pageId = params.get('pageId');
       const date = params.get('date');
       const slot = decodeURIComponent(params.get('slot') || '');
+      const price = Number(params.get('price') || 0);
+      const pol = getCancelPolicy(date, price);
       const code = genCode();
       setCode(userId, code, pageId, 'cancel');
-      setSession(userId, 'inputCode', { cancelPageId: pageId, cancelDate: date, cancelSlot: slot });
-      return reply(event, { type: 'text', text: '⚠️ 確認取消預約\n\n日期：' + date + '\n時段：' + slot + '\n\n驗證碼已發送，請輸入以下 6 位數驗證碼確認取消：\n\n🔑 ' + code + '\n\n（驗證碼 10 分鐘內有效）' });
+      setSession(userId, 'inputCode', { cancelPageId: pageId, cancelDate: date, cancelSlot: slot, cancelPrice: price });
+      const confirmText = '⚠️ 取消預約確認\n\n' +
+        '日期：' + date + '\n時段：' + slot + '\n費用：' + formatPrice(price) + '\n\n' +
+        '距活動 ' + pol.days + ' 天\n退款規則：' + pol.refundNote + '\n\n' +
+        '請輸入以下驗證碼確認取消（10分鐘內有效）：\n\n🔑 ' + code;
+      return reply(event, { type: 'text', text: confirmText });
     }
 
     // 改期請求
@@ -886,11 +987,16 @@ async function handleEvent(event) {
       const pageId = params.get('pageId');
       const date = params.get('date');
       const slot = decodeURIComponent(params.get('slot') || '');
+      const price = Number(params.get('price') || 0);
+      const pol = getReschedulePolicy(date);
       const code = genCode();
       setCode(userId, code, pageId, 'reschedule');
-      setCode(userId, code, pageId, 'reschedule');
-      setSession(userId, 'inputCode', { reschedulePageId: pageId, oldDate: date, oldSlot: slot });
-      return reply(event, { type: 'text', text: '🔄 確認改期\n\n目前預約\n日期：' + date + '\n時段：' + slot + '\n\n驗證碼已發送，請輸入以下 6 位數驗證碼確認改期：\n\n🔑 ' + code + '\n\n（驗證碼 10 分鐘內有效）' });
+      setSession(userId, 'inputCode', { reschedulePageId: pageId, oldDate: date, oldSlot: slot, reschedulePrice: price });
+      const confirmText = '🔄 改期確認\n\n' +
+        '目前預約\n日期：' + date + '\n時段：' + slot + '\n費用：' + formatPrice(price) + '\n\n' +
+        '距活動 ' + pol.days + ' 天\n改期規則：' + pol.feeNote + '\n\n' +
+        '請輸入以下驗證碼確認改期（10分鐘內有效）：\n\n🔑 ' + code;
+      return reply(event, { type: 'text', text: confirmText });
     }
   }
 }
