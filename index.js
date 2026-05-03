@@ -29,26 +29,17 @@ async function fetchTaiwanHolidays(year) {
           const json = JSON.parse(data);
           const holidays = new Set();
           json.forEach(item => {
-            if (item.isHoliday === '2' && item.date) {
-              holidays.add(item.date.replace(/\//g, '-'));
-            }
+            if (item.isHoliday === '2' && item.date) holidays.add(item.date.replace(/\//g, '-'));
           });
           resolve(holidays);
-        } catch (e) {
-          console.error('[Holiday] 解析失敗:', e.message);
-          resolve(new Set());
-        }
+        } catch (e) { resolve(new Set()); }
       });
-    }).on('error', (e) => {
-      console.error('[Holiday] 抓取失敗:', e.message);
-      resolve(new Set());
-    });
+    }).on('error', () => resolve(new Set()));
   });
 }
 
 async function isHoliday(dateStr) {
-  const d = new Date(dateStr);
-  const dow = d.getDay();
+  const dow = new Date(dateStr).getDay();
   if (dow === 0 || dow === 6) return true;
   const year = dateStr.substring(0, 4);
   if (holidayCacheYear !== year) {
@@ -58,72 +49,45 @@ async function isHoliday(dateStr) {
   return holidayCache.has(dateStr);
 }
 
-// ── 統一時間解析與衝突檢查 ─────────────────────────────────
-// 解析任何時間字串為分鐘數（例如 "18:30" → 1110）
+// ── 時間工具 ───────────────────────────────────────────────
 function timeToMin(t) {
-  const parts = t.split(':');
-  return parseInt(parts[0]) * 60 + parseInt(parts[1]);
+  const p = t.split(':');
+  return parseInt(p[0]) * 60 + parseInt(p[1]);
 }
-
-// 提取字串中的時間區間，例如 "早上 09:00~12:30" 或 "全天 10:00~18:00"
+function minToTime(m) {
+  return String(Math.floor(m/60)).padStart(2,'0') + ':' + String(m%60).padStart(2,'0');
+}
 function extractTimeRange(label) {
   const match = label.match(/(\d{1,2}:\d{2})\s*[~～]\s*(\d{1,2}:\d{2})/);
   if (!match) return null;
   return { startMin: timeToMin(match[1]), endMin: timeToMin(match[2]) };
 }
-
-// 將所有已預約的字串，轉換為分鐘區間陣列
 function getBookedRanges(bookedSlots) {
-  const ranges = [];
-  bookedSlots.forEach(function(slotLabel) {
-    const r = extractTimeRange(slotLabel);
-    if (r) ranges.push(r);
-  });
-  return ranges;
+  return bookedSlots.map(s => extractTimeRange(s)).filter(Boolean);
 }
-
-// 檢查 A 區間是否與 B 區間重疊
-function isOverlap(minA, maxA, minB, maxB) {
-  return minA < maxB && maxA > minB;
-}
-
-// 統一審核：檢查目標時間是否與任何已預約時間重疊
-function isConflict(testStartMin, testEndMin, bookedRanges) {
-  return bookedRanges.some(function(r) {
-    return isOverlap(testStartMin, testEndMin, r.startMin, r.endMin);
-  });
+function isOverlap(a1, a2, b1, b2) { return a1 < b2 && a2 > b1; }
+function isConflict(s, e, ranges) {
+  return ranges.some(r => isOverlap(s, e, r.startMin, r.endMin));
 }
 
 // ── 時段定義 ───────────────────────────────────────────────
 const FIXED_SLOTS = [
-  { label: '早上 9:00~12:30',  period: 'morning',   duration: '3.5小時' },
-  { label: '下午 13:30~17:00', period: 'afternoon', duration: '3.5小時' },
-  { label: '晚上 18:00~21:30', period: 'evening',   duration: '3.5小時' },
+  { label: '早上 9:00~12:30',  period: 'morning' },
+  { label: '下午 13:30~17:00', period: 'afternoon' },
+  { label: '晚上 18:00~21:30', period: 'evening' },
 ];
-
-// 休息時段（不接受預約）
 const BREAK_SLOTS = ['12:30~13:30', '17:00~18:00'];
 
-// 產生整點+半點時段，排除休息時段
 function generateHourlySlots() {
   const slots = [];
-  for (let totalMin = 9 * 60; totalMin <= 20 * 60 + 30; totalMin += 30) {
-    const startH = Math.floor(totalMin / 60);
-    const startM = totalMin % 60;
-    const endTotalMin = totalMin + 60;
-    const endH = Math.floor(endTotalMin / 60);
-    const endM = endTotalMin % 60;
-    const startStr = String(startH).padStart(2, '0') + ':' + String(startM).padStart(2, '0');
-    const endStr   = String(endH).padStart(2, '0')   + ':' + String(endM).padStart(2, '0');
-    const label = startStr + '~' + endStr;
-
+  for (let m = 9*60; m <= 20*60+30; m += 30) {
+    const end = m + 60;
+    const label = minToTime(m) + '~' + minToTime(end);
     if (BREAK_SLOTS.indexOf(label) !== -1) continue;
-
     let period = 'morning';
-    if (totalMin >= 13 * 60) period = 'afternoon';
-    if (totalMin >= 18 * 60) period = 'evening';
-
-    slots.push({ label: label, startMin: totalMin, endMin: endTotalMin, period: period });
+    if (m >= 13*60) period = 'afternoon';
+    if (m >= 18*60) period = 'evening';
+    slots.push({ label, startMin: m, endMin: end, period });
   }
   return slots;
 }
@@ -140,23 +104,10 @@ const PRICES = {
     holiday: { morning: 2200, afternoon: 2600, evening: 3100 },
   },
 };
-
 function getPrice(type, period, holiday) {
   return PRICES[type][holiday ? 'holiday' : 'weekday'][period];
 }
-
-function formatPrice(n) {
-  return 'NT$ ' + Number(n).toLocaleString();
-}
-
-function calcHourlyTotal(selectedLabels, holiday) {
-  let total = 0;
-  selectedLabels.forEach(label => {
-    const slot = HOURLY_SLOTS.find(s => s.label === label);
-    if (slot) total += getPrice('hourly', slot.period, holiday);
-  });
-  return total;
-}
+function formatPrice(n) { return 'NT$ ' + Number(n).toLocaleString(); }
 
 // ── 對話狀態機 ─────────────────────────────────────────────
 const sessions = new Map();
@@ -169,7 +120,7 @@ function getSession(userId) {
 function setSession(userId, step, data) {
   const existing = sessions.get(userId) || { data: {} };
   sessions.set(userId, {
-    step: step,
+    step,
     data: Object.assign({}, existing.data, data || {}),
     expireAt: Date.now() + 30 * 60 * 1000,
   });
@@ -178,15 +129,26 @@ function clearSession(userId) { sessions.delete(userId); }
 function getStep(userId) { const s = getSession(userId); return s ? s.step : 'idle'; }
 function getData(userId) { const s = getSession(userId); return s ? s.data : {}; }
 
-// ── 取得 LINE 使用者名稱 ───────────────────────────────────
+// ── 驗證碼儲存 ─────────────────────────────────────────────
+const verificationCodes = new Map();
+function genCode() { return String(Math.floor(100000 + Math.random() * 900000)); }
+function setCode(userId, code, pageId, action) {
+  verificationCodes.set(userId, { code, pageId, action, expireAt: Date.now() + 10 * 60 * 1000 });
+}
+function getCode(userId) {
+  const v = verificationCodes.get(userId);
+  if (!v) return null;
+  if (Date.now() > v.expireAt) { verificationCodes.delete(userId); return null; }
+  return v;
+}
+function clearCode(userId) { verificationCodes.delete(userId); }
+
+// ── LINE 工具 ──────────────────────────────────────────────
 async function getLineDisplayName(userId) {
   try {
-    const profile = await client.getProfile(userId);
-    return profile.displayName || '';
-  } catch (e) {
-    console.error('[LINE] getProfile:', e.message);
-    return '';
-  }
+    const p = await client.getProfile(userId);
+    return p.displayName || '';
+  } catch (e) { return ''; }
 }
 
 // ── Notion 操作 ────────────────────────────────────────────
@@ -203,34 +165,90 @@ async function getBookedSlots(date) {
   }
 }
 
+async function getUserBookings(userId) {
+  try {
+    const res = await notion.databases.query({
+      database_id: DATABASE_ID,
+      filter: {
+        and: [
+          { property: 'LINE ID', rich_text: { equals: userId } },
+          { property: '預約日期', date: { on_or_after: new Date().toISOString().split('T')[0] } },
+        ],
+      },
+      sorts: [{ property: '預約日期', direction: 'ascending' }],
+    });
+    return res.results;
+  } catch (e) {
+    console.error('[Notion] getUserBookings:', e.message);
+    return [];
+  }
+}
+
+async function getBookingsByDateRange(startDate, endDate) {
+  try {
+    const res = await notion.databases.query({
+      database_id: DATABASE_ID,
+      filter: {
+        and: [
+          { property: '預約日期', date: { on_or_after: startDate } },
+          { property: '預約日期', date: { before: endDate } },
+        ],
+      },
+      sorts: [{ property: '預約日期', direction: 'ascending' }],
+    });
+    return res.results;
+  } catch (e) {
+    console.error('[Notion] getBookingsByDateRange:', e.message);
+    return [];
+  }
+}
+
+async function cancelBooking(pageId) {
+  try {
+    await notion.pages.update({ page_id: pageId, archived: true });
+    return true;
+  } catch (e) {
+    console.error('[Notion] cancelBooking:', e.message);
+    return false;
+  }
+}
+
+async function rescheduleBooking(pageId, newDate, newSlot) {
+  try {
+    const range = extractTimeRange(newSlot);
+    let dateProp = { start: newDate };
+    if (range) {
+      dateProp = {
+        start: newDate + 'T' + minToTime(range.startMin) + ':00+08:00',
+        end: newDate + 'T' + minToTime(range.endMin) + ':00+08:00',
+      };
+    }
+    await notion.pages.update({
+      page_id: pageId,
+      properties: {
+        '預約日期': { date: dateProp },
+        '預約時段': { select: { name: newSlot } },
+      },
+    });
+    return true;
+  } catch (e) {
+    console.error('[Notion] rescheduleBooking:', e.message);
+    return false;
+  }
+}
+
 async function createBooking(booking) {
   try {
     const slotDisplay = (booking.selectedSlots && booking.selectedSlots.length > 0) ? booking.selectedSlots.join('、') : booking.slot;
-    
-    const ranges = [];
-    const timeMatches = slotDisplay.match(/(\d{1,2}:\d{2})\s*[~～]\s*(\d{1,2}:\d{2})/g) || [];
-    timeMatches.forEach(match => {
-      const parsed = extractTimeRange(match);
-      if (parsed) ranges.push(parsed);
-    });
-
+    const range = extractTimeRange(slotDisplay.split('、')[0]);
+    const rangeEnd = extractTimeRange(slotDisplay.split('、')[slotDisplay.split('、').length - 1]);
     let dateProp = { start: booking.date };
-
-    if (ranges.length > 0) {
-      const minStart = Math.min(...ranges.map(r => r.startMin));
-      const maxEnd = Math.max(...ranges.map(r => r.endEnd ? r.endEnd : r.endMin)); // fallback
-      
-      const startH = String(Math.floor(minStart / 60)).padStart(2, '0');
-      const startM = String(minStart % 60).padStart(2, '0');
-      const endH = String(Math.floor(maxEnd / 60)).padStart(2, '0');
-      const endM = String(maxEnd % 60).padStart(2, '0');
-      
+    if (range && rangeEnd) {
       dateProp = {
-        start: `${booking.date}T${startH}:${startM}:00+08:00`,
-        end: `${booking.date}T${endH}:${endM}:00+08:00`
+        start: booking.date + 'T' + minToTime(range.startMin) + ':00+08:00',
+        end: booking.date + 'T' + minToTime(rangeEnd.endMin) + ':00+08:00',
       };
     }
-
     await notion.pages.create({
       parent: { database_id: DATABASE_ID },
       properties: {
@@ -240,9 +258,10 @@ async function createBooking(booking) {
         '聯絡電話': { phone_number: booking.phone || '' },
         '預約類型': { select: { name: booking.slotType || '包場時段' } },
         '舉辦類型': { select: { name: booking.eventType || '其他' } },
-        '金額':     { number: Number(booking.price) || 0 },
-        '備註':     { rich_text: [{ text: { content: '人數：' + String(booking.headcount || 1) + ' 人' + (booking.note ? '\n備註：' + booking.note : '') } }] },
+        '金額': { number: Number(booking.price) || 0 },
+        '備註': { rich_text: [{ text: { content: '人數：' + String(booking.headcount || 1) + ' 人' + (booking.note ? '\n備註：' + booking.note : '') } }] },
         '預約來源': { select: { name: 'LINE' } },
+        'LINE ID': { rich_text: [{ text: { content: booking.userId || '' } }] },
       },
     });
     return true;
@@ -252,19 +271,33 @@ async function createBooking(booking) {
   }
 }
 
-// ── 日期驗證（24小時前不給預約）─────────────────────────────
+// ── 日期驗證 ───────────────────────────────────────────────
 function checkDateAllowed(dateStr) {
   const now = new Date();
   const twNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
   const todayStr = twNow.toISOString().split('T')[0];
-  if (dateStr <= todayStr) {
-    return { allowed: false, reason: '⚠️ 不接受當天或過去的日期。\n24小時內請直接電話人工預約：0939-607867' };
-  }
+  if (dateStr <= todayStr) return { allowed: false, reason: '⚠️ 不接受當天或過去的日期。\n24小時內請直接電話人工預約：0939-607867' };
   const diff = (new Date(dateStr + 'T00:00:00+08:00') - now) / 3600000;
-  if (diff < 24) {
-    return { allowed: false, reason: '⚠️ 24小時內無法線上預約。\n請直接電話人工預約：0939-607867' };
-  }
+  if (diff < 24) return { allowed: false, reason: '⚠️ 24小時內無法線上預約。\n請直接電話人工預約：0939-607867' };
   return { allowed: true, reason: '' };
+}
+
+// ── 日期計算工具 ───────────────────────────────────────────
+function getTwDate(offset = 0) {
+  const now = new Date();
+  const tw = new Date(now.getTime() + 8 * 60 * 60 * 1000 + offset * 86400000);
+  return tw.toISOString().split('T')[0];
+}
+function getWeekRange(weekOffset = 0) {
+  const now = new Date();
+  const tw = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  const dow = tw.getDay();
+  const monday = new Date(tw.getTime() - (dow === 0 ? 6 : dow - 1) * 86400000 + weekOffset * 7 * 86400000);
+  const sunday = new Date(monday.getTime() + 6 * 86400000);
+  return {
+    start: monday.toISOString().split('T')[0],
+    end: new Date(sunday.getTime() + 86400000).toISOString().split('T')[0],
+  };
 }
 
 // ── 工具函式 ───────────────────────────────────────────────
@@ -272,7 +305,6 @@ function reply(event, messages) {
   const msgs = Array.isArray(messages) ? messages : [messages];
   return client.replyMessage(event.replyToken, msgs);
 }
-
 function row(label, value) {
   return {
     type: 'box', layout: 'horizontal',
@@ -284,7 +316,6 @@ function row(label, value) {
 }
 
 // ── 訊息模板 ──────────────────────────────────────────────
-
 function buildMainMenu() {
   return {
     type: 'text',
@@ -293,6 +324,9 @@ function buildMainMenu() {
       items: [
         { type: 'action', action: { type: 'message', label: '📅 立即預約', text: '立即預約' } },
         { type: 'action', action: { type: 'message', label: '💰 價目表', text: '價目表' } },
+        { type: 'action', action: { type: 'message', label: '📋 我的預約', text: '我的預約' } },
+        { type: 'action', action: { type: 'message', label: '❌ 取消預約', text: '取消預約' } },
+        { type: 'action', action: { type: 'message', label: '🔄 改期', text: '改期' } },
       ],
     },
   };
@@ -304,241 +338,50 @@ function buildDatePicker() {
   const minDate = new Date(now.getTime() + twOffset + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
   const maxDate = new Date(now.getTime() + twOffset + 60 * 86400000).toISOString().split('T')[0];
   return {
-    type: 'template',
-    altText: '請選擇預約日期',
+    type: 'template', altText: '請選擇預約日期',
     template: {
-      type: 'buttons',
-      title: '敘事空域 預約',
-      text: '請選擇您想預約的日期：',
-      actions: [{
-        type: 'datetimepicker',
-        label: '📅 選擇日期',
-        data: 'action=pickDate',
-        mode: 'date',
-        min: minDate,
-        max: maxDate,
-      }],
+      type: 'buttons', title: '敘事空域 預約', text: '請選擇您想預約的日期：',
+      actions: [{ type: 'datetimepicker', label: '📅 選擇日期', data: 'action=pickDate', mode: 'date', min: minDate, max: maxDate }],
     },
   };
 }
 
 function buildPriceMessage() {
-  function priceRows(items) {
-    return items.map(function(item) {
-      return {
-        type: 'box', layout: 'horizontal', margin: 'sm',
-        contents: [
-          { type: 'text', text: item[0], size: 'sm', color: '#555555', flex: 6 },
-          { type: 'text', text: formatPrice(item[1]), size: 'sm', color: '#333333', flex: 4, align: 'end', weight: 'bold' },
-        ],
-      };
-    });
+  function pr(items) {
+    return items.map(item => ({
+      type: 'box', layout: 'horizontal', margin: 'sm',
+      contents: [
+        { type: 'text', text: item[0], size: 'sm', color: '#555555', flex: 6 },
+        { type: 'text', text: formatPrice(item[1]), size: 'sm', color: '#333333', flex: 4, align: 'end', weight: 'bold' },
+      ],
+    }));
   }
-  function st(text) {
-    return { type: 'text', text: text, weight: 'bold', size: 'sm', color: '#3D6B8C', margin: 'md' };
-  }
+  function st(text) { return { type: 'text', text, weight: 'bold', size: 'sm', color: '#3D6B8C', margin: 'md' }; }
   return {
     type: 'flex', altText: '敘事空域 價目表',
     contents: {
       type: 'bubble', size: 'giga',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
-        contents: [{ type: 'text', text: '敘事空域 💰 價目表', weight: 'bold', color: '#FFFFFF', size: 'lg' }],
-      },
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '敘事空域 💰 價目表', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
       body: {
         type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
         contents: [
           { type: 'text', text: '📌 包場時段', weight: 'bold', size: 'md', color: '#222222' },
           { type: 'separator', margin: 'sm' },
           st('平日（週一～五）'),
-          ...priceRows([
-            ['早上 9:00~12:30', PRICES.fixed.weekday.morning],
-            ['下午 13:30~17:00', PRICES.fixed.weekday.afternoon],
-            ['晚上 18:00~21:30', PRICES.fixed.weekday.evening],
-            ['全天包場（任選8小時）', PRICES.fixed.weekday.fullday],
-          ]),
+          ...pr([['早上 9:00~12:30', PRICES.fixed.weekday.morning], ['下午 13:30~17:00', PRICES.fixed.weekday.afternoon], ['晚上 18:00~21:30', PRICES.fixed.weekday.evening], ['全天包場（任選8小時）', PRICES.fixed.weekday.fullday]]),
           { type: 'separator', margin: 'md' },
           st('假日（週六日＋連假）'),
-          ...priceRows([
-            ['早上 9:00~12:30', PRICES.fixed.holiday.morning],
-            ['下午 13:30~17:00', PRICES.fixed.holiday.afternoon],
-            ['晚上 18:00~21:30', PRICES.fixed.holiday.evening],
-            ['全天包場（任選8小時）', PRICES.fixed.holiday.fullday],
-          ]),
+          ...pr([['早上 9:00~12:30', PRICES.fixed.holiday.morning], ['下午 13:30~17:00', PRICES.fixed.holiday.afternoon], ['晚上 18:00~21:30', PRICES.fixed.holiday.evening], ['全天包場（任選8小時）', PRICES.fixed.holiday.fullday]]),
           { type: 'separator', margin: 'md' },
           { type: 'text', text: '⏰ 單一鐘點（每小時）', weight: 'bold', size: 'md', color: '#222222', margin: 'md' },
           { type: 'separator', margin: 'sm' },
-          st('平日（週一～五）'),
-          ...priceRows([
-            ['早上（09:00~12:30）', PRICES.hourly.weekday.morning],
-            ['下午（13:30~17:00）', PRICES.hourly.weekday.afternoon],
-            ['晚上（18:00~21:00）', PRICES.hourly.weekday.evening],
-          ]),
+          st('平日'), ...pr([['早上', PRICES.hourly.weekday.morning], ['下午', PRICES.hourly.weekday.afternoon], ['晚上', PRICES.hourly.weekday.evening]]),
           { type: 'separator', margin: 'md' },
-          st('假日（週六日＋連假）'),
-          ...priceRows([
-            ['早上（09:00~12:30）', PRICES.hourly.holiday.morning],
-            ['下午（13:30~17:00）', PRICES.hourly.holiday.afternoon],
-            ['晚上（18:00~21:00）', PRICES.hourly.holiday.evening],
-          ]),
+          st('假日'), ...pr([['早上', PRICES.hourly.holiday.morning], ['下午', PRICES.hourly.holiday.afternoon], ['晚上', PRICES.hourly.holiday.evening]]),
           { type: 'separator', margin: 'md' },
-          { type: 'text', text: '※ 24小時內請電話人工預約：0939-607867\n※ 單一鐘點可複選多個時段\n※ 休息換場時段不接受預約（12:30~13:30、17:00~18:00）', size: 'xs', color: '#888888', wrap: true, margin: 'md' },
+          { type: 'text', text: '※ 24小時內請電話：0939-607867\n※ 休息換場：12:30~13:30、17:00~18:00', size: 'xs', color: '#888888', wrap: true, margin: 'md' },
         ],
       },
-    },
-  };
-}
-
-function buildStartTimeFlex(date, bookedSlots, holiday, duration = 1, isFullDay = false) {
-  const dayLabel = holiday ? '假日' : '平日';
-  const bookedRanges = getBookedRanges(bookedSlots);
-  const available = [];
-  const unavailable = [];
-  const requiredMins = duration * 60; 
-
-  HOURLY_SLOTS.forEach(function(slot) {
-    const endMin = slot.startMin + requiredMins;
-    
-    if (endMin > 1290) {
-      if (!isFullDay) unavailable.push(slot); 
-      return; 
-    }
-
-    const conflict = isConflict(slot.startMin, endMin, bookedRanges);
-    
-    if (conflict) {
-      unavailable.push(slot);
-    } else {
-      available.push(slot);
-    }
-  });
-
-  if (available.length === 0) {
-    return { type: 'text', text: '😢 ' + date + ' 已無連續可用時段。' };
-  }
-
-  const buttons = [];
-
-  available.forEach(function(slot) {
-    const startStr = slot.label.split('~')[0];
-    
-    if (isFullDay) {
-      const priceFullday = getPrice('fixed', 'fullday', holiday);
-      buttons.push({
-        type: 'button', style: 'primary', color: '#8B7355', height: 'sm',
-        action: {
-          type: 'postback',
-          label: startStr + ' 開始(8H) ' + formatPrice(priceFullday),
-          data: 'action=confirmHourlyNew&date=' + date + '&startMin=' + slot.startMin + '&duration=8&period=fullday&holiday=' + holiday + '&isFullDay=true',
-          displayText: '預約全天 ' + startStr + ' 開始',
-        },
-      });
-    } else {
-      const price1hr = getPrice('hourly', slot.period, holiday);
-      buttons.push({
-        type: 'button', style: 'primary', color: '#5B8DB8', height: 'sm',
-        action: {
-          type: 'postback',
-          label: startStr + ' 開始 ' + formatPrice(price1hr) + '/小時',
-          data: 'action=pickDuration&date=' + date + '&startMin=' + slot.startMin + '&period=' + slot.period + '&holiday=' + holiday,
-          displayText: '選擇 ' + startStr + ' 開始',
-        },
-      });
-    }
-  });
-
-  if (!isFullDay) {
-    unavailable.forEach(function(slot) {
-      const startStr = slot.label.split('~')[0];
-      buttons.push({
-        type: 'button', style: 'secondary', height: 'sm', color: '#CCCCCC',
-        action: {
-          type: 'postback',
-          label: '🚫 ' + startStr + ' 已被佔用',
-          data: 'action=alreadyBooked',
-          displayText: startStr + ' 已被預約',
-        },
-      });
-    });
-  }
-
-  return {
-    type: 'flex', altText: date + ' 選擇開始時間',
-    contents: {
-      type: 'bubble', size: 'giga',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: isFullDay ? '#2C3E50' : '#8B7355', paddingAll: 'md',
-        contents: [
-          { type: 'text', text: isFullDay ? '敘事空域 🌟 全天包場' : '敘事空域 ⏰ 單一鐘點', weight: 'bold', color: '#FFFFFF', size: 'lg' },
-          { type: 'text', text: '📅 ' + date + '　' + dayLabel + '　請選擇開始時間', color: '#FFFFFFCC', size: 'sm' },
-        ],
-      },
-      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
-    },
-  };
-}
-
-function buildDurationFlex(date, startMin, period, holiday) {
-  const dayLabel = holiday ? '假日' : '平日';
-  const startH = Math.floor(startMin / 60);
-  const startM = startMin % 60;
-  const startStr = String(startH).padStart(2,'0') + ':' + String(startM).padStart(2,'0');
-  const price1hr = getPrice('hourly', period, holiday);
-  const price2hr = price1hr * 2;
-
-  const end1Min = startMin + 60;
-  const end1Str = String(Math.floor(end1Min/60)).padStart(2,'0') + ':' + String(end1Min%60).padStart(2,'0');
-  const end2Min = startMin + 120;
-  const end2Str = String(Math.floor(end2Min/60)).padStart(2,'0') + ':' + String(end2Min%60).padStart(2,'0');
-
-  const canDo2hr = end2Min <= 21*60+30;
-
-  const buttons = [
-    {
-      type: 'button', style: 'primary', color: '#5B8DB8',
-      action: {
-        type: 'postback',
-        label: '1 小時　' + startStr + '~' + end1Str + '　' + formatPrice(price1hr),
-        data: 'action=confirmHourlyNew&date=' + date + '&startMin=' + startMin + '&duration=1&period=' + period + '&holiday=' + holiday,
-        displayText: '預約 ' + startStr + '~' + end1Str + '（1小時）',
-      },
-    },
-  ];
-
-  if (canDo2hr) {
-    buttons.push({
-      type: 'button', style: 'primary', color: '#3D6B8C',
-      action: {
-        type: 'postback',
-        label: '2 小時　' + startStr + '~' + end2Str + '　' + formatPrice(price2hr),
-        data: 'action=confirmHourlyNew&date=' + date + '&startMin=' + startMin + '&duration=2&period=' + period + '&holiday=' + holiday,
-        displayText: '預約 ' + startStr + '~' + end2Str + '（2小時）',
-      },
-    });
-  }
-
-  buttons.push({
-    type: 'button', style: 'secondary',
-    action: {
-      type: 'postback',
-      label: '3小時以上建議包場 →',
-      data: 'action=suggestFixed&date=' + date + '&holiday=' + holiday,
-      displayText: '了解包場服務',
-    },
-  });
-
-  return {
-    type: 'flex', altText: '請選擇時數',
-    contents: {
-      type: 'bubble',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#8B7355', paddingAll: 'md',
-        contents: [
-          { type: 'text', text: '⏰ 選擇時數', weight: 'bold', color: '#FFFFFF', size: 'lg' },
-          { type: 'text', text: '開始時間：' + startStr + '　' + dayLabel, color: '#FFFFFFCC', size: 'sm' },
-        ],
-      },
-      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
     },
   };
 }
@@ -546,107 +389,111 @@ function buildDurationFlex(date, startMin, period, holiday) {
 function buildSlotTypePicker(date, holiday, bookedSlots) {
   const dayLabel = holiday ? '假日' : '平日';
   const bookedRanges = getBookedRanges(bookedSlots);
-
-  const availableFixed = FIXED_SLOTS.filter(s => {
-    const r = extractTimeRange(s.label);
-    return r && !isConflict(r.startMin, r.endMin, bookedRanges);
-  });
-  const fixedAvailCount = availableFixed.length;
-
-  const warningContents = [];
-  if (bookedSlots.length > 0) {
-    warningContents.push({
-      type: 'box', layout: 'vertical', backgroundColor: '#FFF3CD', cornerRadius: 'md', paddingAll: 'sm', margin: 'md',
-      contents: [
-        { type: 'text', text: '⚠️ 該日部分時段已被預約', size: 'xs', weight: 'bold', color: '#856404' },
-      ],
-    });
-  }
-
+  const fixedAvailCount = FIXED_SLOTS.filter(s => { const r = extractTimeRange(s.label); return r && !isConflict(r.startMin, r.endMin, bookedRanges); }).length;
+  const warnContents = bookedSlots.length > 0 ? [{
+    type: 'box', layout: 'vertical', backgroundColor: '#FFF3CD', cornerRadius: 'md', paddingAll: 'sm', margin: 'md',
+    contents: [{ type: 'text', text: '⚠️ 該日部分時段已被預約', size: 'xs', weight: 'bold', color: '#856404' }],
+  }] : [];
   return {
     type: 'flex', altText: '請選擇預約類型',
     contents: {
       type: 'bubble',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
-        contents: [
-          { type: 'text', text: '敘事空域', weight: 'bold', color: '#FFFFFF', size: 'lg' },
-          { type: 'text', text: '📅 ' + date + '　' + dayLabel, color: '#FFFFFFCC', size: 'sm' },
-        ],
-      },
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '敘事空域', weight: 'bold', color: '#FFFFFF', size: 'lg' }, { type: 'text', text: '📅 ' + date + '　' + dayLabel, color: '#FFFFFFCC', size: 'sm' }] },
       body: {
         type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'md',
         contents: [
           { type: 'text', text: '請選擇預約類型：', size: 'sm', color: '#555555' },
-          ...warningContents,
-          {
-            type: 'button', style: fixedAvailCount > 0 ? 'primary' : 'secondary', color: fixedAvailCount > 0 ? '#5B8DB8' : undefined,
-            action: { type: 'postback', label: '🕘 區段包場（3.5小時）' + (fixedAvailCount === 0 ? ' - 已滿' : ''), data: 'action=chooseType&date=' + date + '&holiday=' + holiday + '&type=fixed', displayText: '選擇區段包場' },
-          },
-          {
-            type: 'button', style: 'primary', color: '#8B7355',
-            action: { type: 'postback', label: '🌟 全天包場（任選 8小時）', data: 'action=pickStartTime&date=' + date + '&holiday=' + holiday + '&duration=8&isFullDay=true', displayText: '選擇全天包場' },
-          },
-          {
-            type: 'button', style: 'secondary',
-            action: { type: 'postback', label: '⏰ 單一鐘點（每小時）', data: 'action=chooseType&date=' + date + '&holiday=' + holiday + '&type=hourly', displayText: '選擇單一鐘點' },
-          },
+          ...warnContents,
+          { type: 'button', style: fixedAvailCount > 0 ? 'primary' : 'secondary', color: fixedAvailCount > 0 ? '#5B8DB8' : undefined, action: { type: 'postback', label: '🕘 區段包場（3.5小時）' + (fixedAvailCount === 0 ? ' - 已滿' : ''), data: 'action=chooseType&date=' + date + '&holiday=' + holiday + '&type=fixed' } },
+          { type: 'button', style: 'primary', color: '#8B7355', action: { type: 'postback', label: '🌟 全天包場（任選 8小時）', data: 'action=pickStartTime&date=' + date + '&holiday=' + holiday + '&duration=8&isFullDay=true' } },
+          { type: 'button', style: 'secondary', action: { type: 'postback', label: '⏰ 單一鐘點（每小時）', data: 'action=chooseType&date=' + date + '&holiday=' + holiday + '&type=hourly' } },
         ],
       },
     },
   };
 }
 
-function buildFixedSlotFlex(date, availableFixed, holiday) {
+function buildStartTimeFlex(date, bookedSlots, holiday, duration, isFullDay) {
   const dayLabel = holiday ? '假日' : '平日';
-  if (availableFixed.length === 0) {
-    return { type: 'text', text: '😢 ' + date + ' 區段包場已全部預約完畢。' };
-  }
-  const buttons = availableFixed.map(function(slot) {
-    const price = getPrice('fixed', slot.period, holiday);
-    return {
-      type: 'button', style: 'primary', color: '#5B8DB8', height: 'sm',
-      action: {
-        type: 'postback',
-        label: slot.label + '　' + formatPrice(price),
-        data: 'action=confirmSlot&date=' + date + '&slot=' + encodeURIComponent(slot.label) + '&type=包場時段&price=' + price,
-        displayText: '預約 ' + date + ' ' + slot.label,
-      },
-    };
+  const bookedRanges = getBookedRanges(bookedSlots);
+  const available = [], unavailable = [];
+  HOURLY_SLOTS.forEach(slot => {
+    const endMin = slot.startMin + (isFullDay ? 480 : 60);
+    if (endMin > 21*60+30) return;
+    isConflict(slot.startMin, endMin, bookedRanges) ? unavailable.push(slot) : available.push(slot);
   });
+  if (available.length === 0) return { type: 'text', text: '😢 ' + date + ' 已無可用時段。' };
+  const buttons = [];
+  available.forEach(slot => {
+    const startStr = minToTime(slot.startMin);
+    if (isFullDay) {
+      buttons.push({ type: 'button', style: 'primary', color: '#8B7355', height: 'sm', action: { type: 'postback', label: startStr + ' 開始(8H) ' + formatPrice(getPrice('fixed', 'fullday', holiday)), data: 'action=confirmHourlyNew&date=' + date + '&startMin=' + slot.startMin + '&duration=8&period=fullday&holiday=' + holiday + '&isFullDay=true', displayText: '全天 ' + startStr + ' 開始' } });
+    } else {
+      buttons.push({ type: 'button', style: 'primary', color: '#5B8DB8', height: 'sm', action: { type: 'postback', label: startStr + ' 開始 ' + formatPrice(getPrice('hourly', slot.period, holiday)) + '/小時', data: 'action=pickDuration&date=' + date + '&startMin=' + slot.startMin + '&period=' + slot.period + '&holiday=' + holiday, displayText: '選擇 ' + startStr + ' 開始' } });
+    }
+  });
+  if (!isFullDay) {
+    unavailable.forEach(slot => {
+      buttons.push({ type: 'button', style: 'secondary', height: 'sm', color: '#CCCCCC', action: { type: 'postback', label: '🚫 ' + minToTime(slot.startMin) + ' 已被佔用', data: 'action=alreadyBooked' } });
+    });
+  }
+  return {
+    type: 'flex', altText: date + ' 選擇開始時間',
+    contents: {
+      type: 'bubble', size: 'giga',
+      header: { type: 'box', layout: 'vertical', backgroundColor: isFullDay ? '#2C3E50' : '#8B7355', paddingAll: 'md', contents: [{ type: 'text', text: isFullDay ? '敘事空域 🌟 全天包場' : '敘事空域 ⏰ 單一鐘點', weight: 'bold', color: '#FFFFFF', size: 'lg' }, { type: 'text', text: '📅 ' + date + '　' + dayLabel + '　請選擇開始時間', color: '#FFFFFFCC', size: 'sm' }] },
+      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
+    },
+  };
+}
+
+function buildDurationFlex(date, startMin, period, holiday) {
+  const dayLabel = holiday ? '假日' : '平日';
+  const startStr = minToTime(startMin);
+  const p1 = getPrice('hourly', period, holiday);
+  const p2 = p1 * 2;
+  const end1 = startMin + 60, end2 = startMin + 120;
+  const buttons = [
+    { type: 'button', style: 'primary', color: '#5B8DB8', action: { type: 'postback', label: '1小時 ' + startStr + '~' + minToTime(end1) + ' ' + formatPrice(p1), data: 'action=confirmHourlyNew&date=' + date + '&startMin=' + startMin + '&duration=1&period=' + period + '&holiday=' + holiday } },
+  ];
+  if (end2 <= 21*60+30) {
+    buttons.push({ type: 'button', style: 'primary', color: '#3D6B8C', action: { type: 'postback', label: '2小時 ' + startStr + '~' + minToTime(end2) + ' ' + formatPrice(p2), data: 'action=confirmHourlyNew&date=' + date + '&startMin=' + startMin + '&duration=2&period=' + period + '&holiday=' + holiday } });
+  }
+  buttons.push({ type: 'button', style: 'secondary', action: { type: 'postback', label: '3小時以上建議包場 →', data: 'action=suggestFixed&date=' + date + '&holiday=' + holiday } });
+  return {
+    type: 'flex', altText: '請選擇時數',
+    contents: {
+      type: 'bubble',
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#8B7355', paddingAll: 'md', contents: [{ type: 'text', text: '⏰ 選擇時數', weight: 'bold', color: '#FFFFFF', size: 'lg' }, { type: 'text', text: '開始：' + startStr + '　' + dayLabel, color: '#FFFFFFCC', size: 'sm' }] },
+      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
+    },
+  };
+}
+
+function buildFixedSlotFlex(date, available, holiday) {
+  const dayLabel = holiday ? '假日' : '平日';
+  if (available.length === 0) return { type: 'text', text: '😢 ' + date + ' 區段包場已全部預約完畢。' };
+  const buttons = available.map(slot => ({
+    type: 'button', style: 'primary', color: '#5B8DB8', height: 'sm',
+    action: { type: 'postback', label: slot.label + '　' + formatPrice(getPrice('fixed', slot.period, holiday)), data: 'action=confirmSlot&date=' + date + '&slot=' + encodeURIComponent(slot.label) + '&type=包場時段&price=' + getPrice('fixed', slot.period, holiday) },
+  }));
   return {
     type: 'flex', altText: date + ' 包場時段',
     contents: {
       type: 'bubble', size: 'giga',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
-        contents: [
-          { type: 'text', text: '敘事空域 🏛️ 包場時段', weight: 'bold', color: '#FFFFFF', size: 'lg' },
-          { type: 'text', text: '📅 ' + date + '　' + dayLabel, color: '#FFFFFFCC', size: 'sm' },
-        ],
-      },
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '敘事空域 🏛️ 包場時段', weight: 'bold', color: '#FFFFFF', size: 'lg' }, { type: 'text', text: '📅 ' + date + '　' + dayLabel, color: '#FFFFFFCC', size: 'sm' }] },
       body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
     },
   };
 }
 
 function buildEventTypePicker() {
-  const types = ['講座', '課程', '活動', '其他'];
-  const buttons = types.map(function(t) {
-    return {
-      type: 'button', style: 'secondary', height: 'sm',
-      action: { type: 'postback', label: t, data: 'action=pickEventType&eventType=' + encodeURIComponent(t), displayText: '舉辦類型：' + t },
-    };
-  });
   return {
     type: 'flex', altText: '請選擇舉辦類型',
     contents: {
       type: 'bubble',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
-        contents: [{ type: 'text', text: '🎯 請選擇舉辦類型', weight: 'bold', color: '#FFFFFF', size: 'lg' }],
-      },
-      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '🎯 請選擇舉辦類型', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+      body: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: 'md', contents: ['講座', '課程', '活動', '其他'].map(t => ({ type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: t, data: 'action=pickEventType&eventType=' + encodeURIComponent(t), displayText: '舉辦類型：' + t } })) },
     },
   };
 }
@@ -657,159 +504,223 @@ function buildInfoConfirm(data) {
     type: 'flex', altText: '請確認以下預約資訊',
     contents: {
       type: 'bubble',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
-        contents: [{ type: 'text', text: '📋 請確認預約資訊', weight: 'bold', color: '#FFFFFF', size: 'lg' }],
-      },
-      body: {
-        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
-        contents: [
-          row('姓名', data.name),
-          row('日期', data.date),
-          row('時段', slotDisplay),
-          row('類型', data.slotType),
-          row('舉辦類型', data.eventType),
-          row('費用', formatPrice(Number(data.price))),
-          row('電話', data.phone),
-          row('人數', String(data.headcount || '') + ' 人'),
-          row('備註', data.note || '無'),
-        ],
-      },
-      footer: {
-        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
-        contents: [
-          { type: 'button', style: 'primary', color: '#4CAF82', action: { type: 'message', label: '✅ 確認預約', text: '確認預約' } },
-          { type: 'button', style: 'secondary', action: { type: 'message', label: '🔄 重新選擇', text: '重新選擇' } },
-        ],
-      },
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '📋 請確認預約資訊', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+      body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [row('姓名', data.name), row('日期', data.date), row('時段', slotDisplay), row('類型', data.slotType), row('舉辦類型', data.eventType), row('費用', formatPrice(Number(data.price))), row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'), row('備註', data.note || '無')] },
+      footer: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [{ type: 'button', style: 'primary', color: '#4CAF82', action: { type: 'message', label: '✅ 確認預約', text: '確認預約' } }, { type: 'button', style: 'secondary', action: { type: 'message', label: '🔄 重新選擇', text: '重新選擇' } }] },
     },
   };
 }
 
 function buildSuccessMessages(data) {
   const slotDisplay = (data.selectedSlots && data.selectedSlots.length > 0) ? data.selectedSlots.join('、') : data.slot;
-  const msg1 = {
-    type: 'flex', altText: '預約成功！',
-    contents: {
-      type: 'bubble',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#4CAF82', paddingAll: 'md',
-        contents: [{ type: 'text', text: '✅ 預約成功！', weight: 'bold', color: '#FFFFFF', size: 'lg' }],
-      },
-      body: {
-        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
-        contents: [
-          row('姓名', data.name),
-          row('日期', data.date),
-          row('時段', slotDisplay),
-          row('舉辦類型', data.eventType),
-          row('費用', formatPrice(Number(data.price))),
-          row('電話', data.phone),
-          row('人數', String(data.headcount || '') + ' 人'),
-          { type: 'separator', margin: 'md' },
-          { type: 'text', text: '場域主理人：蘇郁翔\n聯繫電話：0939-607867', size: 'sm', color: '#555555', wrap: true, margin: 'md' },
-        ],
+  return [
+    {
+      type: 'flex', altText: '預約成功！',
+      contents: {
+        type: 'bubble',
+        header: { type: 'box', layout: 'vertical', backgroundColor: '#4CAF82', paddingAll: 'md', contents: [{ type: 'text', text: '✅ 預約成功！', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+        body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [row('姓名', data.name), row('日期', data.date), row('時段', slotDisplay), row('舉辦類型', data.eventType), row('費用', formatPrice(Number(data.price))), row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'), { type: 'separator', margin: 'md' }, { type: 'text', text: '場域主理人：蘇郁翔\n聯繫電話：0939-607867', size: 'sm', color: '#555555', wrap: true, margin: 'md' }] },
       },
     },
-  };
-  const msg2 = {
-    type: 'flex', altText: '匯款資訊',
-    contents: {
-      type: 'bubble',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#2C3E50', paddingAll: 'md',
-        contents: [{ type: 'text', text: '💳 匯款資訊', weight: 'bold', color: '#FFFFFF', size: 'lg' }],
-      },
-      body: {
-        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
-        contents: [
-          row('匯款金額', formatPrice(Number(data.price))),
-          row('銀行', '星展銀行 810'),
-          row('分行', '世貿分行'),
-          row('帳號', '602-489-60988'),
-          row('戶名', '鍾沛潔'),
-          { type: 'separator', margin: 'md' },
-          { type: 'text', margin: 'md', size: 'sm', color: '#555555', wrap: true, text: '為確保您的預約檔期，請於本報價單發出後 3 個工作日內，匯款「訂金」至以上指定帳戶，並提供匯款帳號後五碼以利對帳。檔期保留將以訂金入帳為準。' },
-          { type: 'separator', margin: 'md' },
-          { type: 'text', margin: 'md', size: 'sm', color: '#3D6B8C', wrap: true, weight: 'bold', text: '感謝您選擇敘事空域 🏛️\n每一個故事，都值得一個好的空間。\n期待與您共創美好時光，若有任何需求請隨時聯繫我們！' },
-        ],
+    {
+      type: 'flex', altText: '匯款資訊',
+      contents: {
+        type: 'bubble',
+        header: { type: 'box', layout: 'vertical', backgroundColor: '#2C3E50', paddingAll: 'md', contents: [{ type: 'text', text: '💳 匯款資訊', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+        body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [row('匯款金額', formatPrice(Number(data.price))), row('銀行', '星展銀行 810'), row('分行', '世貿分行'), row('帳號', '602-489-60988'), row('戶名', '鍾沛潔'), { type: 'separator', margin: 'md' }, { type: 'text', margin: 'md', size: 'sm', color: '#555555', wrap: true, text: '為確保您的預約檔期，請於本報價單發出後 3 個工作日內，匯款「訂金」至以下指定帳戶，並提供匯款帳號後五碼以利對帳。檔期保留將以訂金入帳為準。' }, { type: 'separator', margin: 'md' }, { type: 'text', margin: 'md', size: 'sm', color: '#3D6B8C', wrap: true, weight: 'bold', text: '感謝您選擇敘事空域 🏛️\n每一個故事，都值得一個好的空間。\n期待與您共創美好時光，若有任何需求請隨時聯繫我們！' }] },
       },
     },
+  ];
+}
+
+// ── 我的預約清單 ───────────────────────────────────────────
+function buildMyBookings(pages, action) {
+  if (pages.length === 0) return { type: 'text', text: '目前沒有未來的預約記錄。' };
+  const items = pages.map(p => {
+    const name = p.properties['預約姓名']?.title?.[0]?.plain_text || '';
+    const dateObj = p.properties['預約日期']?.date;
+    const date = dateObj?.start?.split('T')[0] || '';
+    const slot = p.properties['預約時段']?.select?.name || '';
+    const price = p.properties['金額']?.number || 0;
+    const label = action === 'cancel' ? '❌ 取消此預約' : '🔄 改期此預約';
+    const postbackAction = action === 'cancel' ? 'requestCancel' : 'requestReschedule';
+    return {
+      type: 'bubble',
+      body: {
+        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
+        contents: [row('日期', date), row('時段', slot), row('費用', formatPrice(price))],
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: 'md',
+        contents: [{ type: 'button', style: action === 'cancel' ? 'secondary' : 'primary', color: action === 'cancel' ? '#E74C3C' : '#3D6B8C', action: { type: 'postback', label, data: postbackAction + '&pageId=' + p.id + '&date=' + date + '&slot=' + encodeURIComponent(slot), displayText: label } }],
+      },
+    };
+  });
+  return {
+    type: 'flex', altText: action === 'cancel' ? '選擇要取消的預約' : '選擇要改期的預約',
+    contents: { type: 'carousel', contents: items },
   };
-  return [msg1, msg2];
+}
+
+// ── 群組查詢預約 ───────────────────────────────────────────
+async function handleGroupQuery(event, queryText) {
+  let startDate, endDate, label;
+  const today = getTwDate();
+
+  if (queryText.includes('今天')) {
+    startDate = today; endDate = getTwDate(1); label = '今天';
+  } else if (queryText.includes('明天')) {
+    startDate = getTwDate(1); endDate = getTwDate(2); label = '明天';
+  } else if (queryText.includes('本週')) {
+    const r = getWeekRange(0); startDate = r.start; endDate = r.end; label = '本週';
+  } else if (queryText.includes('下週')) {
+    const r = getWeekRange(1); startDate = r.start; endDate = r.end; label = '下週';
+  } else {
+    const match = queryText.match(/(\d{4}-\d{2}-\d{2})/);
+    if (match) { startDate = match[1]; endDate = getTwDate(1); label = match[1]; }
+    else return;
+  }
+
+  const pages = await getBookingsByDateRange(startDate, endDate);
+  if (pages.length === 0) {
+    return client.replyMessage(event.replyToken, { type: 'text', text: '📅 ' + label + '（' + startDate + (endDate !== getTwDate(1) ? '~' + endDate : '') + '）\n目前無預約紀錄。' });
+  }
+
+  const lines = pages.map(p => {
+    const date = (p.properties['預約日期']?.date?.start || '').split('T')[0];
+    const slot = p.properties['預約時段']?.select?.name || '';
+    const name = p.properties['預約姓名']?.title?.[0]?.plain_text || '';
+    const type = p.properties['舉辦類型']?.select?.name || '';
+    return '📌 ' + date + '\n時段：' + slot + '\n姓名：' + name + '\n類型：' + type;
+  });
+
+  return client.replyMessage(event.replyToken, {
+    type: 'text',
+    text: '📅 ' + label + ' 預約清單（共 ' + pages.length + ' 筆）\n\n' + lines.join('\n\n'),
+  });
+}
+
+// ── 推播通知群組 ───────────────────────────────────────────
+async function notifyGroup(booking, action) {
+  action = action || 'new';
+  const slotDisplay = (booking.selectedSlots && booking.selectedSlots.length > 0) ? booking.selectedSlots.join('、') : booking.slot;
+  const headerText = action === 'cancel' ? '🚫 預約取消通知' : action === 'reschedule' ? '🔄 改期通知' : '🔔 新預約通知！';
+  const headerColor = action === 'cancel' ? '#888888' : action === 'reschedule' ? '#E67E22' : '#E74C3C';
+  const message = {
+    type: 'flex', altText: headerText,
+    contents: {
+      type: 'bubble',
+      header: { type: 'box', layout: 'vertical', backgroundColor: headerColor, paddingAll: 'md', contents: [{ type: 'text', text: headerText, weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+      body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [row('姓名', booking.name || ''), row('日期', booking.date || ''), row('時段', slotDisplay), row('電話', booking.phone || '')] },
+    },
+  };
+  try { await client.pushMessage(NOTIFY_GROUP_ID, message); } catch (e) { console.error('[通知]', e.message); }
 }
 
 // ── 主要事件處理器 ────────────────────────────────────────
 async function handleEvent(event) {
-  // 💡 【新增過濾器】：如果訊息來源不是一對一私訊 (user)，則略過不處理。
-  // 這樣群組內大家聊天，機器人就會安靜不理會。
-  if (event.source.type !== 'user') {
+  // 群組訊息：只處理查詢指令
+  if (event.source.type === 'group') {
+    if (event.type === 'message' && event.message.type === 'text') {
+      const text = event.message.text.trim();
+      if (text.startsWith('查詢')) {
+        return handleGroupQuery(event, text);
+      }
+    }
     return Promise.resolve(null);
   }
 
+  if (event.source.type !== 'user') return Promise.resolve(null);
   const userId = event.source.userId;
 
   if (event.type === 'follow') {
-    return reply(event, { type: 'text', text: '歡迎加入敘事空域！🏛️\n\n輸入「立即預約」開始預約\n輸入「價目表」查看費用' });
+    return reply(event, { type: 'text', text: '歡迎加入敘事空域！🏛️\n\n輸入「立即預約」開始預約\n輸入「價目表」查看費用\n輸入「我的預約」查看預約紀錄' });
   }
 
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
     const step = getStep(userId);
 
-    if (text === '取消' || text === '重新開始') {
-      clearSession(userId);
-      return reply(event, buildMainMenu());
-    }
-    if (text === '立即預約' || text === '預約') {
-      clearSession(userId);
-      setSession(userId, 'pickDate', {});
-      return reply(event, buildDatePicker());
-    }
+    if (text === '取消' || text === '重新開始') { clearSession(userId); return reply(event, buildMainMenu()); }
+    if (text === '立即預約' || text === '預約') { clearSession(userId); setSession(userId, 'pickDate', {}); return reply(event, buildDatePicker()); }
     if (text === '價目表') return reply(event, buildPriceMessage());
     if (text === '選單' || text === 'menu') return reply(event, buildMainMenu());
 
+    // 我的預約
+    if (text === '我的預約') {
+      const pages = await getUserBookings(userId);
+      if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有未來的預約記錄。\n\n輸入「立即預約」開始預約。' });
+      const lines = pages.map(p => {
+        const date = (p.properties['預約日期']?.date?.start || '').split('T')[0];
+        const slot = p.properties['預約時段']?.select?.name || '';
+        return '📌 ' + date + '　' + slot;
+      });
+      return reply(event, { type: 'text', text: '您的預約紀錄：\n\n' + lines.join('\n') });
+    }
+
+    // 取消預約入口
+    if (text === '取消預約') {
+      const pages = await getUserBookings(userId);
+      if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有可取消的預約。' });
+      return reply(event, buildMyBookings(pages, 'cancel'));
+    }
+
+    // 改期入口
+    if (text === '改期') {
+      const pages = await getUserBookings(userId);
+      if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有可改期的預約。' });
+      return reply(event, buildMyBookings(pages, 'reschedule'));
+    }
+
+    // 輸入驗證碼
+    if (step === 'inputCode') {
+      const v = getCode(userId);
+      if (!v) return reply(event, { type: 'text', text: '⚠️ 驗證碼已過期，請重新操作。' });
+      if (text !== v.code) return reply(event, { type: 'text', text: '⚠️ 驗證碼錯誤，請重新輸入（還有5分鐘有效）：' });
+      clearCode(userId);
+      clearSession(userId);
+      if (v.action === 'cancel') {
+        const ok = await cancelBooking(v.pageId);
+        if (ok) {
+          await notifyGroup({ name: '', date: v.date, slot: v.slot, phone: '' }, 'cancel');
+          return reply(event, { type: 'text', text: '✅ 預約已取消。\n\n如需重新預約請輸入「立即預約」。' });
+        } else {
+          return reply(event, { type: 'text', text: '⚠️ 取消失敗，請聯繫主理人：0939-607867' });
+        }
+      }
+      if (v.action === 'reschedule') {
+        setSession(userId, 'pickRescheduleDate', { reschedulePageId: v.pageId, oldSlot: v.slot });
+        return reply(event, buildDatePicker());
+      }
+    }
+
+    // 電話輸入
     if (step === 'inputPhone') {
       const cleaned = text.replace(/[-\s]/g, '');
-      if (!/^\d{8,10}$/.test(cleaned)) {
-        return reply(event, { type: 'text', text: '⚠️ 請輸入正確的電話號碼（8~10碼），例如：0939607867' });
-      }
+      if (!/^\d{8,10}$/.test(cleaned)) return reply(event, { type: 'text', text: '⚠️ 請輸入正確的電話號碼（8~10碼），例如：0939607867' });
       setSession(userId, 'inputHeadcount', { phone: text });
-      return reply(event, {
-        type: 'text',
-        text: '請問這次預約幾位？（請直接輸入數字，例如：15）',
-      });
+      return reply(event, { type: 'text', text: '請問這次預約幾位？（請直接輸入數字，例如：15）' });
     }
 
+    // 人數輸入
     if (step === 'inputHeadcount') {
       const n = parseInt(text, 10);
-      if (isNaN(n) || n < 1) {
-        return reply(event, { type: 'text', text: '⚠️ 請輸入正確人數（數字），例如：15' });
-      }
-      if (n > 40) {
-        return reply(event, { type: 'text', text: '⚠️ 溫馨提醒：40人以上已超過場地容納上限，場地過於擁擠無法安全使用。\n\n建議人數請控制在 40 人以內，如有特殊需求請直接聯繫：\n📞 0939-607867\n\n請重新輸入人數：' });
-      }
+      if (isNaN(n) || n < 1) return reply(event, { type: 'text', text: '⚠️ 請輸入正確人數（數字），例如：15' });
+      if (n > 40) return reply(event, { type: 'text', text: '⚠️ 溫馨提醒：40人以上超過場地容納上限，無法安全使用。\n\n請控制在 40 人以內，或聯繫：📞 0939-607867\n\n請重新輸入人數：' });
       setSession(userId, 'inputNote', { headcount: n });
-      return reply(event, {
-        type: 'text',
-        text: '有備註或特殊需求嗎？',
-        quickReply: {
-          items: [{ type: 'action', action: { type: 'message', label: '略過', text: '略過' } }],
-        },
-      });
+      return reply(event, { type: 'text', text: '有備註或特殊需求嗎？', quickReply: { items: [{ type: 'action', action: { type: 'message', label: '略過', text: '略過' } }] } });
     }
 
+    // 備註輸入
     if (step === 'inputNote') {
       setSession(userId, 'confirm', { note: text === '略過' ? '' : text });
       return reply(event, buildInfoConfirm(getData(userId)));
     }
 
+    // 確認預約
     if (step === 'confirm') {
       if (text === '確認預約') return await processBooking(event, userId);
-      if (text === '重新選擇') {
-        clearSession(userId);
-        return reply(event, { type: 'text', text: '已取消，請輸入「立即預約」重新開始。' });
-      }
+      if (text === '重新選擇') { clearSession(userId); return reply(event, { type: 'text', text: '已取消，請輸入「立即預約」重新開始。' }); }
       return reply(event, { type: 'text', text: '請點選「✅ 確認預約」或「🔄 重新選擇」' });
     }
 
@@ -820,21 +731,28 @@ async function handleEvent(event) {
     const params = new URLSearchParams(event.postback.data);
     const action = params.get('action');
 
-    if (action === 'alreadyBooked') {
-      return reply(event, { type: 'text', text: '🚫 此時段已被預約，請選擇其他可用時段。' });
-    }
+    if (action === 'alreadyBooked') return reply(event, { type: 'text', text: '🚫 此時段已被預約，請選擇其他可用時段。' });
 
     if (action === 'pickDate') {
       const date = event.postback.params && event.postback.params.date;
       if (!date) return;
-      const check = checkDateAllowed(date);
-      if (!check.allowed) {
-        clearSession(userId);
-        return reply(event, { type: 'text', text: check.reason });
+      const step = getStep(userId);
+
+      // 改期選新日期
+      if (step === 'pickRescheduleDate') {
+        const check = checkDateAllowed(date);
+        if (!check.allowed) return reply(event, { type: 'text', text: check.reason });
+        const holiday = await isHoliday(date);
+        const booked = await getBookedSlots(date);
+        setSession(userId, 'pickRescheduleSlot', { rescheduleNewDate: date });
+        return reply(event, buildSlotTypePicker(date, holiday, booked));
       }
+
+      const check = checkDateAllowed(date);
+      if (!check.allowed) { clearSession(userId); return reply(event, { type: 'text', text: check.reason }); }
       const holiday = await isHoliday(date);
       const booked = await getBookedSlots(date);
-      setSession(userId, 'pickType', { date: date, holiday: holiday, selectedSlots: [] });
+      setSession(userId, 'pickType', { date, holiday, selectedSlots: [] });
       return reply(event, buildSlotTypePicker(date, holiday, booked));
     }
 
@@ -843,23 +761,22 @@ async function handleEvent(event) {
       const holiday = params.get('holiday') === 'true';
       const type = params.get('type');
       const booked = await getBookedSlots(date);
+      const bookedRanges = getBookedRanges(booked);
 
       if (type === 'fixed') {
-        const bookedRanges = getBookedRanges(booked);
-        const available = FIXED_SLOTS.filter(function(s) {
-          const r = extractTimeRange(s.label);
-          return r && !isConflict(r.startMin, r.endMin, bookedRanges);
-        });
-        
-        if (available.length === 0) {
-          return reply(event, { type: 'text', text: '😢 ' + date + ' 區段包場已無空檔，請選擇單一鐘點或其他日期。' });
+        const available = FIXED_SLOTS.filter(s => { const r = extractTimeRange(s.label); return r && !isConflict(r.startMin, r.endMin, bookedRanges); });
+        if (available.length === 0) return reply(event, { type: 'text', text: '😢 ' + date + ' 區段包場已無空檔。' });
+        const step = getStep(userId);
+        if (step === 'pickRescheduleSlot') {
+          // 改期：選定時段後直接確認
+          setSession(userId, 'confirmReschedule', {});
+          return reply(event, buildFixedSlotFlex(date, available, holiday));
         }
-        setSession(userId, 'pickFixed', { date: date, holiday: holiday });
+        setSession(userId, 'pickFixed', { date, holiday });
         return reply(event, buildFixedSlotFlex(date, available, holiday));
       }
-
       if (type === 'hourly') {
-        setSession(userId, 'pickStartTime', { date: date, holiday: holiday });
+        setSession(userId, 'pickStartTime', { date, holiday });
         return reply(event, buildStartTimeFlex(date, booked, holiday, 1, false));
       }
     }
@@ -867,11 +784,9 @@ async function handleEvent(event) {
     if (action === 'pickStartTime') {
       const date = params.get('date');
       const holiday = params.get('holiday') === 'true';
-      const duration = params.get('duration') ? parseInt(params.get('duration'), 10) : 1;
       const isFullDay = params.get('isFullDay') === 'true';
-      
       const booked = await getBookedSlots(date);
-      return reply(event, buildStartTimeFlex(date, booked, holiday, duration, isFullDay));
+      return reply(event, buildStartTimeFlex(date, booked, holiday, 8, isFullDay));
     }
 
     if (action === 'confirmSlot') {
@@ -879,19 +794,31 @@ async function handleEvent(event) {
       const slot = decodeURIComponent(params.get('slot'));
       const slotType = params.get('type');
       const price = params.get('price');
+      const step = getStep(userId);
+
+      // 改期確認
+      if (step === 'confirmReschedule' || step === 'pickRescheduleSlot') {
+        const data = getData(userId);
+        const ok = await rescheduleBooking(data.reschedulePageId, data.rescheduleNewDate || date, slot);
+        clearSession(userId);
+        if (ok) {
+          await notifyGroup({ name: '', date: data.rescheduleNewDate || date, slot, phone: '' }, 'reschedule');
+          return reply(event, { type: 'text', text: '✅ 改期成功！\n\n新日期：' + (data.rescheduleNewDate || date) + '\n新時段：' + slot + '\n\n如需更改請再次輸入「改期」。' });
+        } else {
+          return reply(event, { type: 'text', text: '⚠️ 改期失敗，請聯繫主理人：0939-607867' });
+        }
+      }
+
       const lineName = await getLineDisplayName(userId);
-      setSession(userId, 'pickEventType', { date: date, slot: slot, slotType: slotType, price: price, selectedSlots: [], name: lineName });
+      setSession(userId, 'pickEventType', { date, slot, slotType, price, selectedSlots: [], name: lineName });
       return reply(event, buildEventTypePicker());
     }
 
     if (action === 'pickEventType') {
       const eventType = decodeURIComponent(params.get('eventType'));
-      setSession(userId, 'inputPhone', { eventType: eventType });
+      setSession(userId, 'inputPhone', { eventType });
       const data = getData(userId);
-      return reply(event, {
-        type: 'text',
-        text: 'Hi ' + data.name + '！\n\n請直接輸入您的聯絡電話（必填，10碼數字）：\n例如：0939607867',
-      });
+      return reply(event, { type: 'text', text: 'Hi ' + data.name + '！\n\n請輸入您的聯絡電話（必填，10碼數字）：\n例如：0939607867' });
     }
 
     if (action === 'pickDuration') {
@@ -899,7 +826,7 @@ async function handleEvent(event) {
       const startMin = parseInt(params.get('startMin'), 10);
       const period = params.get('period');
       const holiday = params.get('holiday') === 'true';
-      setSession(userId, 'pickDuration', { date: date, startMin: startMin, period: period, holiday: holiday });
+      setSession(userId, 'pickDuration', { date, startMin, period, holiday });
       return reply(event, buildDurationFlex(date, startMin, period, holiday));
     }
 
@@ -910,44 +837,25 @@ async function handleEvent(event) {
       const period = params.get('period');
       const holiday = params.get('holiday') === 'true';
       const isFullDay = params.get('isFullDay') === 'true';
-
-      const startH = Math.floor(startMin / 60);
-      const startM = startMin % 60;
       const endMin = startMin + duration * 60;
-      const endH = Math.floor(endMin / 60);
-      const endM = endMin % 60;
-      const startStr = String(startH).padStart(2,'0') + ':' + String(startM).padStart(2,'0');
-      const endStr = String(endH).padStart(2,'0') + ':' + String(endM).padStart(2,'0');
-      
-      let total = 0;
-      let slotLabel = '';
-      const occupiedSlots = [];
-
+      const startStr = minToTime(startMin), endStr = minToTime(endMin);
+      let total = 0, slotLabel = '', occupiedSlots = [];
       if (isFullDay) {
         total = getPrice('fixed', 'fullday', holiday);
         slotLabel = '全天 ' + startStr + '~' + endStr;
-        occupiedSlots.push(slotLabel); 
+        occupiedSlots = [slotLabel];
       } else {
         slotLabel = startStr + '~' + endStr;
         for (let i = 0; i < duration; i++) {
-          const blockStart = startMin + i * 60;
-          const bStartStr = String(Math.floor(blockStart/60)).padStart(2,'0') + ':' + String(blockStart % 60).padStart(2,'0');
-          const blockEnd = blockStart + 60;
-          const bEndStr = String(Math.floor(blockEnd/60)).padStart(2,'0') + ':' + String(blockEnd % 60).padStart(2,'0');
-          occupiedSlots.push(bStartStr + '~' + bEndStr);
+          const bs = startMin + i * 60;
+          const oSlot = minToTime(bs) + '~' + minToTime(bs + 60);
+          occupiedSlots.push(oSlot);
+          const matched = HOURLY_SLOTS.find(s => s.label === oSlot);
+          total += matched ? getPrice('hourly', matched.period, holiday) : getPrice('hourly', period, holiday);
         }
-        occupiedSlots.forEach(function(oSlot) {
-          const matched = HOURLY_SLOTS.find(function(s) { return s.label === oSlot; });
-          if (matched) total += getPrice('hourly', matched.period, holiday);
-          else total += getPrice('hourly', period, holiday);
-        });
       }
-
       const lineName = await getLineDisplayName(userId);
-      setSession(userId, 'pickEventType', {
-        date: date, slot: slotLabel, slotType: isFullDay ? '包場時段' : '單一鐘點',
-        price: total, selectedSlots: occupiedSlots, holiday: holiday, name: lineName,
-      });
+      setSession(userId, 'pickEventType', { date, slot: slotLabel, slotType: isFullDay ? '包場時段' : '單一鐘點', price: total, selectedSlots: occupiedSlots, holiday, name: lineName });
       return reply(event, buildEventTypePicker());
     }
 
@@ -956,85 +864,54 @@ async function handleEvent(event) {
       const holiday = params.get('holiday') === 'true';
       const booked = await getBookedSlots(date);
       const bookedRanges = getBookedRanges(booked);
-      const available = FIXED_SLOTS.filter(function(s) {
-        const r = extractTimeRange(s.label);
-        return r && !isConflict(r.startMin, r.endMin, bookedRanges);
-      });
-      setSession(userId, 'pickFixed', { date: date, holiday: holiday });
-      if (available.length === 0) {
-        return reply(event, { type: 'text', text: '😢 ' + date + ' 包場時段已無空檔，請選擇其他日期。' });
-      }
+      const available = FIXED_SLOTS.filter(s => { const r = extractTimeRange(s.label); return r && !isConflict(r.startMin, r.endMin, bookedRanges); });
+      if (available.length === 0) return reply(event, { type: 'text', text: '😢 包場時段已無空檔，請選擇其他日期。' });
+      setSession(userId, 'pickFixed', { date, holiday });
       return reply(event, buildFixedSlotFlex(date, available, holiday));
     }
+
+    // 取消預約請求
+    if (action === 'requestCancel') {
+      const pageId = params.get('pageId');
+      const date = params.get('date');
+      const slot = decodeURIComponent(params.get('slot') || '');
+      const code = genCode();
+      setCode(userId, code, pageId, 'cancel');
+      setSession(userId, 'inputCode', { cancelPageId: pageId, cancelDate: date, cancelSlot: slot });
+      return reply(event, { type: 'text', text: '⚠️ 確認取消預約\n\n日期：' + date + '\n時段：' + slot + '\n\n驗證碼已發送，請輸入以下 6 位數驗證碼確認取消：\n\n🔑 ' + code + '\n\n（驗證碼 10 分鐘內有效）' });
+    }
+
+    // 改期請求
+    if (action === 'requestReschedule') {
+      const pageId = params.get('pageId');
+      const date = params.get('date');
+      const slot = decodeURIComponent(params.get('slot') || '');
+      const code = genCode();
+      setCode(userId, code, pageId, 'reschedule');
+      setCode(userId, code, pageId, 'reschedule');
+      setSession(userId, 'inputCode', { reschedulePageId: pageId, oldDate: date, oldSlot: slot });
+      return reply(event, { type: 'text', text: '🔄 確認改期\n\n目前預約\n日期：' + date + '\n時段：' + slot + '\n\n驗證碼已發送，請輸入以下 6 位數驗證碼確認改期：\n\n🔑 ' + code + '\n\n（驗證碼 10 分鐘內有效）' });
+    }
   }
 }
 
-// ── 推播預約通知到群組 ─────────────────────────────────────
-async function notifyGroup(booking) {
-  const slotDisplay = (booking.selectedSlots && booking.selectedSlots.length > 0)
-    ? booking.selectedSlots.join('、')
-    : booking.slot;
-
-  const message = {
-    type: 'flex',
-    altText: '新預約通知！',
-    contents: {
-      type: 'bubble',
-      header: {
-        type: 'box', layout: 'vertical', backgroundColor: '#E74C3C', paddingAll: 'md',
-        contents: [{ type: 'text', text: '🔔 新預約通知！', weight: 'bold', color: '#FFFFFF', size: 'lg' }],
-      },
-      body: {
-        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
-        contents: [
-          row('姓名', booking.name),
-          row('日期', booking.date),
-          row('時段', slotDisplay),
-          row('類型', booking.slotType),
-          row('舉辦類型', booking.eventType),
-          row('費用', formatPrice(Number(booking.price))),
-          row('電話', booking.phone),
-          row('人數', String(booking.headcount || '') + ' 人'),
-          row('備註', booking.note || '無'),
-        ],
-      },
-    },
-  };
-
-  try {
-    await client.pushMessage(NOTIFY_GROUP_ID, message);
-    console.log('[通知] 群組通知發送成功');
-  } catch (e) {
-    console.error('[通知] 群組通知失敗:', e.message);
-  }
-}
-
-// ── 最終統一審核防呆 ──────────────────────────────────────
+// ── 最終審核 + 寫入 ────────────────────────────────────────
 async function processBooking(event, userId) {
   const data = getData(userId);
-  
   const bookedSlots = await getBookedSlots(data.date);
   const bookedRanges = getBookedRanges(bookedSlots);
-  
   const slotsToBook = (data.selectedSlots && data.selectedSlots.length > 0) ? data.selectedSlots : [data.slot];
   const newRanges = getBookedRanges(slotsToBook);
-
-  let hasConflict = false;
-  newRanges.forEach(function(nr) {
-    if (isConflict(nr.startMin, nr.endMin, bookedRanges)) {
-      hasConflict = true;
-    }
-  });
-
+  const hasConflict = newRanges.some(nr => isConflict(nr.startMin, nr.endMin, bookedRanges));
   if (hasConflict) {
     clearSession(userId);
-    return reply(event, { type: 'text', text: '😢 很抱歉，您選擇的時段剛剛已被他人搶先預約。\n請輸入「立即預約」重新選擇時段。' });
+    return reply(event, { type: 'text', text: '😢 您選擇的時段剛剛已被他人搶先預約。\n請輸入「立即預約」重新選擇。' });
   }
-
-  const ok = await createBooking(data);
+  const bookingData = Object.assign({}, data, { userId });
+  const ok = await createBooking(bookingData);
   clearSession(userId);
   if (ok) {
-    await notifyGroup(data);
+    await notifyGroup(data, 'new');
     return reply(event, buildSuccessMessages(data));
   } else {
     return reply(event, { type: 'text', text: '⚠️ 系統錯誤，請直接電話預約：0939-607867' });
@@ -1044,13 +921,10 @@ async function processBooking(event, userId) {
 // ── Webhook ───────────────────────────────────────────────
 app.post('/webhook', line.middleware(lineConfig), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
-    .then(function(result) { res.json(result); })
-    .catch(function(err) { console.error(err); res.status(500).end(); });
+    .then(result => res.json(result))
+    .catch(err => { console.error(err); res.status(500).end(); });
 });
-
 app.get('/', (req, res) => res.send('敘事空域 Bot 運行中 ✅'));
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('✅ 啟動 Port: ' + PORT));
-
 module.exports = app;
