@@ -319,14 +319,12 @@ function row(label, value) {
 function buildMainMenu() {
   return {
     type: 'text',
-    text: '歡迎光臨敘事空域 🏛️\n請選擇服務：',
+    text: '歡迎光臨敘事空域 🏛️\n請選擇服務：\n\n輸入「取消預約」或「改期」可管理您的預約',
     quickReply: {
       items: [
         { type: 'action', action: { type: 'message', label: '📅 立即預約', text: '立即預約' } },
         { type: 'action', action: { type: 'message', label: '💰 價目表', text: '價目表' } },
         { type: 'action', action: { type: 'message', label: '📋 我的預約', text: '我的預約' } },
-        { type: 'action', action: { type: 'message', label: '❌ 取消預約', text: '取消預約' } },
-        { type: 'action', action: { type: 'message', label: '🔄 改期', text: '改期' } },
       ],
     },
   };
@@ -740,20 +738,26 @@ async function handleEvent(event) {
       return reply(event, { type: 'text', text: '您的預約紀錄：\n\n' + lines.join('\n') });
     }
 
-    // 取消預約入口
-    if (text === '取消預約') {
+    // 取消預約關鍵字觸發
+    const cancelKeywords = ['取消預約', '取消', '退訂', '退預約', '取消場地', '不來了'];
+    const rescheduleKeywords = ['改期', '換日期', '改時間', '換時段', '改預約', '更改預約'];
+
+    if (cancelKeywords.some(k => text.includes(k))) {
       const pages = await getUserBookings(userId);
-      if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有可取消的預約。\n\n如需協助請聯繫：0939-607867' });
+      if (pages.length === 0) {
+        return reply(event, { type: 'text', text: '查詢不到您的預約紀錄。\n\n如有問題請直接聯繫：\n📞 0939-607867' });
+      }
       return reply(event, [
         { type: 'text', text: CANCEL_POLICY_TEXT },
         buildMyBookings(pages, 'cancel'),
       ]);
     }
 
-    // 改期入口
-    if (text === '改期') {
+    if (rescheduleKeywords.some(k => text.includes(k))) {
       const pages = await getUserBookings(userId);
-      if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有可改期的預約。\n\n如需協助請聯繫：0939-607867' });
+      if (pages.length === 0) {
+        return reply(event, { type: 'text', text: '查詢不到您的預約紀錄。\n\n如有問題請直接聯繫：\n📞 0939-607867' });
+      }
       return reply(event, [
         { type: 'text', text: CANCEL_POLICY_TEXT },
         buildMyBookings(pages, 'reschedule'),
