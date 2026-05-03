@@ -723,8 +723,9 @@ async function notifyGroup(booking, action) {
 
 // ── 主要事件處理器 ────────────────────────────────────────
 async function handleEvent(event) {
-  // 群組訊息：只處理查詢指令
+  // 群組訊息：印出完整 source 資訊
   if (event.source.type === 'group') {
+    console.log('[GROUP SOURCE]', JSON.stringify(event.source));
     if (event.type === 'message' && event.message.type === 'text') {
       const text = event.message.text.trim();
       if (text.startsWith('查詢')) {
