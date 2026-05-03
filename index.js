@@ -718,14 +718,18 @@ async function notifyGroup(booking, action) {
       body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: bodyContents },
     },
   };
-  try { await client.pushMessage(NOTIFY_GROUP_ID, message); } catch (e) { console.error('[通知]', e.message); }
+  try {
+    await client.pushMessage(NOTIFY_GROUP_ID, message);
+    console.log('[通知] 群組推播成功');
+  } catch (e) {
+    console.error('[通知] 群組推播失敗:', e.message, e.response && e.response.data ? JSON.stringify(e.response.data) : '');
+  }
 }
 
 // ── 主要事件處理器 ────────────────────────────────────────
 async function handleEvent(event) {
-  // 群組訊息：印出完整 source 資訊
+  // 群組訊息：只處理查詢指令
   if (event.source.type === 'group') {
-    console.log('[GROUP SOURCE]', JSON.stringify(event.source));
     if (event.type === 'message' && event.message.type === 'text') {
       const text = event.message.text.trim();
       if (text.startsWith('查詢')) {
@@ -1141,6 +1145,95 @@ async function processBooking(event, userId) {
 }
 
 
+
+// ── 前一天下午6點提醒 ──────────────────────────────────────
+async function scanAndRemindTomorrow() {
+  try {
+    const now = new Date();
+    const tw = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+    const tomorrow = new Date(tw.getTime() + 86400000);
+    const tomorrowStr = tomorrow.toISOString().split('T')[0];
+
+    const res = await notion.databases.query({
+      database_id: DATABASE_ID,
+      filter: { property: '預約日期', date: { equals: tomorrowStr } },
+    });
+
+    if (res.results.length === 0) {
+      console.log('[提醒] 明天無預約');
+      return;
+    }
+
+    // 整理明天所有預約
+    const bookings = res.results.map(p => {
+      return {
+        name: p.properties['預約姓名']?.title?.[0]?.plain_text || '',
+        slot: p.properties['預約時段']?.select?.name || '',
+        slotType: p.properties['預約類型']?.select?.name || '',
+        eventType: p.properties['舉辦類型']?.select?.name || '',
+        phone: p.properties['聯絡電話']?.phone_number || '',
+        lineId: p.properties['LINE ID']?.rich_text?.[0]?.plain_text || '',
+        price: p.properties['金額']?.number || 0,
+      };
+    });
+
+    // 通知每位客人
+    for (const b of bookings) {
+      if (!b.lineId) continue;
+      const clientMsg = {
+        type: 'flex', altText: '📅 預約提醒',
+        contents: {
+          type: 'bubble',
+          header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '📅 明日預約提醒', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
+            contents: [
+              row('姓名', b.name),
+              row('日期', tomorrowStr),
+              row('時段', b.slot),
+              row('類型', b.slotType),
+              { type: 'separator', margin: 'md' },
+              { type: 'text', text: '期待明天與您相見 🏛️\n如需更改請立即聯繫：\n📞 0939-607867', size: 'sm', color: '#3D6B8C', wrap: true, margin: 'md' },
+            ],
+          },
+        },
+      };
+      try {
+        await client.pushMessage(b.lineId, clientMsg);
+        console.log('[提醒] 客人通知成功:', b.name);
+      } catch (e) {
+        console.error('[提醒] 客人通知失敗:', b.name, e.message);
+      }
+    }
+
+    // 通知群組今日工作行程
+    const scheduleLines = bookings.map((b, i) =>
+      (i + 1) + '. ' + b.slot + '\n   ' + b.name + '（' + b.eventType + '）\n   📞 ' + (b.phone || '未提供')
+    ).join('\n\n');
+
+    const groupMsg = {
+      type: 'flex', altText: '📋 明日場地行程',
+      contents: {
+        type: 'bubble',
+        header: { type: 'box', layout: 'vertical', backgroundColor: '#2C3E50', paddingAll: 'md', contents: [{ type: 'text', text: '📋 明日場地行程', weight: 'bold', color: '#FFFFFF', size: 'lg' }, { type: 'text', text: tomorrowStr + '　共 ' + bookings.length + ' 筆預約', color: '#FFFFFFCC', size: 'sm' }] },
+        body: {
+          type: 'box', layout: 'vertical', paddingAll: 'md',
+          contents: [{ type: 'text', text: scheduleLines, size: 'sm', color: '#333333', wrap: true }],
+        },
+      },
+    };
+
+    try {
+      await client.pushMessage(NOTIFY_GROUP_ID, groupMsg);
+      console.log('[提醒] 群組行程通知成功');
+    } catch (e) {
+      console.error('[提醒] 群組通知失敗:', e.message);
+    }
+  } catch (e) {
+    console.error('[提醒] 掃描失敗:', e.message);
+  }
+}
+
 // ── 收款通知推播 ───────────────────────────────────────────
 async function scanAndNotifyPayments() {
   try {
@@ -1186,7 +1279,7 @@ async function scanAndNotifyPayments() {
 
       try {
         await client.pushMessage(lineId, msg);
-        console.log('[收款通知] 已發送給', name, lineId);
+        console.log('[收款通知] 推播成功給', name, lineId);
 
         // 取消勾選，避免重複發送
         await notion.pages.update({
@@ -1203,13 +1296,22 @@ async function scanAndNotifyPayments() {
 }
 
 // ── Webhook ───────────────────────────────────────────────
-// Cron Job 路由（每5分鐘由 Vercel 呼叫）
+// Cron Job 路由
 app.get('/cron/check-payments', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (authHeader !== 'Bearer ' + process.env.CRON_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   await scanAndNotifyPayments();
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
+app.get('/cron/remind-tomorrow', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (authHeader !== 'Bearer ' + process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  await scanAndRemindTomorrow();
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
