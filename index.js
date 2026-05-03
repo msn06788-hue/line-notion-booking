@@ -979,10 +979,28 @@ async function handleEvent(event) {
       const code = genCode();
       setCode(userId, code, pageId, 'cancel');
       setSession(userId, 'inputCode', { cancelPageId: pageId, cancelDate: date, cancelSlot: slot, cancelPrice: price });
-      const confirmText = '⚠️ 取消預約確認\n\n' +
-        '日期：' + date + '\n時段：' + slot + '\n費用：' + formatPrice(price) + '\n\n' +
-        '距活動 ' + pol.days + ' 天\n退款規則：' + pol.refundNote + '\n\n' +
-        '請輸入以下驗證碼確認取消（10分鐘內有效）：\n\n🔑 ' + code;
+      const confirmText = '⚠️ 取消預約確認\n' +
+        '══════════════════\n' +
+        '📅 日期：' + date + '\n' +
+        '🕘 時段：' + slot + '\n' +
+        '💰 費用：' + formatPrice(price) + '\n' +
+        '══════════════════\n' +
+        '距活動 ' + pol.days + ' 天\n' +
+        '退款規則：' + pol.refundNote + '\n\n' +
+        '請在 30 秒內輸入以下驗證碼：\n\n' +
+        '┌─────────────┐\n' +
+        '│  🔑 ' + code + '  │\n' +
+        '└─────────────┘\n\n' +
+        '⏰ 驗證碼有效時間：10 分鐘';
+      // 30秒後提醒
+      setTimeout(async function() {
+        const v = getCode(userId);
+        if (v && v.action === 'cancel') {
+          try {
+            await client.pushMessage(userId, { type: 'text', text: '⏰ 提醒：您有一筆取消預約待確認\n\n驗證碼：' + code + '\n請輸入驗證碼完成取消，或輸入「取消」放棄操作。' });
+          } catch(e) {}
+        }
+      }, 30000);
       return reply(event, { type: 'text', text: confirmText });
     }
 
@@ -996,10 +1014,27 @@ async function handleEvent(event) {
       const code = genCode();
       setCode(userId, code, pageId, 'reschedule');
       setSession(userId, 'inputCode', { reschedulePageId: pageId, oldDate: date, oldSlot: slot, reschedulePrice: price });
-      const confirmText = '🔄 改期確認\n\n' +
-        '目前預約\n日期：' + date + '\n時段：' + slot + '\n費用：' + formatPrice(price) + '\n\n' +
-        '距活動 ' + pol.days + ' 天\n改期規則：' + pol.feeNote + '\n\n' +
-        '請輸入以下驗證碼確認改期（10分鐘內有效）：\n\n🔑 ' + code;
+      const confirmText = '🔄 改期確認\n' +
+        '══════════════════\n' +
+        '📅 日期：' + date + '\n' +
+        '🕘 時段：' + slot + '\n' +
+        '💰 費用：' + formatPrice(price) + '\n' +
+        '══════════════════\n' +
+        '距活動 ' + pol.days + ' 天\n' +
+        '改期規則：' + pol.feeNote + '\n\n' +
+        '請在 30 秒內輸入以下驗證碼：\n\n' +
+        '┌─────────────┐\n' +
+        '│  🔑 ' + code + '  │\n' +
+        '└─────────────┘\n\n' +
+        '⏰ 驗證碼有效時間：10 分鐘';
+      setTimeout(async function() {
+        const v = getCode(userId);
+        if (v && v.action === 'reschedule') {
+          try {
+            await client.pushMessage(userId, { type: 'text', text: '⏰ 提醒：您有一筆改期申請待確認\n\n驗證碼：' + code + '\n請輸入驗證碼繼續改期，或輸入「取消」放棄操作。' });
+          } catch(e) {}
+        }
+      }, 30000);
       return reply(event, { type: 'text', text: confirmText });
     }
   }
@@ -1028,7 +1063,79 @@ async function processBooking(event, userId) {
   }
 }
 
+
+// ── 收款通知推播 ───────────────────────────────────────────
+async function scanAndNotifyPayments() {
+  try {
+    const res = await notion.databases.query({
+      database_id: DATABASE_ID,
+      filter: { property: '通知已收款', checkbox: { equals: true } },
+    });
+
+    for (const page of res.results) {
+      const lineId = page.properties['LINE ID']?.rich_text?.[0]?.plain_text || '';
+      const name = page.properties['預約姓名']?.title?.[0]?.plain_text || '';
+      const date = (page.properties['預約日期']?.date?.start || '').split('T')[0];
+      const slot = page.properties['預約時段']?.select?.name || '';
+      const price = page.properties['金額']?.number || 0;
+
+      if (!lineId) continue;
+
+      // 發推播給客人
+      const msg = {
+        type: 'flex', altText: '✅ 款項確認通知',
+        contents: {
+          type: 'bubble',
+          header: {
+            type: 'box', layout: 'vertical', backgroundColor: '#4CAF82', paddingAll: 'md',
+            contents: [{ type: 'text', text: '✅ 款項已確認收到！', weight: 'bold', color: '#FFFFFF', size: 'lg' }],
+          },
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
+            contents: [
+              row('姓名', name),
+              row('日期', date),
+              row('時段', slot),
+              row('金額', formatPrice(price)),
+              { type: 'separator', margin: 'md' },
+              {
+                type: 'text', margin: 'md', size: 'sm', color: '#3D6B8C', wrap: true, weight: 'bold',
+                text: '親愛的 ' + name + '，\n\n感謝您的信任與支持！\n我們已確認收到您的訂金，場地已為您正式保留。\n\n如有任何需求，歡迎隨時與我們聯繫。\n期待與您共創美好時光 🏛️\n\n場域主理人：蘇郁翔\n聯繫電話：0939-607867',
+              },
+            ],
+          },
+        },
+      };
+
+      try {
+        await client.pushMessage(lineId, msg);
+        console.log('[收款通知] 已發送給', name, lineId);
+
+        // 取消勾選，避免重複發送
+        await notion.pages.update({
+          page_id: page.id,
+          properties: { '通知已收款': { checkbox: false } },
+        });
+      } catch (e) {
+        console.error('[收款通知] 發送失敗:', e.message);
+      }
+    }
+  } catch (e) {
+    console.error('[收款通知] 掃描失敗:', e.message);
+  }
+}
+
 // ── Webhook ───────────────────────────────────────────────
+// Cron Job 路由（每5分鐘由 Vercel 呼叫）
+app.get('/cron/check-payments', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (authHeader !== 'Bearer ' + process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  await scanAndNotifyPayments();
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
 app.post('/webhook', line.middleware(lineConfig), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
     .then(result => res.json(result))
