@@ -1116,6 +1116,11 @@ async function notifyGroup(booking, action) {
     row('時段', slotDisplay || '—'),
     row('電話', booking.phone || '—'),
   ];
+  if (action === 'new') {
+    bodyContents.push(row('金額', formatPrice(Number(booking.price) || 0)));
+    const tierTxt = booking.userId ? getTierDisplayName(booking.userId) : null;
+    if (tierTxt) bodyContents.push(row('客戶層級', tierTxt));
+  }
   if (action === 'reschedule' && (booking.oldDate || booking.oldSlot)) {
     bodyContents.push(row('原日期', booking.oldDate || '—'));
     bodyContents.push(row('原時段', booking.oldSlot || '—'));
@@ -1958,7 +1963,7 @@ async function processBooking(event, userId) {
   const ok = await createBooking(bookingData);
   clearSession(userId);
   if (ok) {
-    await notifyGroup(Object.assign({}, data, { adminCtx: { action: 'new' } }), 'new');
+    await notifyGroup(Object.assign({}, data, { userId, adminCtx: { action: 'new' } }), 'new');
     return reply(event, [...buildSuccessMessages(data), buildGoogleNavMessage()]);
   }
   return reply(event, { type: 'text', text: '⚠️ 系統錯誤，請直接電話預約：' + CONTACT_PHONE });
