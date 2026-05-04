@@ -601,6 +601,40 @@ const GUEST_FAQ_RULES = [
   },
   {
     match: (q) =>
+      q.includes('議價') ||
+      q.includes('談價') ||
+      q.includes('殺價') ||
+      q.includes('價格可以談') ||
+      q.includes('價錢可以談') ||
+      q.includes('場租可以談') ||
+      q.includes('租金可以談') ||
+      ((q.includes('可以談') || q.includes('能談')) &&
+        (q.includes('價') ||
+          q.includes('場租') ||
+          q.includes('租金') ||
+          q.includes('報價') ||
+          q.includes('價錢'))) ||
+      ((q.includes('打折') || q.includes('折扣') || q.includes('優惠')) &&
+        (q.includes('價') || q.includes('錢') || q.includes('租') || q.includes('場'))) ||
+      q.includes('便宜一點') ||
+      q.includes('便宜點') ||
+      q.includes('算便宜') ||
+      q.includes('能不能便宜') ||
+      q.includes('可以便宜') ||
+      ((q.includes('價格') || q.includes('價錢') || q.includes('場租') || q.includes('租金') || q.includes('報價')) &&
+        (q.includes('貴') || q.includes('太高') || q.includes('離譜'))) ||
+      q.includes('怎麼那麼貴') ||
+      q.includes('那麼貴') ||
+      q.includes('這麼貴') ||
+      ((q.includes('太貴') || q.includes('好貴')) &&
+        (q.includes('價') || q.includes('場租') || q.includes('租金') || q.includes('你們') || q.includes('你') || q.includes('這'))),
+    reply:
+      '謝謝您願意說出想法，我們重視您的考量 🙏\n\n' +
+      '場租會依日期／時段／方案有所不同；若行程或預算有特殊考量，歡迎和我們行政同仁說明需求，我們會盡量在可行範圍內協助評估（例如長租、離峰時段等會有不同作法）。\n' +
+      '也可先對照『價目表』上的標準方案；若要細談，請直接聯繫 📞 {{CONTACT_PHONE}}',
+  },
+  {
+    match: (q) =>
       q.includes('垃圾') &&
       (q.includes('自己') || q.includes('帶走') || q.includes('丟') || q.includes('分類') || q.includes('清潔費')),
     reply:
@@ -1801,7 +1835,7 @@ function buildAdminPlainSummary(booking, action) {
 
 /** 場地會勘：關鍵字觸發引導文案（姓名＝LINE 顯示名；電話與時間須通過驗證才算數） */
 const SITE_VISIT_GUIDE_REPLY =
-  '您好，如需安排「場地會勘」，請複製下方格式填寫後，將內容「一次傳送」給我們：\n\n' +
+  '了解，先幫您留會勘資料～請複製下方格式填寫後，將內容「一次傳送」給我：\n\n' +
   '【場地會勘】\n' +
   '（姓名將直接使用您的 LINE 顯示名稱，無須填寫）\n' +
   '電話：（必填，例：0912345678）\n' +
@@ -1814,22 +1848,24 @@ const SITE_VISIT_GUIDE_REPLY =
   '※ 送出後我們將儘快與您聯繫，謝謝您！';
 
 const SITE_VISIT_SUBMITTED_REPLY =
-  '✅ 已收到您的場地會勘申請，我們將儘快與您聯繫。\n\n如需預約正式場次，請輸入「立即預約」。';
+  '✅ 資料有收到了，謝謝您！行政同仁將盡快與您聯繫。\n\n' +
+  '若接下來想直接線上選正式場次，可以輸入「立即預約」；想再改期或管理預約，用「我的預約」即可。';
 
 const SITE_VISIT_REJECT_NO_PHONE =
-  '⚠️ 場地會勘尚未成立：請務必留下「手機號碼」（10 碼，09 開頭，例：0912345678），並與會勘時間一起「一次傳送」。';
+  '不好意思，這邊還缺一項必填資料，目前無法送出喔～ 請務必附上「手機號碼」（10 碼、09 開頭，例：0912345678），並與會勘時間放在同一則訊息「一次傳送」，謝謝您 🙏';
 
 const SITE_VISIT_REJECT_NO_TIME =
-  '⚠️ 場地會勘尚未成立：請務必寫明「會勘時間」（須含月／日與時段，例：6/9下午三點），並與電話一起「一次傳送」。';
+  '不好意思，這邊還需要「會勘時間」才能送出喔～ 請寫明月／日與時段（例：6/9下午三點），並與電話同一則「一次傳送」，謝謝您 🙏';
 
 const BOOKING_VS_SITE_VISIT_PROMPT =
-  '請問您這次是想：\n\n' +
+  '收到您的訊息了，我怕會搞混兩種流程，跟您確認一下好嗎～\n\n' +
+  '您這次比較想做的是：\n\n' +
   '① 會勘場地（先看場地，尚未正式訂場）\n' +
   '② 預約場地（正式選日期／時段訂場）\n\n' +
-  '請直接回覆「會勘場地」或「預約場地」，謝謝。';
+  '請直接回覆「會勘場地」或「預約場地」，我就能接對線，謝謝您 🙏';
 
 const BOOKING_VS_SITE_VISIT_BOGUS =
-  '請回覆「會勘場地」或「預約場地」其中一種即可。\n若要取消請輸入「取消」。';
+  '我這邊需要二選一才不會接錯～ 麻煩回覆「會勘場地」或「預約場地」其中一種就好。\n若想從頭開始，可輸入「取消」。';
 
 function normalizeSiteVisitQuery(raw) {
   return String(raw || '').trim().replace(/\s+/g, '');
@@ -2260,12 +2296,19 @@ async function notifyGroup(booking, action) {
 function buildMainMenu() {
   return {
     type: 'text',
-    text: '歡迎光臨敘事空域 🏛️\n請選擇服務：\n\n輸入「取消預約」或「改期」可管理您的預約',
+    text:
+      '謝謝您聯繫我們 🏛️\n\n' +
+      '怕訊息太多您不好找，這邊先幫您整理最常做的幾件事～\n' +
+      '點下方按鈕，或直接輸入關鍵字都可以：\n' +
+      '• 會勘／勘場 — 先看場\n' +
+      '• 取消預約／改期 — 管理預約\n\n' +
+      '您這次最想先做哪一件事呢？',
     quickReply: {
       items: [
         { type: 'action', action: { type: 'message', label: '📅 立即預約', text: '立即預約' } },
         { type: 'action', action: { type: 'message', label: '💰 價目表', text: '價目表' } },
         { type: 'action', action: { type: 'message', label: '📋 我的預約', text: '我的預約' } },
+        { type: 'action', action: { type: 'message', label: '🏛️ 會勘／勘場', text: '會勘' } },
       ],
     },
   };
@@ -2276,11 +2319,11 @@ function buildDatePicker() {
   const maxDate = ymdAddDays(getTwDate(1), BOOKING_MAX_DAYS_AHEAD - 1);
   return {
     type: 'template',
-    altText: '請選擇預約日期',
+    altText: '請選擇預約日期（選方便的日期即可）',
     template: {
       type: 'buttons',
       title: '敘事空域 預約',
-      text: '請選擇您想預約的日期：',
+      text: '太好了，接下來請選您方便的日期（點下方選日期）：',
       actions: [{ type: 'datetimepicker', label: '📅 選擇日期', data: 'action=pickDate', mode: 'date', min: minDate, max: maxDate }],
     },
   };
@@ -3290,7 +3333,17 @@ async function handleEvent(event) {
   }
 
   if (event.type === 'follow') {
-    return reply(event, { type: 'text', text: '歡迎加入敘事空域！🏛️\n\n輸入「立即預約」開始預約\n輸入「價目表」查看費用\n輸入「我的預約」查看預約紀錄' });
+    return reply(event, {
+      type: 'text',
+      text:
+        '很高興認識您，歡迎來到敘事空域 🏛️\n\n' +
+        '接下來您可以這樣開始：\n' +
+        '• 輸入「立即預約」— 正式選日期／時段\n' +
+        '• 輸入「會勘」或「勘場」— 先看場、約時間過來聊聊\n' +
+        '• 輸入「價目表」— 了解費用\n' +
+        '• 輸入「我的預約」— 查詢或管理預約\n\n' +
+        '若想先看選單，也可以輸入「選單」。',
+    });
   }
 
   if (event.type === 'message' && event.message.type === 'text') {
@@ -3376,7 +3429,9 @@ async function handleEvent(event) {
       if (!trimmedSv) {
         return reply(event, {
           type: 'text',
-          text: '請貼上電話與會勘時間（姓名將使用您的 LINE 名稱）。若需重新查看格式，請再輸入「會勘」。',
+          text:
+            '我在這裡等您的資料喔～ 請貼上「電話」與「會勘時間」（姓名會直接用您的 LINE 名稱）。\n' +
+            '若想再看一次格式，輸入「會勘」就可以。',
         });
       }
       const phoneSv = extractTaiwanMobileFromSiteVisitText(trimmedSv);
@@ -3412,7 +3467,10 @@ async function handleEvent(event) {
       if (text === '確認預約') return await processBooking(event, userId);
       if (text === '重新選擇') {
         clearSession(userId);
-        return reply(event, { type: 'text', text: '已取消，請輸入「立即預約」重新開始。' });
+        return reply(event, {
+          type: 'text',
+          text: '好的，先前的選項先幫您取消了。\n若想重新預約，輸入「立即預約」即可再開始。',
+        });
       }
       if (manageBookingKeywords.some((k) => text === k || text.includes(k))) return await replyManageBookingsOrEmpty();
       if (isPriceIntentMessage(text)) return reply(event, buildPriceMessage(userId));
@@ -3428,7 +3486,10 @@ async function handleEvent(event) {
           text: faqConfirmEarly + '\n\n確認資料無誤後，請點選「✅ 確認預約」。',
         });
       }
-      return reply(event, { type: 'text', text: '請點選「✅ 確認預約」或「🔄 重新選擇」' });
+      return reply(event, {
+        type: 'text',
+        text: '謝謝您耐心填到這一步～ 接下來請點選下方「✅ 確認預約」，若想改資料請點「🔄 重新選擇」。',
+      });
     }
 
     if (isStartBookingIntentMessage(text)) {
