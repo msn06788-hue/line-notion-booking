@@ -1,13 +1,11 @@
 /**
  * 敘事空域 LINE Bot
- * - 行政群組推播：新預約 / 取消 / 改期（取消與改期先文字再 Flex，含退款／價差說明）
- * - 群組查詢：本日、明日、本週、下週、本月、指定日、財務（查詢財務／報表…）
- * - 環境變數重點：
- *   LINE_CHANNEL_*、NOTION_*、LINE_NOTIFY_GROUP_ID（或 LINE_ADMIN_GROUP_ID）行政群組 ID
- *   CONTACT_PHONE、BANK_*、PAYMENT_INFO_NOTION_URL（匯款詳情連結，可選）
- *   LOG_DIR、LOG_GROUP_MESSAGE=1（除錯用，印出 groupId）
- *   ALERT_SLACK_WEBHOOK_URL 或 ALERT_TELEGRAM_BOT_TOKEN+ALERT_TELEGRAM_CHAT_ID、ALERT_GENERIC_WEBHOOK_URL
- *   SENTRY_DSN（需 npm 安裝 @sentry/node）、BOOKING_MAX_DAYS_AHEAD
+ * - Cron（Header：Authorization: Bearer CRON_SECRET）
+ *   /cron/evening-2130 — 前晚 21:30｜明日→行政群；客人→提醒+Google 導航
+ *   /cron/morning-0800 — 早安 08:00｜今日→行政群
+ *   /cron/unpaid-ultimatum — 未付款最後 24h 催繳（建議每 1 小時）
+ *   /cron/remind-tomorrow — 同 evening-2130（相容舊網址）
+ * - 相關環境變數：CRON_SECRET、NAV_GOOGLE_MAPS_URI、PAYMENT_GRACE_DAYS、NOTION_UNPAID_ULTIMATUM_PROPERTY（見程式內常數區）
  */
 const express = require('express');
 const line = require('@line/bot-sdk');
@@ -48,6 +46,11 @@ const BANK_BRANCH = process.env.BANK_BRANCH || '世貿分行';
 const BANK_ACCOUNT = process.env.BANK_ACCOUNT || '602-489-60988';
 const BANK_HOLDER = process.env.BANK_HOLDER || '鍾沛潔';
 const PAYMENT_NOTE_URL = (process.env.PAYMENT_INFO_NOTION_URL || '').trim();
+const NAV_GOOGLE_MAPS_URI = (process.env.NAV_GOOGLE_MAPS_URI || 'https://share.google/scBlKep6NLkHHNwsQ').trim();
+/** 預訂後須於幾日內匯款（曆日倍數 24h），預設 3；最後 24h 會再推播催繳 */
+const PAYMENT_GRACE_DAYS = Math.min(Math.max(Number(process.env.PAYMENT_GRACE_DAYS) || 3, 1), 60);
+/** Notion 核取方塊：匯款最後提醒已送出（可選，若無此欄則改寫入 logs/unpaid-ultimatum-sent.ids） */
+const NOTION_UNPAID_ULTIMATUM_FLAG = (process.env.NOTION_UNPAID_ULTIMATUM_PROPERTY || '匯款最後提醒已送').trim();
 /** 日期選擇器可預約之最遠日期（自「明日」起算天數），預設 730 天；設環境變數 BOOKING_MAX_DAYS_AHEAD */
 const BOOKING_MAX_DAYS_AHEAD = Math.min(Math.max(Number(process.env.BOOKING_MAX_DAYS_AHEAD) || 730, 30), 3650);
 const app = express();
@@ -134,6 +137,36 @@ async function sendOwnerAlert(title, detail) {
     tasks.push(postHttpsJson(process.env.ALERT_GENERIC_WEBHOOK_URL, { title, detail, source: 'narra-space-bot' }).catch((e) => console.error('[告警 Webhook]', e.message)));
   }
   await Promise.all(tasks);
+}
+
+function buildGoogleNavMessage() {
+  return {
+    type: 'flex',
+    altText: '📍 敘事空域 導航',
+    contents: {
+      type: 'bubble',
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#27AE60', paddingAll: 'md', contents: [{ type: 'text', text: '📍 前往敘事空域', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+      body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'md', contents: [{ type: 'text', text: '點下方按鈕開啟 Google 導航，我們在那裡等您 🏛️', size: 'sm', color: '#555555', wrap: true }] },
+      footer: { type: 'box', layout: 'vertical', paddingAll: 'md', contents: [{ type: 'button', style: 'primary', color: '#27AE60', action: { type: 'uri', label: '🗺️ 開啟 Google 導航', uri: NAV_GOOGLE_MAPS_URI } }] },
+    },
+  };
+}
+
+function loadUltimatumSentIds() {
+  try {
+    const f = path.join(LOG_DIR, 'unpaid-ultimatum-sent.ids');
+    if (!fs.existsSync(f)) return new Set();
+    return new Set(fs.readFileSync(f, 'utf8').split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function recordUltimatumSentLocal(pageId) {
+  try {
+    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(path.join(LOG_DIR, 'unpaid-ultimatum-sent.ids'), pageId + '\n');
+  } catch (e) {}
 }
 
 async function linePushLogged(to, message, context) {
@@ -833,14 +866,20 @@ function buildSlotTypePicker(date, holiday, bookedSlots) {
     const r = extractTimeRange(s.label);
     return r && !isConflict(r.startMin, r.endMin, bookedRanges);
   }).length;
-  const warnContents = bookedSlots.length > 0 ? [{
+  const bookedLines = (bookedSlots && bookedSlots.length)
+    ? ('⚠️ 以下時段已被預約（不可重複預約）：\n' + bookedSlots.map((s) => '· ' + s).join('\n')).slice(0, 1800)
+    : '';
+  const warnContents = bookedLines ? [{
     type: 'box',
     layout: 'vertical',
     backgroundColor: '#FFF3CD',
     cornerRadius: 'md',
     paddingAll: 'sm',
     margin: 'md',
-    contents: [{ type: 'text', text: '⚠️ 該日部分時段已被預約', size: 'xs', weight: 'bold', color: '#856404' }],
+    contents: [
+      { type: 'text', text: '⚠️ 該日已有預約', size: 'xs', weight: 'bold', color: '#856404', margin: 'xs' },
+      { type: 'text', text: bookedLines, size: 'xs', color: '#856404', wrap: true, margin: 'xs' },
+    ],
   }] : [];
   return {
     type: 'flex',
@@ -897,7 +936,13 @@ function buildStartTimeFlex(date, bookedSlots, holiday, duration, isFullDay) {
       type: 'bubble',
       size: 'giga',
       header: { type: 'box', layout: 'vertical', backgroundColor: isFullDay ? '#2C3E50' : '#8B7355', paddingAll: 'md', contents: [{ type: 'text', text: isFullDay ? '敘事空域 🌟 全天包場' : '敘事空域 ⏰ 單一鐘點', weight: 'bold', color: '#FFFFFF', size: 'lg' }, { type: 'text', text: '📅 ' + date + '　' + dayLabel + '　請選擇開始時間', color: '#FFFFFFCC', size: 'sm' }] },
-      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        contents: (bookedSlots.length ? [{ type: 'text', text: '⚠️ 已被預約時段：' + bookedSlots.join('、'), size: 'xs', color: '#856404', wrap: true, margin: 'sm' }] : []).concat(buttons),
+        spacing: 'sm',
+        paddingAll: 'md',
+      },
     },
   };
 }
@@ -927,9 +972,12 @@ function buildDurationFlex(date, startMin, period, holiday) {
   };
 }
 
-function buildFixedSlotFlex(date, available, holiday) {
+function buildFixedSlotFlex(date, available, holiday, bookedSlotLabels) {
   const dayLabel = holiday ? '假日' : '平日';
   if (available.length === 0) return { type: 'text', text: '😢 ' + date + ' 區段包場已全部預約完畢。' };
+  const bookedNote = (bookedSlotLabels && bookedSlotLabels.length)
+    ? [{ type: 'text', text: '⚠️ 已被預約：\n' + bookedSlotLabels.join('\n'), size: 'xs', color: '#856404', wrap: true, margin: 'sm' }]
+    : [];
   const buttons = available.map((slot) => ({
     type: 'button',
     style: 'primary',
@@ -944,7 +992,7 @@ function buildFixedSlotFlex(date, available, holiday) {
       type: 'bubble',
       size: 'giga',
       header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '敘事空域 🏛️ 包場時段', weight: 'bold', color: '#FFFFFF', size: 'lg' }, { type: 'text', text: '📅 ' + date + '　' + dayLabel, color: '#FFFFFFCC', size: 'sm' }] },
-      body: { type: 'box', layout: 'vertical', contents: buttons, spacing: 'sm', paddingAll: 'md' },
+      body: { type: 'box', layout: 'vertical', contents: [...bookedNote, ...buttons], spacing: 'sm', paddingAll: 'md' },
     },
   };
 }
@@ -1203,6 +1251,60 @@ function buildCancelConfirmCard(date, slot, price, isPaid, polNote) {
   };
 }
 
+/** 改期：選完新時段後僅此一张確認卡（不再進入新預約選單／電話／備註） */
+function buildRescheduleConfirmCard(d) {
+  const isPaidR = d.rescheduleIsPaid === 'true';
+  const polR = getReschedulePolicy(d.rescheduleOldDate || d.pendingNewDate || '', isPaidR);
+  const oldP = Number(d.rescheduleOldPrice || 0);
+  const newP = Number(d.pendingNewPrice || 0);
+  const surchargeR = Number(d.rescheduleSurcharge || 0);
+  const surchargeAmt = isPaidR && surchargeR > 0 ? Math.floor(oldP * surchargeR / 100) : 0;
+  const priceDiff = newP - oldP;
+  let feeLines = '改期規則：' + polR.feeNote;
+  if (isPaidR && surchargeAmt > 0) feeLines += '\n改期補償金（' + surchargeR + '%）：' + formatPrice(surchargeAmt);
+  if (isPaidR) {
+    if (priceDiff > 0) feeLines += '\n價差需補匯：' + formatPrice(priceDiff);
+    else if (priceDiff < 0) feeLines += '\n價差應退：' + formatPrice(Math.abs(priceDiff));
+    else feeLines += '\n價差：無';
+  } else if (oldP !== newP) {
+    feeLines += '\n（尚未付款）新檔期報價：' + formatPrice(newP);
+  }
+  return {
+    type: 'flex',
+    altText: '確認改期',
+    contents: {
+      type: 'bubble',
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#2980B9', paddingAll: 'md', contents: [{ type: 'text', text: '🔄 請確認改期', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: 'md',
+        spacing: 'sm',
+        contents: [
+          row('原日期', d.rescheduleOldDate || '—'),
+          row('原時段', d.rescheduleOldSlot || '—'),
+          row('新日期', d.pendingNewDate || '—'),
+          row('新時段', d.pendingNewSlot || '—'),
+          row('原金額', formatPrice(oldP)),
+          row('新金額', formatPrice(newP)),
+          { type: 'separator', margin: 'md' },
+          { type: 'text', text: feeLines, size: 'xs', color: '#555555', wrap: true, margin: 'md' },
+        ],
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: 'md',
+        spacing: 'sm',
+        contents: [
+          { type: 'button', style: 'primary', color: '#2980B9', action: { type: 'postback', label: '✅ 確認改期', data: 'action=executeReschedule', displayText: '確認改期' } },
+          { type: 'button', style: 'secondary', action: { type: 'postback', label: '取消', data: 'action=cancelRescheduleDraft', displayText: '取消改期' } },
+        ],
+      },
+    },
+  };
+}
+
 function sumBookingAmounts(pages) {
   return pages.reduce((acc, p) => acc + (Number(p.properties['金額']?.number) || 0), 0);
 }
@@ -1444,20 +1546,74 @@ async function processBooking(event, userId) {
   clearSession(userId);
   if (ok) {
     await notifyGroup(Object.assign({}, data, { adminCtx: { action: 'new' } }), 'new');
-    const navMsg = {
-      type: 'flex',
-      altText: '📍 敘事空域 導航',
-      contents: {
-        type: 'bubble',
-        header: { type: 'box', layout: 'vertical', backgroundColor: '#27AE60', paddingAll: 'md', contents: [{ type: 'text', text: '📍 前往敘事空域', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
-        body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'md', contents: [{ type: 'text', text: '點下方按鈕開啟 Google 導航，我們在那裡等您 🏛️', size: 'sm', color: '#555555', wrap: true }] },
-        footer: { type: 'box', layout: 'vertical', paddingAll: 'md', contents: [{ type: 'button', style: 'primary', color: '#27AE60', action: { type: 'uri', label: '🗺️ 開啟 Google 導航', uri: 'https://share.google/scBlKep6NLkHHNwsQ' } }] },
-      },
-    };
-    return reply(event, [...buildSuccessMessages(data), navMsg]);
+    return reply(event, [...buildSuccessMessages(data), buildGoogleNavMessage()]);
   }
   return reply(event, { type: 'text', text: '⚠️ 系統錯誤，請直接電話預約：' + CONTACT_PHONE });
 }
+
+async function finalizeRescheduleFromSession(event, userId) {
+  const data = getData(userId);
+  if (getStep(userId) !== 'rescheduleConfirm' || !data.reschedulePageId || !data.pendingNewSlot || !data.pendingNewDate) {
+    return reply(event, { type: 'text', text: '⚠️ 改期資料已過期，請從「我的預約」重新操作。' });
+  }
+  const newDate = data.pendingNewDate;
+  const slot = data.pendingNewSlot;
+  const oldPrice = Number(data.rescheduleOldPrice || 0);
+  const newPrice = Number(data.pendingNewPrice || 0);
+  const isPaidR = data.rescheduleIsPaid === 'true';
+  const surchargeR = Number(data.rescheduleSurcharge || 0);
+  const polR = getReschedulePolicy(data.rescheduleOldDate || newDate, isPaidR);
+  const surchargeAmt = isPaidR && surchargeR > 0 ? Math.floor(oldPrice * surchargeR / 100) : 0;
+  const priceDiff = newPrice - oldPrice;
+
+  const bookedForNew = await getBookedSlots(newDate, data.reschedulePageId);
+  const br = getBookedRanges(bookedForNew);
+  const newRanges = data.pendingOccupiedSlots && data.pendingOccupiedSlots.length
+    ? getBookedRanges(data.pendingOccupiedSlots)
+    : getBookedRanges([slot]);
+  if (newRanges.some((nr) => isConflict(nr.startMin, nr.endMin, br))) {
+    clearSession(userId);
+    return reply(event, { type: 'text', text: '😢 新時段剛被其他人預約，請重新改期。' });
+  }
+
+  const ok = await rescheduleBooking(data.reschedulePageId, newDate, slot);
+  clearSession(userId);
+  if (!ok) return reply(event, { type: 'text', text: '⚠️ 改期失敗，請聯繫主理人：' + CONTACT_PHONE });
+
+  await notifyGroup({
+    name: data.rescheduleName || '',
+    date: newDate,
+    slot,
+    phone: '',
+    oldDate: data.rescheduleOldDate || '',
+    oldSlot: data.rescheduleOldSlot || '',
+    adminCtx: {
+      action: 'reschedule',
+      isPaid: isPaidR,
+      polReschedule: polR,
+      surchargePercent: surchargeR,
+      surchargeAmt,
+      priceDiff,
+      newPrice,
+    },
+    extraNote: '原日期：' + (data.rescheduleOldDate || '') + '｜原時段：' + (data.rescheduleOldSlot || ''),
+  }, 'reschedule');
+
+  let diffMsg = '';
+  if (isPaidR) {
+    if (surchargeAmt > 0) diffMsg += '\n補償金（' + surchargeR + '%）：' + formatPrice(surchargeAmt);
+    if (priceDiff > 0) diffMsg += '\n需補差額：' + formatPrice(priceDiff);
+    else if (priceDiff < 0) diffMsg += '\n應退差額：' + formatPrice(Math.abs(priceDiff));
+    if (surchargeAmt > 0 || priceDiff !== 0) diffMsg += '\n\n請依上述金額進行匯款/退款。\n聯繫主理人：📞 ' + CONTACT_PHONE;
+  } else if (newPrice !== oldPrice) {
+    diffMsg = '\n\n⚠️ 費用變動通知\n原費用：' + formatPrice(oldPrice) + '\n新費用：' + formatPrice(newPrice);
+    if (priceDiff > 0) diffMsg += '\n請補匯差額：' + formatPrice(priceDiff);
+    else if (priceDiff < 0) diffMsg += '\n將退還差額：' + formatPrice(Math.abs(priceDiff));
+  }
+  const rMsg = '✅ 改期成功！\n══════════════════\n📅 新日期：' + newDate + '\n🕘 新時段：' + slot + diffMsg + '\n══════════════════\n如需更改請輸入「改期」。';
+  return reply(event, { type: 'text', text: rMsg });
+}
+
 async function handleEvent(event) {
   // 群組訊息：預約查詢 / 財務報表
   if (event.source.type === 'group') {
@@ -1668,7 +1824,8 @@ async function handleEvent(event) {
         const check = checkDateAllowed(date);
         if (!check.allowed) return reply(event, { type: 'text', text: check.reason });
         const holiday = await isHoliday(date);
-        const booked = await getBookedSlots(date);
+        const rs = getData(userId);
+        const booked = await getBookedSlots(date, rs.reschedulePageId || undefined);
         setSession(userId, 'pickRescheduleSlot', { rescheduleNewDate: date });
         return reply(event, buildSlotTypePicker(date, holiday, booked));
       }
@@ -1685,7 +1842,9 @@ async function handleEvent(event) {
       const date = params.get('date');
       const holiday = params.get('holiday') === 'true';
       const type = params.get('type');
-      const booked = await getBookedSlots(date);
+      const sessionPick = getData(userId);
+      const excludePid = sessionPick.reschedulePageId || undefined;
+      const booked = await getBookedSlots(date, excludePid);
       const bookedRanges = getBookedRanges(booked);
 
       if (type === 'fixed') {
@@ -1693,12 +1852,11 @@ async function handleEvent(event) {
         if (available.length === 0) return reply(event, { type: 'text', text: '😢 ' + date + ' 區段包場已無空檔。' });
         const step = getStep(userId);
         if (step === 'pickRescheduleSlot') {
-          // 改期：選定時段後直接確認
           setSession(userId, 'confirmReschedule', {});
-          return reply(event, buildFixedSlotFlex(date, available, holiday));
+          return reply(event, buildFixedSlotFlex(date, available, holiday, booked));
         }
         setSession(userId, 'pickFixed', { date, holiday });
-        return reply(event, buildFixedSlotFlex(date, available, holiday));
+        return reply(event, buildFixedSlotFlex(date, available, holiday, booked));
       }
       if (type === 'hourly') {
         setSession(userId, 'pickStartTime', { date, holiday });
@@ -1710,8 +1868,17 @@ async function handleEvent(event) {
       const date = params.get('date');
       const holiday = params.get('holiday') === 'true';
       const isFullDay = params.get('isFullDay') === 'true';
-      const booked = await getBookedSlots(date);
+      const sd = getData(userId);
+      const booked = await getBookedSlots(date, sd.reschedulePageId || undefined);
       return reply(event, buildStartTimeFlex(date, booked, holiday, 8, isFullDay));
+    }
+
+    if (action === 'executeReschedule') {
+      return finalizeRescheduleFromSession(event, userId);
+    }
+    if (action === 'cancelRescheduleDraft') {
+      clearSession(userId);
+      return reply(event, { type: 'text', text: '已取消改期。\n如需改期請從「我的預約」選擇場次後再操作。' });
     }
 
     if (action === 'confirmSlot') {
@@ -1719,19 +1886,12 @@ async function handleEvent(event) {
       const slot = decodeURIComponent(params.get('slot'));
       const slotType = params.get('type');
       const price = params.get('price');
-      const step = getStep(userId);
+      const data = getData(userId);
 
-      // 改期確認
-      if (step === 'confirmReschedule' || step === 'pickRescheduleSlot') {
-        const data = getData(userId);
+      if (data.reschedulePageId) {
         const oldPrice = Number(data.rescheduleOldPrice || 0);
         const newPrice = Number(params.get('price') || 0) || oldPrice;
-        const isPaidR = data.rescheduleIsPaid === 'true';
-        const surchargeR = Number(data.rescheduleSurcharge || 0);
         const newDate = data.rescheduleNewDate || date;
-        const polR = getReschedulePolicy(data.rescheduleOldDate || newDate, isPaidR);
-        const surchargeAmt = isPaidR && surchargeR > 0 ? Math.floor(oldPrice * surchargeR / 100) : 0;
-        const priceDiff = newPrice - oldPrice;
         const bookedForNew = await getBookedSlots(newDate, data.reschedulePageId);
         const br = getBookedRanges(bookedForNew);
         const nrs = getBookedRanges([slot]);
@@ -1739,43 +1899,12 @@ async function handleEvent(event) {
           clearSession(userId);
           return reply(event, { type: 'text', text: '😢 新時段剛被其他人預約，請改選其他日期或時段。' });
         }
-        const ok = await rescheduleBooking(data.reschedulePageId, newDate, slot);
-        clearSession(userId);
-        if (ok) {
-          await notifyGroup({
-            name: data.rescheduleName || '',
-            date: newDate,
-            slot,
-            phone: '',
-            oldDate: data.rescheduleOldDate || '',
-            oldSlot: data.rescheduleOldSlot || '',
-            adminCtx: {
-              action: 'reschedule',
-              isPaid: isPaidR,
-              polReschedule: polR,
-              surchargePercent: surchargeR,
-              surchargeAmt,
-              priceDiff,
-              newPrice,
-            },
-            extraNote: '原日期：' + (data.rescheduleOldDate || '') + '｜原時段：' + (data.rescheduleOldSlot || ''),
-          }, 'reschedule');
-          let diffMsg = '';
-          if (isPaidR) {
-            if (surchargeAmt > 0) diffMsg += '\n補償金（' + surchargeR + '%）：' + formatPrice(surchargeAmt);
-            if (priceDiff > 0) diffMsg += '\n需補差額：' + formatPrice(priceDiff);
-            else if (priceDiff < 0) diffMsg += '\n應退差額：' + formatPrice(Math.abs(priceDiff));
-            if (surchargeAmt > 0 || priceDiff !== 0) diffMsg += '\n\n請依上述金額進行匯款/退款。\n聯繫主理人：📞 ' + CONTACT_PHONE;
-          } else if (newPrice !== oldPrice) {
-            diffMsg = '\n\n⚠️ 費用變動通知\n原費用：' + formatPrice(oldPrice) + '\n新費用：' + formatPrice(newPrice);
-            if (priceDiff > 0) diffMsg += '\n請補匯差額：' + formatPrice(priceDiff);
-            else if (priceDiff < 0) diffMsg += '\n將退還差額：' + formatPrice(Math.abs(priceDiff));
-          }
-          const rMsg = '✅ 改期成功！\n══════════════════\n📅 新日期：' + newDate + '\n🕘 新時段：' + slot + diffMsg + '\n══════════════════\n如需更改請輸入「改期」。';
-          return reply(event, { type: 'text', text: rMsg });
-        } else {
-          return reply(event, { type: 'text', text: '⚠️ 改期失敗，請聯繫主理人：' + CONTACT_PHONE });
-        }
+        setSession(userId, 'rescheduleConfirm', Object.assign({}, data, {
+          pendingNewDate: newDate,
+          pendingNewSlot: slot,
+          pendingNewPrice: newPrice,
+        }));
+        return reply(event, buildRescheduleConfirmCard(getData(userId)));
       }
 
       const lineName = await getLineDisplayName(userId);
@@ -1826,13 +1955,7 @@ async function handleEvent(event) {
       const sessionData = getData(userId);
       if (sessionData.reschedulePageId) {
         const newDate = sessionData.rescheduleNewDate || date;
-        const oldPrice = Number(sessionData.rescheduleOldPrice || 0);
         const newPrice = total;
-        const isPaidR = sessionData.rescheduleIsPaid === 'true';
-        const surchargeR = Number(sessionData.rescheduleSurcharge || 0);
-        const polR = getReschedulePolicy(sessionData.rescheduleOldDate || newDate, isPaidR);
-        const surchargeAmt = isPaidR && surchargeR > 0 ? Math.floor(oldPrice * surchargeR / 100) : 0;
-        const priceDiff = newPrice - oldPrice;
         const bookedForNew = await getBookedSlots(newDate, sessionData.reschedulePageId);
         const br = getBookedRanges(bookedForNew);
         const nrs = getBookedRanges(occupiedSlots);
@@ -1840,42 +1963,13 @@ async function handleEvent(event) {
           clearSession(userId);
           return reply(event, { type: 'text', text: '😢 新時段剛被其他人預約，請改選其他日期或時段。' });
         }
-        const ok = await rescheduleBooking(sessionData.reschedulePageId, newDate, slotLabel);
-        clearSession(userId);
-        if (ok) {
-          await notifyGroup({
-            name: sessionData.rescheduleName || '',
-            date: newDate,
-            slot: slotLabel,
-            phone: '',
-            oldDate: sessionData.rescheduleOldDate || '',
-            oldSlot: sessionData.rescheduleOldSlot || '',
-            adminCtx: {
-              action: 'reschedule',
-              isPaid: isPaidR,
-              polReschedule: polR,
-              surchargePercent: surchargeR,
-              surchargeAmt,
-              priceDiff,
-              newPrice,
-            },
-            extraNote: '原日期：' + (sessionData.rescheduleOldDate || '') + '｜原時段：' + (sessionData.rescheduleOldSlot || ''),
-          }, 'reschedule');
-          let diffMsg = '';
-          if (isPaidR) {
-            if (surchargeAmt > 0) diffMsg += '\n補償金（' + surchargeR + '%）：' + formatPrice(surchargeAmt);
-            if (priceDiff > 0) diffMsg += '\n需補差額：' + formatPrice(priceDiff);
-            else if (priceDiff < 0) diffMsg += '\n應退差額：' + formatPrice(Math.abs(priceDiff));
-            if (surchargeAmt > 0 || priceDiff !== 0) diffMsg += '\n\n請依上述金額進行匯款/退款。\n聯繫主理人：📞 ' + CONTACT_PHONE;
-          } else if (newPrice !== oldPrice) {
-            diffMsg = '\n\n⚠️ 費用變動通知\n原費用：' + formatPrice(oldPrice) + '\n新費用：' + formatPrice(newPrice);
-            if (priceDiff > 0) diffMsg += '\n請補匯差額：' + formatPrice(priceDiff);
-            else if (priceDiff < 0) diffMsg += '\n將退還差額：' + formatPrice(Math.abs(priceDiff));
-          }
-          const rMsg = '✅ 改期成功！\n══════════════════\n📅 新日期：' + newDate + '\n🕘 新時段：' + slotLabel + diffMsg + '\n══════════════════\n如需更改請輸入「改期」。';
-          return reply(event, { type: 'text', text: rMsg });
-        }
-        return reply(event, { type: 'text', text: '⚠️ 改期失敗，請聯繫主理人：' + CONTACT_PHONE });
+        setSession(userId, 'rescheduleConfirm', Object.assign({}, sessionData, {
+          pendingNewDate: newDate,
+          pendingNewSlot: slotLabel,
+          pendingNewPrice: newPrice,
+          pendingOccupiedSlots: occupiedSlots,
+        }));
+        return reply(event, buildRescheduleConfirmCard(getData(userId)));
       }
 
       const lineName = await getLineDisplayName(userId);
@@ -1891,7 +1985,7 @@ async function handleEvent(event) {
       const available = FIXED_SLOTS.filter(s => { const r = extractTimeRange(s.label); return r && !isConflict(r.startMin, r.endMin, bookedRanges); });
       if (available.length === 0) return reply(event, { type: 'text', text: '😢 包場時段已無空檔，請選擇其他日期。' });
       setSession(userId, 'pickFixed', { date, holiday });
-      return reply(event, buildFixedSlotFlex(date, available, holiday));
+      return reply(event, buildFixedSlotFlex(date, available, holiday, booked));
     }
 
     // 選擇某筆預約 -> 顯示取消或改期選單
@@ -2043,85 +2137,186 @@ async function handleEvent(event) {
   }
 }
 
-// ── 前一天下午6點提醒 ──────────────────────────────────────
-async function scanAndRemindTomorrow() {
+// ── 排程推播（請用外部 Cron 於台北時間觸發：21:30 / 08:00 / 約每小時催繳）──
+function mapPageToBooking(p) {
+  return {
+    pageId: p.id,
+    name: p.properties['預約姓名']?.title?.[0]?.plain_text || '',
+    slot: p.properties['預約時段']?.select?.name || '',
+    slotType: p.properties['預約類型']?.select?.name || '',
+    eventType: p.properties['舉辦類型']?.select?.name || '',
+    phone: p.properties['聯絡電話']?.phone_number || '',
+    lineId: p.properties['LINE ID']?.rich_text?.[0]?.plain_text || '',
+    price: p.properties['金額']?.number || 0,
+  };
+}
+
+async function queryBookingsOnDate(ymd) {
+  try {
+    const results = await notionQueryAll(DATABASE_ID, {
+      filter: { property: '預約日期', date: { equals: ymd } },
+    });
+    return results.map(mapPageToBooking);
+  } catch (e) {
+    console.error('[排程] queryBookingsOnDate:', e.message);
+    return [];
+  }
+}
+
+function buildAdminScheduleFlex(title, dateStr, subtitleSuffix, bookings) {
+  const scheduleLines = bookings.length
+    ? bookings.map((b, i) =>
+      (i + 1) + '. ' + b.slot + '\n   ' + b.name + '（' + b.eventType + '）\n   📞 ' + (b.phone || '未提供')
+    ).join('\n\n')
+    : '（無預約）';
+  return {
+    type: 'flex',
+    altText: title,
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#2C3E50',
+        paddingAll: 'md',
+        contents: [
+          { type: 'text', text: title, weight: 'bold', color: '#FFFFFF', size: 'lg' },
+          { type: 'text', text: dateStr + '　' + subtitleSuffix, color: '#FFFFFFCC', size: 'sm' },
+        ],
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: 'md',
+        contents: [{ type: 'text', text: scheduleLines, size: 'sm', color: '#333333', wrap: true }],
+      },
+    },
+  };
+}
+
+async function runEvening2130Reminders() {
   try {
     const tomorrowStr = getTwDate(1);
-
-    const res = await notion.databases.query({
-      database_id: DATABASE_ID,
-      filter: { property: '預約日期', date: { equals: tomorrowStr } },
-    });
-
-    if (res.results.length === 0) {
-      console.log('[提醒] 明天無預約');
+    const bookings = await queryBookingsOnDate(tomorrowStr);
+    if (bookings.length === 0) {
+      console.log('[前晚21:30] 明日無預約');
       return;
     }
 
-    // 整理明天所有預約
-    const bookings = res.results.map(p => {
-      return {
-        name: p.properties['預約姓名']?.title?.[0]?.plain_text || '',
-        slot: p.properties['預約時段']?.select?.name || '',
-        slotType: p.properties['預約類型']?.select?.name || '',
-        eventType: p.properties['舉辦類型']?.select?.name || '',
-        phone: p.properties['聯絡電話']?.phone_number || '',
-        lineId: p.properties['LINE ID']?.rich_text?.[0]?.plain_text || '',
-        price: p.properties['金額']?.number || 0,
-      };
-    });
-
-    // 通知每位客人
     for (const b of bookings) {
       if (!b.lineId) continue;
       const clientMsg = {
-        type: 'flex', altText: '📅 預約提醒',
+        type: 'flex',
+        altText: '📅 明日預約提醒',
         contents: {
           type: 'bubble',
           header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '📅 明日預約提醒', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
           body: {
-            type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
+            type: 'box',
+            layout: 'vertical',
+            paddingAll: 'md',
+            spacing: 'sm',
             contents: [
               row('姓名', b.name),
               row('日期', tomorrowStr),
               row('時段', b.slot),
               row('類型', b.slotType),
               { type: 'separator', margin: 'md' },
-              { type: 'text', text: '期待明天與您相見 🏛️\n如需更改請立即聯繫：\n📞 ' + CONTACT_PHONE, size: 'sm', color: '#3D6B8C', wrap: true, margin: 'md' },
+              { type: 'text', text: '明天見 🏛️\n如需更改請立即聯繫：\n📞 ' + CONTACT_PHONE, size: 'sm', color: '#3D6B8C', wrap: true, margin: 'md' },
             ],
           },
         },
       };
-      const okPush = await linePushLogged(b.lineId, clientMsg, '明日提醒·客人');
-      if (!okPush) {
-        await sendOwnerAlert('明日提醒推播失敗', '客人：' + b.name + ' lineId=' + maskId(b.lineId));
+      const navMsg = buildGoogleNavMessage();
+      const okPush = await linePushLogged(b.lineId, [clientMsg, navMsg], '前晚2130·客人+導航');
+      if (!okPush) await sendOwnerAlert('前晚提醒推播失敗', '客人：' + b.name + ' lineId=' + maskId(b.lineId));
+    }
+
+    const groupMsg = buildAdminScheduleFlex('📋 明日場地行程', tomorrowStr, '共 ' + bookings.length + ' 筆（前晚 21:30）', bookings);
+    const gOk = await linePushLogged(NOTIFY_GROUP_ID, groupMsg, '前晚2130·行政群');
+    if (!gOk) await sendOwnerAlert('明日行程·行政群推播失敗', 'target=' + maskId(NOTIFY_GROUP_ID));
+  } catch (e) {
+    console.error('[前晚21:30] 掃描失敗:', e.message);
+  }
+}
+
+async function runMorning0800TodayAdmin() {
+  try {
+    const todayStr = getTwDate(0);
+    const bookings = await queryBookingsOnDate(todayStr);
+    if (bookings.length === 0) {
+      await linePushLogged(NOTIFY_GROUP_ID, { type: 'text', text: '📋 ' + todayStr + ' 今日無預約（早安 08:00）' }, '早安0800·行政群');
+      return;
+    }
+    const groupMsg = buildAdminScheduleFlex('📋 今日場地行程', todayStr, '共 ' + bookings.length + ' 筆（早安 08:00）', bookings);
+    const gOk = await linePushLogged(NOTIFY_GROUP_ID, groupMsg, '早安0800·行政群');
+    if (!gOk) await sendOwnerAlert('今日行程·行政群推播失敗', 'target=' + maskId(NOTIFY_GROUP_ID));
+  } catch (e) {
+    console.error('[早安08:00] 掃描失敗:', e.message);
+  }
+}
+
+async function scanUnpaidPaymentUltimatum() {
+  try {
+    const today = getTwDate(0);
+    const sentLocal = loadUltimatumSentIds();
+    const pages = await notionQueryAll(DATABASE_ID, {
+      filter: { property: '預約日期', date: { on_or_after: today } },
+    });
+    const now = Date.now();
+    const graceMs = PAYMENT_GRACE_DAYS * 24 * 60 * 60 * 1000;
+    const windowMs = 24 * 60 * 60 * 1000;
+
+    for (const page of pages) {
+      const pay = page.properties['付款狀態']?.select?.name || '未付款';
+      if (pay === '已付款') continue;
+      if (page.properties[NOTION_UNPAID_ULTIMATUM_FLAG] && page.properties[NOTION_UNPAID_ULTIMATUM_FLAG].checkbox === true) continue;
+      if (sentLocal.has(page.id)) continue;
+
+      const created = new Date(page.created_time).getTime();
+      const deadline = created + graceMs;
+      const remindStart = deadline - windowMs;
+      if (now < remindStart || now >= deadline) continue;
+
+      const name = page.properties['預約姓名']?.title?.[0]?.plain_text || '';
+      const lineId = page.properties['LINE ID']?.rich_text?.[0]?.plain_text || '';
+      const dateStr = (page.properties['預約日期']?.date?.start || '').split('T')[0];
+      const price = page.properties['金額']?.number || 0;
+      if (!lineId) {
+        appendBotLog('[匯款催繳] 略過（無 LINE ID） page=' + page.id);
+        continue;
+      }
+
+      const body =
+        '⏰ 匯款最後提醒（剩餘不到 24 小時）\n\n' +
+        name + ' 您好\n' +
+        '您預約 ' + dateStr + ' 場次，金額 ' + formatPrice(price) + '，尚未完成匯款。\n\n' +
+        '預訂後須於 ' + PAYMENT_GRACE_DAYS + ' 日內完成訂金；逾時將釋出檔期。\n' +
+        '請盡快匯款並回傳帳號後五碼。\n\n' +
+        '聯絡：' + CONTACT_PHONE;
+
+      const ok = await linePushLogged(lineId, { type: 'text', text: body }, '匯款最後24h·客人');
+      if (!ok) {
+        await sendOwnerAlert('匯款催繳推播失敗', '客人：' + name + ' ' + maskId(lineId));
+        continue;
+      }
+      try {
+        await notion.pages.update({
+          page_id: page.id,
+          properties: { [NOTION_UNPAID_ULTIMATUM_FLAG]: { checkbox: true } },
+        });
+      } catch (e) {
+        recordUltimatumSentLocal(page.id);
+        appendBotLog('[匯款催繳] 已送客；Notion 無「' + NOTION_UNPAID_ULTIMATUM_FLAG + '」欄位時已改寫入 logs/unpaid-ultimatum-sent.ids page=' + page.id);
       }
     }
-
-    // 通知群組今日工作行程
-    const scheduleLines = bookings.map((b, i) =>
-      (i + 1) + '. ' + b.slot + '\n   ' + b.name + '（' + b.eventType + '）\n   📞 ' + (b.phone || '未提供')
-    ).join('\n\n');
-
-    const groupMsg = {
-      type: 'flex', altText: '📋 明日場地行程',
-      contents: {
-        type: 'bubble',
-        header: { type: 'box', layout: 'vertical', backgroundColor: '#2C3E50', paddingAll: 'md', contents: [{ type: 'text', text: '📋 明日場地行程', weight: 'bold', color: '#FFFFFF', size: 'lg' }, { type: 'text', text: tomorrowStr + '　共 ' + bookings.length + ' 筆預約', color: '#FFFFFFCC', size: 'sm' }] },
-        body: {
-          type: 'box', layout: 'vertical', paddingAll: 'md',
-          contents: [{ type: 'text', text: scheduleLines, size: 'sm', color: '#333333', wrap: true }],
-        },
-      },
-    };
-
-    const gOk = await linePushLogged(NOTIFY_GROUP_ID, groupMsg, '明日提醒·行政群');
-    if (!gOk) {
-      await sendOwnerAlert('明日行程·行政群推播失敗', 'target=' + maskId(NOTIFY_GROUP_ID));
-    }
   } catch (e) {
-    console.error('[提醒] 掃描失敗:', e.message);
+    console.error('[匯款催繳] 掃描失敗:', e.message);
   }
+}
+
+async function scanAndRemindTomorrow() {
+  return runEvening2130Reminders();
 }
 
 // ── 收款通知推播 ───────────────────────────────────────────
@@ -2199,7 +2394,37 @@ app.get('/cron/remind-tomorrow', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   await scanAndRemindTomorrow();
-  res.json({ ok: true, time: new Date().toISOString() });
+  res.json({ ok: true, time: new Date().toISOString(), job: 'evening-2130 (alias)' });
+});
+
+/** 台北時間 21:30：明日行程 → 行政群；客人 → 明日提醒 + Google 導航 */
+app.get('/cron/evening-2130', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader !== 'Bearer ' + process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  await runEvening2130Reminders();
+  res.json({ ok: true, time: new Date().toISOString(), job: 'evening-2130' });
+});
+
+/** 台北時間 08:00：今日行程 → 僅行政群 */
+app.get('/cron/morning-0800', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader !== 'Bearer ' + process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  await runMorning0800TodayAdmin();
+  res.json({ ok: true, time: new Date().toISOString(), job: 'morning-0800' });
+});
+
+/** 未付款：建立後 PAYMENT_GRACE_DAYS 日內，於最後 24 小時視窗內推播一次催繳（建議每小時或每 15 分鐘呼叫） */
+app.get('/cron/unpaid-ultimatum', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader !== 'Bearer ' + process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  await scanUnpaidPaymentUltimatum();
+  res.json({ ok: true, time: new Date().toISOString(), job: 'unpaid-ultimatum' });
 });
 
 app.post('/webhook', line.middleware(lineConfig), (req, res) => {
