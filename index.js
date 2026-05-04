@@ -1,14 +1,31 @@
 /**
  * 敘事空域 LINE Bot
- * - 行政群組：新預約 / 取消 / 改期（先推播「文字摘要」再推播 Flex，退款與價差寫在文字裡）
- * - 群組查詢：查詢本日/明日/本週/下週/本月/指定日；查詢財務、查詢報表、財務報告（簡易財務）
- * - 日期選單最遠日：環境變數 BOOKING_MAX_DAYS_AHEAD（預設 730 天）
- * - LINE_NOTIFY_GROUP_ID 請設行政群組 ID；留空則用程式內預設
+ * - 行政群組推播：新預約 / 取消 / 改期（取消與改期先文字再 Flex，含退款／價差說明）
+ * - 群組查詢：本日、明日、本週、下週、本月、指定日、財務（查詢財務／報表…）
+ * - 環境變數重點：
+ *   LINE_CHANNEL_*、NOTION_*、LINE_NOTIFY_GROUP_ID（或 LINE_ADMIN_GROUP_ID）行政群組 ID
+ *   CONTACT_PHONE、BANK_*、PAYMENT_INFO_NOTION_URL（匯款詳情連結，可選）
+ *   LOG_DIR、LOG_GROUP_MESSAGE=1（除錯用，印出 groupId）
+ *   ALERT_SLACK_WEBHOOK_URL 或 ALERT_TELEGRAM_BOT_TOKEN+ALERT_TELEGRAM_CHAT_ID、ALERT_GENERIC_WEBHOOK_URL
+ *   SENTRY_DSN（需 npm 安裝 @sentry/node）、BOOKING_MAX_DAYS_AHEAD
  */
 const express = require('express');
 const line = require('@line/bot-sdk');
 const { Client } = require('@notionhq/client');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { URL } = require('url');
+
+let Sentry = null;
+try {
+  if (process.env.SENTRY_DSN) {
+    Sentry = require('@sentry/node');
+    Sentry.init({ dsn: process.env.SENTRY_DSN, tracesSampleRate: 0 });
+  }
+} catch (e) {
+  console.warn('[Sentry] 未安裝 @sentry/node 或初始化失敗，僅寫入檔案日誌');
+}
 
 // ── 設定 ──────────────────────────────────────────────────
 const lineConfig = {
@@ -18,14 +35,128 @@ const lineConfig = {
 const client = new line.Client(lineConfig);
 const notion = new Client({ auth: process.env.NOTION_INTEGRATION_TOKEN });
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;
-const NOTIFY_GROUP_ID = (process.env.LINE_NOTIFY_GROUP_ID || '').trim() || 'C6f36b9fa93777db373fa52dedbc43d66';
+const NOTIFY_GROUP_ID = (
+  process.env.LINE_NOTIFY_GROUP_ID ||
+  process.env.LINE_ADMIN_GROUP_ID ||
+  ''
+).trim() || 'C6f36b9fa93777db373fa52dedbc43d66';
+const DEFAULT_NOTIFY_FALLBACK = !((process.env.LINE_NOTIFY_GROUP_ID || process.env.LINE_ADMIN_GROUP_ID || '').trim());
+const LOG_DIR = process.env.LOG_DIR || path.join(process.cwd(), 'logs');
+const CONTACT_PHONE = (process.env.CONTACT_PHONE || '0939-607867').trim();
+const BANK_NAME = process.env.BANK_NAME || '星展銀行 810';
+const BANK_BRANCH = process.env.BANK_BRANCH || '世貿分行';
+const BANK_ACCOUNT = process.env.BANK_ACCOUNT || '602-489-60988';
+const BANK_HOLDER = process.env.BANK_HOLDER || '鍾沛潔';
+const PAYMENT_NOTE_URL = (process.env.PAYMENT_INFO_NOTION_URL || '').trim();
 /** 日期選擇器可預約之最遠日期（自「明日」起算天數），預設 730 天；設環境變數 BOOKING_MAX_DAYS_AHEAD */
 const BOOKING_MAX_DAYS_AHEAD = Math.min(Math.max(Number(process.env.BOOKING_MAX_DAYS_AHEAD) || 730, 30), 3650);
 const app = express();
 
+let lastAlertNoGroupMs = 0;
+function appendBotLog(line) {
+  try {
+    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(path.join(LOG_DIR, 'line-bot.log'), new Date().toISOString() + ' ' + line + '\n');
+  } catch (e) {
+    console.error('[日誌寫入失敗]', e.message);
+  }
+}
+
+function maskId(id) {
+  if (!id || id.length < 8) return id || '(空)';
+  return id.slice(0, 4) + '…' + id.slice(-4);
+}
+
+function extractLinePushError(err) {
+  const status = err.statusCode || (err.response && err.response.status) || '';
+  const data = (err.response && err.response.data) || (err.originalError && err.originalError.response && err.originalError.response.data);
+  const body = typeof data === 'object' ? JSON.stringify(data) : (data || '');
+  return 'status=' + status + ' message=' + (err.message || '') + ' body=' + String(body).slice(0, 800);
+}
+
+function postHttpsJson(urlStr, jsonBody) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const body = JSON.stringify(jsonBody);
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      },
+      (res) => {
+        res.on('data', () => {});
+        res.on('end', () => resolve());
+      }
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function postHttpsForm(urlStr, fields) {
+  const u = new URL(urlStr);
+  const body = new URLSearchParams(fields).toString();
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) },
+      },
+      (res) => {
+        res.on('data', () => {});
+        res.on('end', () => resolve());
+      }
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function sendOwnerAlert(title, detail) {
+  const text = ('【敘事空域 Bot】' + title + '\n' + detail).slice(0, 3900);
+  const tasks = [];
+  if (process.env.ALERT_SLACK_WEBHOOK_URL) {
+    tasks.push(postHttpsJson(process.env.ALERT_SLACK_WEBHOOK_URL, { text }).catch((e) => console.error('[告警 Slack]', e.message)));
+  }
+  const tgTok = process.env.ALERT_TELEGRAM_BOT_TOKEN;
+  const tgChat = process.env.ALERT_TELEGRAM_CHAT_ID;
+  if (tgTok && tgChat) {
+    const url = 'https://api.telegram.org/bot' + tgTok + '/sendMessage';
+    tasks.push(postHttpsForm(url, { chat_id: tgChat, text }).catch((e) => console.error('[告警 Telegram]', e.message)));
+  }
+  if (process.env.ALERT_GENERIC_WEBHOOK_URL) {
+    tasks.push(postHttpsJson(process.env.ALERT_GENERIC_WEBHOOK_URL, { title, detail, source: 'narra-space-bot' }).catch((e) => console.error('[告警 Webhook]', e.message)));
+  }
+  await Promise.all(tasks);
+}
+
+async function linePushLogged(to, message, context) {
+  try {
+    await client.pushMessage(to, message);
+    appendBotLog('[push OK] ' + context + ' → ' + maskId(to));
+    return true;
+  } catch (e) {
+    const detail = extractLinePushError(e);
+    appendBotLog('[push FAIL] ' + context + ' → ' + maskId(to) + ' ' + detail);
+    console.error('[LINE push]', context, detail);
+    if (Sentry) {
+      try {
+        Sentry.captureException(e);
+      } catch (x) {}
+    }
+    return false;
+  }
+}
+
 const GROUP_QUERY_HELP =
-  '📋 行政群組｜預約查詢指令\n' +
-  '（訊息開頭加「查詢」或依下列關鍵字）\n\n' +
+  '📋 行政群組｜預約查詢（統整）\n' +
+  '可打：預約查詢、查詢、或訊息裡含「查詢」\n\n' +
   '【名單】\n' +
   '• 查詢今天 / 本日 / 今日\n' +
   '• 查詢明天 / 明日\n' +
@@ -36,7 +167,8 @@ const GROUP_QUERY_HELP =
   '• 查詢財務 或 查詢報表（預設本月）\n' +
   '• 查詢財務本週 / 查詢財務本月\n' +
   '• 查詢財務 2026-05（指定月）\n\n' +
-  '※ 金額以 Notion「金額」欄加總；已付/未付依「付款狀態」欄。';
+  '※ 合計以 Notion「金額」；已收/未收依「付款狀態」。\n' +
+  '※ 若資料庫有「實收訂金」或「訂金」「尾款」欄，財務報表會一併加總。';
 
 // ── 台灣國定假日快取 ───────────────────────────────────────
 let holidayCache = new Set();
@@ -223,13 +355,16 @@ async function notionQueryAll(databaseId, body) {
   return all;
 }
 
-async function getBookedSlots(date) {
+async function getBookedSlots(date, excludePageId) {
   try {
     const res = await notion.databases.query({
       database_id: DATABASE_ID,
       filter: { property: '預約日期', date: { equals: date } },
     });
-    return res.results.map((p) => p.properties['預約時段']?.select?.name).filter(Boolean);
+    return res.results
+      .filter((p) => !excludePageId || p.id !== excludePageId)
+      .map((p) => p.properties['預約時段']?.select?.name)
+      .filter(Boolean);
   } catch (e) {
     console.error('[Notion] getBookedSlots:', e.message);
     return [];
@@ -242,7 +377,7 @@ async function getUserBookings(userId) {
       filter: {
         and: [
           { property: 'LINE ID', rich_text: { equals: userId } },
-          { property: '預約日期', date: { on_or_after: new Date().toISOString().split('T')[0] } },
+          { property: '預約日期', date: { on_or_after: getTwDate(0) } },
         ],
       },
       sorts: [{ property: '預約日期', direction: 'ascending' }],
@@ -343,43 +478,65 @@ async function createBooking(booking) {
 // ── 日期驗證 ───────────────────────────────────────────────
 function checkDateAllowed(dateStr) {
   const now = new Date();
-  const twNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-  const todayStr = twNow.toISOString().split('T')[0];
+  const todayStr = formatTaipeiYmd(now);
   if (dateStr <= todayStr) {
-    return { allowed: false, reason: '⚠️ 不接受當天或過去的日期。\n24小時內請直接電話人工預約：0939-607867' };
+    return { allowed: false, reason: '⚠️ 不接受當天或過去的日期。\n24小時內請直接電話人工預約：' + CONTACT_PHONE };
   }
   const diff = (new Date(dateStr + 'T00:00:00+08:00') - now) / 3600000;
   if (diff < 24) {
-    return { allowed: false, reason: '⚠️ 24小時內無法線上預約。\n請直接電話人工預約：0939-607867' };
+    return { allowed: false, reason: '⚠️ 24小時內無法線上預約。\n請直接電話人工預約：' + CONTACT_PHONE };
   }
   return { allowed: true, reason: '' };
 }
 
-// ── 日期計算工具（台北日曆日）────────────────────────────────
-function getTwDate(offsetDays = 0) {
-  const now = new Date();
-  const tw = new Date(now.getTime() + 8 * 60 * 60 * 1000 + offsetDays * 86400000);
-  return tw.toISOString().split('T')[0];
+// ── 日期計算工具（一律以 Asia/Taipei 曆日）──────────────────
+function formatTaipeiYmd(date) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Taipei',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const y = parts.find((p) => p.type === 'year').value;
+  const m = parts.find((p) => p.type === 'month').value;
+  const d = parts.find((p) => p.type === 'day').value;
+  return y + '-' + m + '-' + d;
 }
 
 function ymdAddDays(ymd, days) {
   const [y, m, d] = ymd.split('-').map((x) => parseInt(x, 10));
-  const dt = new Date(y, m - 1, d + days);
-  const yy = dt.getFullYear();
-  const mm = String(dt.getMonth() + 1).padStart(2, '0');
-  const dd = String(dt.getDate()).padStart(2, '0');
+  const utcMs = Date.UTC(y, m - 1, d + days);
+  const dt = new Date(utcMs);
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getUTCDate()).padStart(2, '0');
   return yy + '-' + mm + '-' + dd;
 }
 
+function mondayOffsetFromTaipeiYmd(ymd) {
+  const short = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Taipei',
+    weekday: 'short',
+  }).format(new Date(ymd + 'T12:00:00+08:00'));
+  const key = short.replace(/\.$/, '').slice(0, 3);
+  const map = { Mon: 0, Tue: 1, Wed: 2, Thu: 3, Fri: 4, Sat: 5, Sun: 6 };
+  return map[key] !== undefined ? map[key] : 0;
+}
+
+function getTwDate(offsetDays = 0) {
+  const today = formatTaipeiYmd(new Date());
+  if (!offsetDays) return today;
+  return ymdAddDays(today, offsetDays);
+}
+
 function getWeekRange(weekOffset = 0) {
-  const now = new Date();
-  const tw = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-  const dow = tw.getDay();
-  const monday = new Date(tw.getTime() - (dow === 0 ? 6 : dow - 1) * 86400000 + weekOffset * 7 * 86400000);
-  const sunday = new Date(monday.getTime() + 6 * 86400000);
+  const today = formatTaipeiYmd(new Date());
+  const monOff = mondayOffsetFromTaipeiYmd(today);
+  const mondayStr = ymdAddDays(today, -monOff + weekOffset * 7);
+  const sundayStr = ymdAddDays(mondayStr, 6);
   return {
-    start: monday.toISOString().split('T')[0],
-    endExclusive: ymdAddDays(sunday.toISOString().split('T')[0], 1),
+    start: mondayStr,
+    endExclusive: ymdAddDays(sundayStr, 1),
   };
 }
 
@@ -512,6 +669,15 @@ function buildAdminPlainSummary(booking, action) {
 
 async function notifyGroup(booking, action) {
   action = action || 'new';
+  if (!NOTIFY_GROUP_ID) {
+    appendBotLog('[行政群組] 略過：LINE_NOTIFY_GROUP_ID 未設定');
+    if (Date.now() - lastAlertNoGroupMs > 3600000) {
+      lastAlertNoGroupMs = Date.now();
+      await sendOwnerAlert('行政群組 ID 未設定', '請在 .env 設定 LINE_NOTIFY_GROUP_ID（或 LINE_ADMIN_GROUP_ID）。推播已略過。');
+    }
+    return;
+  }
+
   const plainSummary = buildAdminPlainSummary(booking, action);
   const slotDisplay = (booking.selectedSlots && booking.selectedSlots.length > 0)
     ? booking.selectedSlots.join('、')
@@ -562,34 +728,20 @@ async function notifyGroup(booking, action) {
     },
   };
 
-  async function pushText() {
-    try {
-      await client.pushMessage(NOTIFY_GROUP_ID, { type: 'text', text: plainSummary });
-      console.log('[行政群組] 文字摘要 OK');
-    } catch (e) {
-      const errDetail = e.response && e.response.data ? JSON.stringify(e.response.data) : e.message;
-      console.error('[行政群組] 文字推播失敗 status=' + (e.response && e.response.status) + ' detail=' + errDetail);
-    }
-  }
-
-  async function pushFlex() {
-    try {
-      await client.pushMessage(NOTIFY_GROUP_ID, message);
-      console.log('[行政群組] Flex OK');
-      return true;
-    } catch (e) {
-      const errDetail = e.response && e.response.data ? JSON.stringify(e.response.data) : e.message;
-      console.error('[行政群組] Flex 失敗 status=' + (e.response && e.response.status) + ' detail=' + errDetail);
-      return false;
-    }
-  }
-
+  let anyOk = false;
   if (action === 'cancel' || action === 'reschedule') {
-    await pushText();
-    await pushFlex();
+    if (await linePushLogged(NOTIFY_GROUP_ID, { type: 'text', text: plainSummary }, '行政群組·文字(' + action + ')')) anyOk = true;
+    if (await linePushLogged(NOTIFY_GROUP_ID, message, '行政群組·Flex(' + action + ')')) anyOk = true;
   } else {
-    const flexOk = await pushFlex();
-    if (!flexOk) await pushText();
+    if (await linePushLogged(NOTIFY_GROUP_ID, message, '行政群組·Flex(new)')) anyOk = true;
+    else if (await linePushLogged(NOTIFY_GROUP_ID, { type: 'text', text: plainSummary }, '行政群組·文字(new·fallback)')) anyOk = true;
+  }
+
+  if (!anyOk) {
+    await sendOwnerAlert(
+      '行政群組推播全失敗（文字與 Flex 皆失敗）',
+      'action=' + action + '\ntarget=' + maskId(NOTIFY_GROUP_ID) + '\n摘要：\n' + plainSummary.slice(0, 1200)
+    );
   }
 }
 
@@ -609,10 +761,8 @@ function buildMainMenu() {
 }
 
 function buildDatePicker() {
-  const now = new Date();
-  const twOffset = 8 * 60 * 60 * 1000;
-  const minDate = new Date(now.getTime() + twOffset + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-  const maxDate = new Date(now.getTime() + twOffset + BOOKING_MAX_DAYS_AHEAD * 86400000).toISOString().split('T')[0];
+  const minDate = getTwDate(1);
+  const maxDate = ymdAddDays(getTwDate(1), BOOKING_MAX_DAYS_AHEAD - 1);
   return {
     type: 'template',
     altText: '請選擇預約日期',
@@ -669,7 +819,7 @@ function buildPriceMessage() {
           st('假日'),
           ...pr([['早上', PRICES.hourly.holiday.morning], ['下午', PRICES.hourly.holiday.afternoon], ['晚上', PRICES.hourly.holiday.evening]]),
           { type: 'separator', margin: 'md' },
-          { type: 'text', text: '※ 24小時內請電話：0939-607867\n※ 休息換場：12:30~13:30、17:00~18:00', size: 'xs', color: '#888888', wrap: true, margin: 'md' },
+          { type: 'text', text: '※ 24小時內請電話：' + CONTACT_PHONE + '\n※ 休息換場：12:30~13:30、17:00~18:00', size: 'xs', color: '#888888', wrap: true, margin: 'md' },
         ],
       },
     },
@@ -827,6 +977,15 @@ function buildInfoConfirm(data) {
 
 function buildSuccessMessages(data) {
   const slotDisplay = (data.selectedSlots && data.selectedSlots.length > 0) ? data.selectedSlots.join('、') : data.slot;
+  const paymentExtra = [];
+  if (PAYMENT_NOTE_URL) {
+    paymentExtra.push({
+      type: 'button',
+      style: 'link',
+      height: 'sm',
+      action: { type: 'uri', label: '開啟完整匯款／注意事項（Notion）', uri: PAYMENT_NOTE_URL },
+    });
+  }
   return [
     {
       type: 'flex',
@@ -834,18 +993,36 @@ function buildSuccessMessages(data) {
       contents: {
         type: 'bubble',
         header: { type: 'box', layout: 'vertical', backgroundColor: '#4CAF82', paddingAll: 'md', contents: [{ type: 'text', text: '✅ 預約成功！', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
-        body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [row('姓名', data.name), row('日期', data.date), row('時段', slotDisplay), row('舉辦類型', data.eventType), row('費用', formatPrice(Number(data.price))), row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'), { type: 'separator', margin: 'md' }, { type: 'text', text: '場域主理人：蘇郁翔\n聯繫電話：0939-607867', size: 'sm', color: '#555555', wrap: true, margin: 'md' }] },
+        body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [row('姓名', data.name), row('日期', data.date), row('時段', slotDisplay), row('舉辦類型', data.eventType), row('費用', formatPrice(Number(data.price))), row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'), { type: 'separator', margin: 'md' }, { type: 'text', text: '場域主理人：蘇郁翔\n聯繫電話：' + CONTACT_PHONE, size: 'sm', color: '#555555', wrap: true, margin: 'md' }] },
       },
     },
-    {
-      type: 'flex',
-      altText: '匯款資訊',
-      contents: {
+    (function () {
+      const bubble = {
         type: 'bubble',
         header: { type: 'box', layout: 'vertical', backgroundColor: '#2C3E50', paddingAll: 'md', contents: [{ type: 'text', text: '💳 匯款資訊', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
-        body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [row('匯款金額', formatPrice(Number(data.price))), row('銀行', '星展銀行 810'), row('分行', '世貿分行'), row('帳號', '602-489-60988'), row('戶名', '鍾沛潔'), { type: 'separator', margin: 'md' }, { type: 'text', margin: 'md', size: 'sm', color: '#555555', wrap: true, text: '為確保您的預約檔期，請於本報價單發出後 3 個工作日內，匯款「訂金」至以下指定帳戶，並提供匯款帳號後五碼以利對帳。檔期保留將以訂金入帳為準。' }, { type: 'separator', margin: 'md' }, { type: 'text', margin: 'md', size: 'sm', color: '#3D6B8C', wrap: true, weight: 'bold', text: '感謝您選擇敘事空域 🏛️\n每一個故事，都值得一個好的空間。\n期待與您共創美好時光，若有任何需求請隨時聯繫我們！' }] },
-      },
-    },
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          paddingAll: 'md',
+          spacing: 'sm',
+          contents: [
+            row('匯款金額', formatPrice(Number(data.price))),
+            row('銀行', BANK_NAME),
+            row('分行', BANK_BRANCH),
+            row('帳號', BANK_ACCOUNT),
+            row('戶名', BANK_HOLDER),
+            { type: 'separator', margin: 'md' },
+            { type: 'text', margin: 'md', size: 'sm', color: '#555555', wrap: true, text: '為確保您的預約檔期，請於本報價單發出後 3 個工作日內，匯款「訂金」至以下指定帳戶，並提供匯款帳號後五碼以利對帳。檔期保留將以訂金入帳為準。' },
+            { type: 'separator', margin: 'md' },
+            { type: 'text', margin: 'md', size: 'sm', color: '#3D6B8C', wrap: true, weight: 'bold', text: '感謝您選擇敘事空域 🏛️\n每一個故事，都值得一個好的空間。\n期待與您共創美好時光，若有任何需求請隨時聯繫我們！' },
+          ],
+        },
+      };
+      if (paymentExtra.length) {
+        bubble.footer = { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: paymentExtra };
+      }
+      return { type: 'flex', altText: '匯款資訊', contents: bubble };
+    })(),
   ];
 }
 
@@ -896,7 +1073,7 @@ const CANCEL_POLICY_TEXT = '📋 預約取消政策\n\n' +
   '• 颱風/地震等天災（依台北市停班停課公告）：可免費改期或全額退訂金';
 
 function buildMyBookings(pages) {
-  if (pages.length === 0) return { type: 'text', text: '目前查無未來的預約記錄。\n\n如有問題請聯繫：📞 0939-607867' };
+  if (pages.length === 0) return { type: 'text', text: '目前查無未來的預約記錄。\n\n如有問題請聯繫：📞 ' + CONTACT_PHONE };
   const items = pages.map(function (p) {
     const date = (p.properties['預約日期']?.date?.start || '').split('T')[0];
     const slot = p.properties['預約時段']?.select?.name || '';
@@ -1030,15 +1207,27 @@ function sumBookingAmounts(pages) {
   return pages.reduce((acc, p) => acc + (Number(p.properties['金額']?.number) || 0), 0);
 }
 
+function notionNumber(props, name) {
+  const n = Number(props[name] && props[name].number);
+  return isNaN(n) ? 0 : n;
+}
+
 function aggregateFinanceStats(pages) {
   let sumTotal = 0;
   let sumPaid = 0;
   let sumUnpaid = 0;
   let nPaid = 0;
   let nUnpaid = 0;
+  let sumDeposit = 0;
+  let sumBalance = 0;
+  let sumRealizedDeposit = 0;
+  let hasDepositField = false;
+  let hasBalanceField = false;
+  let hasRealizedField = false;
   pages.forEach((p) => {
-    const amt = Number(p.properties['金額']?.number) || 0;
-    const ps = p.properties['付款狀態']?.select?.name || '未付款';
+    const pr = p.properties;
+    const amt = Number(pr['金額']?.number) || 0;
+    const ps = pr['付款狀態']?.select?.name || '未付款';
     sumTotal += amt;
     if (ps === '已付款') {
       sumPaid += amt;
@@ -1047,8 +1236,33 @@ function aggregateFinanceStats(pages) {
       sumUnpaid += amt;
       nUnpaid += 1;
     }
+    if (pr['訂金'] && pr['訂金'].number != null) {
+      hasDepositField = true;
+      sumDeposit += notionNumber(pr, '訂金');
+    }
+    if (pr['尾款'] && pr['尾款'].number != null) {
+      hasBalanceField = true;
+      sumBalance += notionNumber(pr, '尾款');
+    }
+    if (pr['實收訂金'] && pr['實收訂金'].number != null) {
+      hasRealizedField = true;
+      sumRealizedDeposit += notionNumber(pr, '實收訂金');
+    }
   });
-  return { sumTotal, sumPaid, sumUnpaid, nPaid, nUnpaid, count: pages.length };
+  return {
+    sumTotal,
+    sumPaid,
+    sumUnpaid,
+    nPaid,
+    nUnpaid,
+    count: pages.length,
+    sumDeposit,
+    sumBalance,
+    sumRealizedDeposit,
+    hasDepositField,
+    hasBalanceField,
+    hasRealizedField,
+  };
 }
 
 async function handleFinancialReport(event, queryText) {
@@ -1089,16 +1303,23 @@ async function handleFinancialReport(event, queryText) {
   const pages = await getBookingsByDateRange(startDate, endDateExclusive);
   const st = aggregateFinanceStats(pages);
   const rangeStr = startDate + ' ~ ' + ymdAddDays(endDateExclusive, -1);
-  const text =
+  let text =
     '📊 簡易財務報告｜' + label + '\n' +
     '區間：' + rangeStr + '\n' +
     '────────────────\n' +
     '預約筆數：' + st.count + '（已付 ' + st.nPaid + ' / 未付 ' + st.nUnpaid + '）\n' +
     '金額合計：' + formatPrice(st.sumTotal) + '\n' +
     '• 已收款：' + formatPrice(st.sumPaid) + '\n' +
-    '• 未收款：' + formatPrice(st.sumUnpaid) + '\n' +
+    '• 未收款：' + formatPrice(st.sumUnpaid) + '\n';
+  if (st.hasRealizedField || st.hasDepositField || st.hasBalanceField) {
+    text += '────────────────\n';
+    if (st.hasRealizedField) text += '實收訂金（欄位加總）：' + formatPrice(st.sumRealizedDeposit) + '\n';
+    if (st.hasDepositField) text += '訂金（欄位加總）：' + formatPrice(st.sumDeposit) + '\n';
+    if (st.hasBalanceField) text += '尾款（欄位加總）：' + formatPrice(st.sumBalance) + '\n';
+  }
+  text +=
     '────────────────\n' +
-    '※ 資料來自 Notion「金額」「付款狀態」欄，歸檔的預約不會列入。';
+    '※ 主表以「金額」「付款狀態」為主；訂金/尾款為加值欄位，需與店內定義一致。';
   return client.replyMessage(event.replyToken, { type: 'text', text });
 }
 
@@ -1199,15 +1420,25 @@ async function handleGroupQuery(event, queryText) {
 
 async function processBooking(event, userId) {
   const data = getData(userId);
-  const bookedSlots = await getBookedSlots(data.date);
-  const bookedRanges = getBookedRanges(bookedSlots);
   const slotsToBook = (data.selectedSlots && data.selectedSlots.length > 0) ? data.selectedSlots : [data.slot];
   const newRanges = getBookedRanges(slotsToBook);
-  const hasConflict = newRanges.some((nr) => isConflict(nr.startMin, nr.endMin, bookedRanges));
-  if (hasConflict) {
-    clearSession(userId);
-    return reply(event, { type: 'text', text: '😢 您選擇的時段剛剛已被他人搶先預約。\n請輸入「立即預約」重新選擇。' });
+
+  function slotConflict(bookedSlots) {
+    const bookedRanges = getBookedRanges(bookedSlots);
+    return newRanges.some((nr) => isConflict(nr.startMin, nr.endMin, bookedRanges));
   }
+
+  let bookedSlots = await getBookedSlots(data.date);
+  if (slotConflict(bookedSlots)) {
+    clearSession(userId);
+    return reply(event, { type: 'text', text: '😢 您選擇的時段剛剛已被他人預約。\n請輸入「立即預約」重新選擇。' });
+  }
+  bookedSlots = await getBookedSlots(data.date);
+  if (slotConflict(bookedSlots)) {
+    clearSession(userId);
+    return reply(event, { type: 'text', text: '😢 送出前再次確認：時段已被預約（多人同時下單）。\n請輸入「立即預約」重選。' });
+  }
+
   const bookingData = Object.assign({}, data, { userId });
   const ok = await createBooking(bookingData);
   clearSession(userId);
@@ -1225,13 +1456,16 @@ async function processBooking(event, userId) {
     };
     return reply(event, [...buildSuccessMessages(data), navMsg]);
   }
-  return reply(event, { type: 'text', text: '⚠️ 系統錯誤，請直接電話預約：0939-607867' });
+  return reply(event, { type: 'text', text: '⚠️ 系統錯誤，請直接電話預約：' + CONTACT_PHONE });
 }
 async function handleEvent(event) {
   // 群組訊息：預約查詢 / 財務報表
   if (event.source.type === 'group') {
     if (event.type === 'message' && event.message.type === 'text') {
       const text = event.message.text.trim();
+      if (process.env.LOG_GROUP_MESSAGE === '1' && event.source.groupId) {
+        console.log('[群組訊息] groupId=' + event.source.groupId + ' text=' + text.slice(0, 120));
+      }
       const staffCmd =
         text.startsWith('查詢') ||
         text === '預約查詢' ||
@@ -1296,7 +1530,7 @@ async function handleEvent(event) {
     if (manageKeywords.some(k => text === k || text.includes(k))) {
       const pages = await getUserBookings(userId);
       if (pages.length === 0) {
-        return reply(event, { type: 'text', text: '查詢不到您的未來預約記錄。\n\n如有問題請直接聯繫：\n📞 0939-607867' });
+        return reply(event, { type: 'text', text: '查詢不到您的未來預約記錄。\n\n如有問題請直接聯繫：\n📞 ' + CONTACT_PHONE });
       }
       return reply(event, [
         { type: 'text', text: '以下是您的預約記錄，請選擇要操作的場次：' },
@@ -1334,10 +1568,10 @@ async function handleEvent(event) {
           } else {
             cancelMsg += '══════════════════\n尚未付款，取消無需退款。\n';
           }
-          cancelMsg += '\n如需重新預約請輸入「立即預約」。\n如有疑問請聯繫：📞 0939-607867';
+          cancelMsg += '\n如需重新預約請輸入「立即預約」。\n如有疑問請聯繫：📞 ' + CONTACT_PHONE;
           return reply(event, { type: 'text', text: cancelMsg });
         }
-        return reply(event, { type: 'text', text: '⚠️ 取消失敗，請聯繫主理人：0939-607867' });
+        return reply(event, { type: 'text', text: '⚠️ 取消失敗，請聯繫主理人：' + CONTACT_PHONE });
       }
       if (v.action === 'reschedule') {
         setSession(userId, 'pickRescheduleDate', {
@@ -1365,7 +1599,7 @@ async function handleEvent(event) {
     if (step === 'inputHeadcount') {
       const n = parseInt(text, 10);
       if (isNaN(n) || n < 1) return reply(event, { type: 'text', text: '⚠️ 請輸入正確人數（數字），例如：15' });
-      if (n > 40) return reply(event, { type: 'text', text: '⚠️ 溫馨提醒：40人以上超過場地容納上限，無法安全使用。\n\n請控制在 40 人以內，或聯繫：📞 0939-607867\n\n請重新輸入人數：' });
+      if (n > 40) return reply(event, { type: 'text', text: '⚠️ 溫馨提醒：40人以上超過場地容納上限，無法安全使用。\n\n請控制在 40 人以內，或聯繫：📞 ' + CONTACT_PHONE + '\n\n請重新輸入人數：' });
       setSession(userId, 'inputNote', { headcount: n });
       return reply(event, { type: 'text', text: '有備註或特殊需求嗎？', quickReply: { items: [{ type: 'action', action: { type: 'message', label: '略過', text: '略過' } }] } });
     }
@@ -1407,10 +1641,10 @@ async function handleEvent(event) {
         } else {
           msg += '尚未付款，取消無需退款。';
         }
-        msg += '\n\n如需重新預約請輸入「立即預約」\n如有疑問請聯繫：📞 0939-607867';
+        msg += '\n\n如需重新預約請輸入「立即預約」\n如有疑問請聯繫：📞 ' + CONTACT_PHONE;
         return reply(event, { type: 'text', text: msg });
       } else {
-        return reply(event, { type: 'text', text: '⚠️ 取消失敗，請聯繫主理人：0939-607867' });
+        return reply(event, { type: 'text', text: '⚠️ 取消失敗，請聯繫主理人：' + CONTACT_PHONE });
       }
     }
 
@@ -1422,7 +1656,7 @@ async function handleEvent(event) {
     const action = params.get('action');
 
     if (action === 'alreadyBooked') return reply(event, { type: 'text', text: '🚫 此時段已被預約，請選擇其他可用時段。' });
-    if (action === 'blocked') return reply(event, { type: 'text', text: '⛔ 此預約已無法線上操作。\n\n請直接聯繫主理人：\n📞 0939-607867' });
+    if (action === 'blocked') return reply(event, { type: 'text', text: '⛔ 此預約已無法線上操作。\n\n請直接聯繫主理人：\n📞 ' + CONTACT_PHONE });
 
     if (action === 'pickDate') {
       const date = event.postback.params && event.postback.params.date;
@@ -1498,6 +1732,13 @@ async function handleEvent(event) {
         const polR = getReschedulePolicy(data.rescheduleOldDate || newDate, isPaidR);
         const surchargeAmt = isPaidR && surchargeR > 0 ? Math.floor(oldPrice * surchargeR / 100) : 0;
         const priceDiff = newPrice - oldPrice;
+        const bookedForNew = await getBookedSlots(newDate, data.reschedulePageId);
+        const br = getBookedRanges(bookedForNew);
+        const nrs = getBookedRanges([slot]);
+        if (nrs.some((nr) => isConflict(nr.startMin, nr.endMin, br))) {
+          clearSession(userId);
+          return reply(event, { type: 'text', text: '😢 新時段剛被其他人預約，請改選其他日期或時段。' });
+        }
         const ok = await rescheduleBooking(data.reschedulePageId, newDate, slot);
         clearSession(userId);
         if (ok) {
@@ -1524,7 +1765,7 @@ async function handleEvent(event) {
             if (surchargeAmt > 0) diffMsg += '\n補償金（' + surchargeR + '%）：' + formatPrice(surchargeAmt);
             if (priceDiff > 0) diffMsg += '\n需補差額：' + formatPrice(priceDiff);
             else if (priceDiff < 0) diffMsg += '\n應退差額：' + formatPrice(Math.abs(priceDiff));
-            if (surchargeAmt > 0 || priceDiff !== 0) diffMsg += '\n\n請依上述金額進行匯款/退款。\n聯繫主理人：📞 0939-607867';
+            if (surchargeAmt > 0 || priceDiff !== 0) diffMsg += '\n\n請依上述金額進行匯款/退款。\n聯繫主理人：📞 ' + CONTACT_PHONE;
           } else if (newPrice !== oldPrice) {
             diffMsg = '\n\n⚠️ 費用變動通知\n原費用：' + formatPrice(oldPrice) + '\n新費用：' + formatPrice(newPrice);
             if (priceDiff > 0) diffMsg += '\n請補匯差額：' + formatPrice(priceDiff);
@@ -1533,7 +1774,7 @@ async function handleEvent(event) {
           const rMsg = '✅ 改期成功！\n══════════════════\n📅 新日期：' + newDate + '\n🕘 新時段：' + slot + diffMsg + '\n══════════════════\n如需更改請輸入「改期」。';
           return reply(event, { type: 'text', text: rMsg });
         } else {
-          return reply(event, { type: 'text', text: '⚠️ 改期失敗，請聯繫主理人：0939-607867' });
+          return reply(event, { type: 'text', text: '⚠️ 改期失敗，請聯繫主理人：' + CONTACT_PHONE });
         }
       }
 
@@ -1592,6 +1833,13 @@ async function handleEvent(event) {
         const polR = getReschedulePolicy(sessionData.rescheduleOldDate || newDate, isPaidR);
         const surchargeAmt = isPaidR && surchargeR > 0 ? Math.floor(oldPrice * surchargeR / 100) : 0;
         const priceDiff = newPrice - oldPrice;
+        const bookedForNew = await getBookedSlots(newDate, sessionData.reschedulePageId);
+        const br = getBookedRanges(bookedForNew);
+        const nrs = getBookedRanges(occupiedSlots);
+        if (nrs.some((nr) => isConflict(nr.startMin, nr.endMin, br))) {
+          clearSession(userId);
+          return reply(event, { type: 'text', text: '😢 新時段剛被其他人預約，請改選其他日期或時段。' });
+        }
         const ok = await rescheduleBooking(sessionData.reschedulePageId, newDate, slotLabel);
         clearSession(userId);
         if (ok) {
@@ -1618,7 +1866,7 @@ async function handleEvent(event) {
             if (surchargeAmt > 0) diffMsg += '\n補償金（' + surchargeR + '%）：' + formatPrice(surchargeAmt);
             if (priceDiff > 0) diffMsg += '\n需補差額：' + formatPrice(priceDiff);
             else if (priceDiff < 0) diffMsg += '\n應退差額：' + formatPrice(Math.abs(priceDiff));
-            if (surchargeAmt > 0 || priceDiff !== 0) diffMsg += '\n\n請依上述金額進行匯款/退款。\n聯繫主理人：📞 0939-607867';
+            if (surchargeAmt > 0 || priceDiff !== 0) diffMsg += '\n\n請依上述金額進行匯款/退款。\n聯繫主理人：📞 ' + CONTACT_PHONE;
           } else if (newPrice !== oldPrice) {
             diffMsg = '\n\n⚠️ 費用變動通知\n原費用：' + formatPrice(oldPrice) + '\n新費用：' + formatPrice(newPrice);
             if (priceDiff > 0) diffMsg += '\n請補匯差額：' + formatPrice(priceDiff);
@@ -1627,7 +1875,7 @@ async function handleEvent(event) {
           const rMsg = '✅ 改期成功！\n══════════════════\n📅 新日期：' + newDate + '\n🕘 新時段：' + slotLabel + diffMsg + '\n══════════════════\n如需更改請輸入「改期」。';
           return reply(event, { type: 'text', text: rMsg });
         }
-        return reply(event, { type: 'text', text: '⚠️ 改期失敗，請聯繫主理人：0939-607867' });
+        return reply(event, { type: 'text', text: '⚠️ 改期失敗，請聯繫主理人：' + CONTACT_PHONE });
       }
 
       const lineName = await getLineDisplayName(userId);
@@ -1706,7 +1954,7 @@ async function handleEvent(event) {
       const isPaid = params.get('isPaid') === 'true';
       const pol = getCancelPolicy(date, price, isPaid);
       if (pol.blocked) {
-        return reply(event, { type: 'text', text: '⛔ 距活動不足7天且已付款，無法線上取消。\n\n請直接聯繫主理人：\n📞 0939-607867' });
+        return reply(event, { type: 'text', text: '⛔ 距活動不足7天且已付款，無法線上取消。\n\n請直接聯繫主理人：\n📞 ' + CONTACT_PHONE });
       }
       const displayName = await getLineDisplayName(userId);
       const code = setVerification(userId, {
@@ -1738,7 +1986,7 @@ async function handleEvent(event) {
         const v = getVerification(userId);
         if (v && v.action === 'cancel') {
           try {
-            await client.pushMessage(userId, { type: 'text', text: '⏰ 提醒：您有一筆取消預約待確認\n\n驗證碼：' + code + '\n請輸入驗證碼完成取消，或輸入「取消」放棄操作。' });
+            await linePushLogged(userId, { type: 'text', text: '⏰ 提醒：您有一筆取消預約待確認\n\n驗證碼：' + code + '\n請輸入驗證碼完成取消，或輸入「取消」放棄操作。' }, '驗證碼提醒·取消');
           } catch(e) {}
         }
       }, 30000);
@@ -1755,7 +2003,7 @@ async function handleEvent(event) {
       const surcharge = Number(params.get('surcharge') || 0);
       const pol = getReschedulePolicy(date, isPaid);
       if (pol.blocked) {
-        return reply(event, { type: 'text', text: '⛔ 距活動不足7天且已付款，無法線上改期。\n\n請直接聯繫主理人：\n📞 0939-607867' });
+        return reply(event, { type: 'text', text: '⛔ 距活動不足7天且已付款，無法線上改期。\n\n請直接聯繫主理人：\n📞 ' + CONTACT_PHONE });
       }
       const displayName = await getLineDisplayName(userId);
       const code = setVerification(userId, {
@@ -1786,7 +2034,7 @@ async function handleEvent(event) {
         const v = getVerification(userId);
         if (v && v.action === 'reschedule') {
           try {
-            await client.pushMessage(userId, { type: 'text', text: '⏰ 提醒：您有一筆改期申請待確認\n\n驗證碼：' + code + '\n請輸入驗證碼繼續改期，或輸入「取消」放棄操作。' });
+            await linePushLogged(userId, { type: 'text', text: '⏰ 提醒：您有一筆改期申請待確認\n\n驗證碼：' + code + '\n請輸入驗證碼繼續改期，或輸入「取消」放棄操作。' }, '驗證碼提醒·改期');
           } catch(e) {}
         }
       }, 30000);
@@ -1798,10 +2046,7 @@ async function handleEvent(event) {
 // ── 前一天下午6點提醒 ──────────────────────────────────────
 async function scanAndRemindTomorrow() {
   try {
-    const now = new Date();
-    const tw = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-    const tomorrow = new Date(tw.getTime() + 86400000);
-    const tomorrowStr = tomorrow.toISOString().split('T')[0];
+    const tomorrowStr = getTwDate(1);
 
     const res = await notion.databases.query({
       database_id: DATABASE_ID,
@@ -1842,16 +2087,14 @@ async function scanAndRemindTomorrow() {
               row('時段', b.slot),
               row('類型', b.slotType),
               { type: 'separator', margin: 'md' },
-              { type: 'text', text: '期待明天與您相見 🏛️\n如需更改請立即聯繫：\n📞 0939-607867', size: 'sm', color: '#3D6B8C', wrap: true, margin: 'md' },
+              { type: 'text', text: '期待明天與您相見 🏛️\n如需更改請立即聯繫：\n📞 ' + CONTACT_PHONE, size: 'sm', color: '#3D6B8C', wrap: true, margin: 'md' },
             ],
           },
         },
       };
-      try {
-        await client.pushMessage(b.lineId, clientMsg);
-        console.log('[提醒] 客人通知成功:', b.name);
-      } catch (e) {
-        console.error('[提醒] 客人通知失敗:', b.name, e.message);
+      const okPush = await linePushLogged(b.lineId, clientMsg, '明日提醒·客人');
+      if (!okPush) {
+        await sendOwnerAlert('明日提醒推播失敗', '客人：' + b.name + ' lineId=' + maskId(b.lineId));
       }
     }
 
@@ -1872,11 +2115,9 @@ async function scanAndRemindTomorrow() {
       },
     };
 
-    try {
-      await client.pushMessage(NOTIFY_GROUP_ID, groupMsg);
-      console.log('[提醒] 群組行程通知成功');
-    } catch (e) {
-      console.error('[提醒] 群組通知失敗:', e.message);
+    const gOk = await linePushLogged(NOTIFY_GROUP_ID, groupMsg, '明日提醒·行政群');
+    if (!gOk) {
+      await sendOwnerAlert('明日行程·行政群推播失敗', 'target=' + maskId(NOTIFY_GROUP_ID));
     }
   } catch (e) {
     console.error('[提醒] 掃描失敗:', e.message);
@@ -1919,24 +2160,21 @@ async function scanAndNotifyPayments() {
               { type: 'separator', margin: 'md' },
               {
                 type: 'text', margin: 'md', size: 'sm', color: '#3D6B8C', wrap: true, weight: 'bold',
-                text: '親愛的 ' + name + '，\n\n感謝您的信任與支持！\n我們已確認收到您的訂金，場地已為您正式保留。\n\n如有任何需求，歡迎隨時與我們聯繫。\n期待與您共創美好時光 🏛️\n\n場域主理人：蘇郁翔\n聯繫電話：0939-607867',
+                text: '親愛的 ' + name + '，\n\n感謝您的信任與支持！\n我們已確認收到您的訂金，場地已為您正式保留。\n\n如有任何需求，歡迎隨時與我們聯繫。\n期待與您共創美好時光 🏛️\n\n場域主理人：蘇郁翔\n聯繫電話：' + CONTACT_PHONE,
               },
             ],
           },
         },
       };
 
-      try {
-        await client.pushMessage(lineId, msg);
-        console.log('[收款通知] 推播成功給', name, lineId);
-
-        // 取消勾選，避免重複發送
+      const pushed = await linePushLogged(lineId, msg, '收款通知·客人');
+      if (pushed) {
         await notion.pages.update({
           page_id: page.id,
           properties: { '通知已收款': { checkbox: false } },
         });
-      } catch (e) {
-        console.error('[收款通知] 發送失敗:', e.message);
+      } else {
+        await sendOwnerAlert('收款確認推播失敗', '客人：' + name + ' ' + maskId(lineId));
       }
     }
   } catch (e) {
@@ -1971,5 +2209,18 @@ app.post('/webhook', line.middleware(lineConfig), (req, res) => {
 });
 app.get('/', (req, res) => res.send('敘事空域 Bot 運行中 ✅'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('✅ 啟動 Port: ' + PORT));
+app.listen(PORT, () => {
+  console.log('✅ 啟動 Port: ' + PORT);
+  console.log('[設定] 後台日誌目錄：' + LOG_DIR + '（line-bot.log）');
+  console.log('[設定] 行政推播目標群組：' + maskId(NOTIFY_GROUP_ID) + (DEFAULT_NOTIFY_FALLBACK ? ' — ⚠️ 使用程式內預設 ID，請在 .env 設定 LINE_NOTIFY_GROUP_ID 為你的行政群' : ' — 來自環境變數'));
+  if (DEFAULT_NOTIFY_FALLBACK) {
+    console.warn('[提示] 若行政群沒收到推播：① Channel 與入群的是同一支 Bot ② 群組 ID 正確。可暫設 LOG_GROUP_MESSAGE=1 重啟後在群裡發話，從主控台複製 groupId 到 .env。');
+  }
+  if (process.env.SENTRY_DSN && !Sentry) {
+    console.warn('[Sentry] 已設定 SENTRY_DSN 但未載入套件，請執行：npm install @sentry/node');
+  }
+  if (!process.env.ALERT_SLACK_WEBHOOK_URL && !(process.env.ALERT_TELEGRAM_BOT_TOKEN && process.env.ALERT_TELEGRAM_CHAT_ID) && !process.env.ALERT_GENERIC_WEBHOOK_URL) {
+    console.log('[設定] 未設定告警 Webhook（推播全失敗時僅寫入 line-bot.log，不會外送 Slack/Telegram）');
+  }
+});
 module.exports = app;
