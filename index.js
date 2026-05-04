@@ -16,6 +16,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+const { matchGuestFaqReply } = require('./guest-faq');
 
 let Sentry = null;
 try {
@@ -486,7 +487,13 @@ function getBookingTotalDue(baseVenueCharge, eventType, userId) {
   return Math.round(Number(baseVenueCharge) || 0) + getVenueDepositAmount(eventType, userId);
 }
 
-const VENUE_RULE_NO_SMOKING_ZH = '全室禁煙。';
+const VENUE_RULE_NO_SMOKING_ZH = '全室禁煙（含電子菸、加熱菸）；吸菸請至一樓戶外。';
+
+/** 客人問答命中內部 FAQ 時回覆；{{CONTACT_PHONE}} 會替換為 CONTACT_PHONE */
+function guestFaqIfHit(text) {
+  const raw = matchGuestFaqReply(text);
+  return raw ? raw.replace(/\{\{CONTACT_PHONE\}\}/g, CONTACT_PHONE) : null;
+}
 
 // ── 對話狀態機 ─────────────────────────────────────────────
 const sessions = new Map();
@@ -2406,6 +2413,16 @@ async function handleEvent(event) {
         setSession(userId, 'inputHeadcount', { phone: text });
         return reply(event, { type: 'text', text: '已更新電話。\n\n請問這次預約幾位？（請直接輸入數字，例如：15）' });
       }
+      const faqHitCp = guestFaqIfHit(text);
+      if (faqHitCp) {
+        return reply(event, {
+          type: 'text',
+          text:
+            faqHitCp +
+            '\n\n請點選上方「✅ 確認電話無誤」沿用號碼，或直接傳送新的手機號碼（8~10 碼數字）。\n\n🚭 ' +
+            VENUE_RULE_NO_SMOKING_ZH,
+        });
+      }
       return reply(event, {
         type: 'text',
         text:
@@ -2417,13 +2434,19 @@ async function handleEvent(event) {
     // 電話輸入
     if (step === 'inputPhone') {
       const cleaned = text.replace(/[-\s]/g, '');
-      if (!/^\d{8,10}$/.test(cleaned)) return reply(event, { type: 'text', text: '⚠️ 請輸入正確的電話號碼（8~10碼），例如：0939607867' });
+      if (!/^\d{8,10}$/.test(cleaned)) {
+        const faqHitIp = guestFaqIfHit(text);
+        if (faqHitIp) return reply(event, { type: 'text', text: faqHitIp + '\n\n⚠️ 請輸入正確的電話號碼（8~10碼），例如：0939607867' });
+        return reply(event, { type: 'text', text: '⚠️ 請輸入正確的電話號碼（8~10碼），例如：0939607867' });
+      }
       setSession(userId, 'inputHeadcount', { phone: text });
       return reply(event, { type: 'text', text: '請問這次預約幾位？（請直接輸入數字，例如：15）' });
     }
 
     // 人數輸入
     if (step === 'inputHeadcount') {
+      const faqHitHc = guestFaqIfHit(text);
+      if (faqHitHc) return reply(event, { type: 'text', text: faqHitHc + '\n\n請繼續輸入本次預約人數（數字），例如：15' });
       const n = parseInt(text, 10);
       if (isNaN(n) || n < 1) return reply(event, { type: 'text', text: '⚠️ 請輸入正確人數（數字），例如：15' });
       if (n > 40) return reply(event, { type: 'text', text: '⚠️ 溫馨提醒：40人以上超過場地容納上限，無法安全使用。\n\n請控制在 40 人以內，或聯繫：📞 ' + CONTACT_PHONE + '\n\n請重新輸入人數：' });
@@ -2433,6 +2456,16 @@ async function handleEvent(event) {
 
     // 備註輸入
     if (step === 'inputNote') {
+      if (text !== '略過') {
+        const faqHitNote = guestFaqIfHit(text);
+        if (faqHitNote) {
+          return reply(event, {
+            type: 'text',
+            text: faqHitNote + '\n\n若無其他備註，請輸入「略過」或繼續留下您的備註內容。',
+            quickReply: { items: [{ type: 'action', action: { type: 'message', label: '略過', text: '略過' } }] },
+          });
+        }
+      }
       setSession(userId, 'confirm', { note: text === '略過' ? '' : text });
       return reply(event, buildInfoConfirm(getData(userId), userId));
     }
@@ -2441,6 +2474,8 @@ async function handleEvent(event) {
     if (step === 'confirm') {
       if (text === '確認預約') return await processBooking(event, userId);
       if (text === '重新選擇') { clearSession(userId); return reply(event, { type: 'text', text: '已取消，請輸入「立即預約」重新開始。' }); }
+      const faqHitCf = guestFaqIfHit(text);
+      if (faqHitCf) return reply(event, { type: 'text', text: faqHitCf + '\n\n確認資料無誤後，請點選「✅ 確認預約」。' });
       return reply(event, { type: 'text', text: '請點選「✅ 確認預約」或「🔄 重新選擇」' });
     }
 
@@ -2475,6 +2510,10 @@ async function handleEvent(event) {
       }
     }
 
+    if (step !== 'inputCode') {
+      const faqIdle = guestFaqIfHit(text);
+      if (faqIdle) return reply(event, { type: 'text', text: faqIdle });
+    }
     return reply(event, buildMainMenu());
   }
 
