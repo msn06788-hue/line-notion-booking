@@ -5,8 +5,9 @@
  *   /cron/morning-0800 — 早安 08:00｜今日→行政群
  *   /cron/unpaid-ultimatum — 未付款最後 24h 催繳（建議每 1 小時）
  *   /cron/remind-tomorrow — 同 evening-2130（相容舊網址）
- * - 相關環境變數：CRON_SECRET、NAV_GOOGLE_MAPS_URI、PAYMENT_GRACE_DAYS、NOTION_UNPAID_ULTIMATUM_PROPERTY（見程式內常數區）
+ * - 相關環境變數：CRON_SECRET、NAV_GOOGLE_MAPS_URI、NAV_APPLE_MAPS_URI（可選）、PAYMENT_GRACE_DAYS、NOTION_UNPAID_ULTIMATUM_PROPERTY（見程式內常數區）
  * - 客戶層級：NOTION_CUSTOMER_DATABASE_ID、客戶層級、可選臨時價格倍率；另有 GLOBAL_PRICE_MULTIPLIER、蓁愛表 JSON（見程式內註解）
+ * - 活動／課程押金：VENUE_ACTIVITY_DEPOSIT_NT（預設 3000）；講座／其他不收；蓁愛講師免押金
  */
 const express = require('express');
 const line = require('@line/bot-sdk');
@@ -68,7 +69,9 @@ const BANK_BRANCH = process.env.BANK_BRANCH || '世貿分行';
 const BANK_ACCOUNT = process.env.BANK_ACCOUNT || '602-489-60988';
 const BANK_HOLDER = process.env.BANK_HOLDER || '鍾沛潔';
 const PAYMENT_NOTE_URL = (process.env.PAYMENT_INFO_NOTION_URL || '').trim();
+/** 手機上較容易喚起 Google Maps App 的格式：…/maps/dir/?api=1&destination=25.033,121.565 或 destination=編碼後的地址（勿用 share.google 短鍵若要在 App 開） */
 const NAV_GOOGLE_MAPS_URI = (process.env.NAV_GOOGLE_MAPS_URI || 'https://share.google/scBlKep6NLkHHNwsQ').trim();
+const NAV_APPLE_MAPS_URI = (process.env.NAV_APPLE_MAPS_URI || '').trim();
 /** 預訂後須於幾日內匯款（曆日倍數 24h），預設 3；最後 24h 會再推播催繳 */
 const PAYMENT_GRACE_DAYS = Math.min(Math.max(Number(process.env.PAYMENT_GRACE_DAYS) || 3, 1), 60);
 /** Notion 核取方塊：匯款最後提醒已送出（可選，若無此欄則改寫入 logs/unpaid-ultimatum-sent.ids） */
@@ -162,14 +165,30 @@ async function sendOwnerAlert(title, detail) {
 }
 
 function buildGoogleNavMessage() {
+  const buttons = [
+    { type: 'button', style: 'primary', color: '#27AE60', action: { type: 'uri', label: '🗺️ Google 地圖導航', uri: NAV_GOOGLE_MAPS_URI } },
+  ];
+  if (NAV_APPLE_MAPS_URI) {
+    buttons.push({
+      type: 'button',
+      style: 'secondary',
+      action: { type: 'uri', label: '🍎 Apple 地圖', uri: NAV_APPLE_MAPS_URI },
+    });
+  }
   return {
     type: 'flex',
     altText: '📍 敘事空域 導航',
     contents: {
       type: 'bubble',
       header: { type: 'box', layout: 'vertical', backgroundColor: '#27AE60', paddingAll: 'md', contents: [{ type: 'text', text: '📍 前往敘事空域', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
-      body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'md', contents: [{ type: 'text', text: '點下方按鈕開啟 Google 導航，我們在那裡等您 🏛️', size: 'sm', color: '#555555', wrap: true }] },
-      footer: { type: 'box', layout: 'vertical', paddingAll: 'md', contents: [{ type: 'button', style: 'primary', color: '#27AE60', action: { type: 'uri', label: '🗺️ 開啟 Google 導航', uri: NAV_GOOGLE_MAPS_URI } }] },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: 'md',
+        spacing: 'md',
+        contents: [{ type: 'text', text: '點按鈕會開啟地圖連結；多數手機若已安裝 App，會直接開 Google／Apple 地圖（仍依系統與 LINE 而定）。', size: 'sm', color: '#555555', wrap: true }],
+      },
+      footer: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: buttons },
     },
   };
 }
@@ -450,6 +469,23 @@ function formatPrice(n) {
   return 'NT$ ' + Number(n).toLocaleString();
 }
 
+/** 活動／課程加收場地押金；講座、其他不收。蓁愛講師免押金。 */
+const VENUE_ACTIVITY_DEPOSIT_NT = Math.min(Math.max(Number(process.env.VENUE_ACTIVITY_DEPOSIT_NT) || 3000, 0), 999999);
+
+function requiresVenueDeposit(eventType) {
+  const et = String(eventType || '').trim();
+  return et === '活動' || et === '課程';
+}
+
+function getVenueDepositAmount(eventType, userId) {
+  if (getCustomerTier(userId) === 'zhenai_lecturer') return 0;
+  return requiresVenueDeposit(eventType) ? VENUE_ACTIVITY_DEPOSIT_NT : 0;
+}
+
+function getBookingTotalDue(baseVenueCharge, eventType, userId) {
+  return Math.round(Number(baseVenueCharge) || 0) + getVenueDepositAmount(eventType, userId);
+}
+
 // ── 對話狀態機 ─────────────────────────────────────────────
 const sessions = new Map();
 function getSession(userId) {
@@ -706,6 +742,13 @@ async function createBooking(booking) {
     }
     const tier = getCustomerTier(booking.userId);
     const tierNote = tier ? '\n專屬層級：' + (getTierDisplayName(booking.userId) || tier) : '';
+    const depNt = Number(booking.venueDepositNt) || 0;
+    const rentNt = booking.venueRentNt != null ? Number(booking.venueRentNt) : Math.round(Number(booking.price) || 0) - depNt;
+    let depositNote = '';
+    if (depNt > 0) {
+      depositNote =
+        '\n場租：' + formatPrice(rentNt) + '；押金：' + formatPrice(depNt) + '（無損壞／無須大量清潔可退；下方「金額」為應匯場租＋押金合計）';
+    }
     await notion.pages.create({
       parent: { database_id: DATABASE_ID },
       properties: {
@@ -716,7 +759,19 @@ async function createBooking(booking) {
         '預約類型': { select: { name: booking.slotType || '包場時段' } },
         '舉辦類型': { select: { name: booking.eventType || '其他' } },
         '金額': { number: Number(booking.price) || 0 },
-        '備註': { rich_text: [{ text: { content: '人數：' + String(booking.headcount || 1) + ' 人' + (booking.note ? '\n備註：' + booking.note : '') + tierNote } }] },
+        '備註': {
+          rich_text: [{
+            text: {
+              content:
+                '人數：' +
+                String(booking.headcount || 1) +
+                ' 人' +
+                (booking.note ? '\n備註：' + booking.note : '') +
+                tierNote +
+                depositNote,
+            },
+          }],
+        },
         '預約來源': { select: { name: 'LINE' } },
         'LINE ID': { rich_text: [{ text: { content: booking.userId || '' } }] },
       },
@@ -1046,7 +1101,16 @@ function buildAdminPlainSummary(booking, action) {
     lines.push('日期：' + (booking.date || '—'));
     lines.push('時段：' + slotDisplay);
     lines.push('電話：' + (booking.phone || '—'));
-    lines.push('金額：' + formatPrice(Number(booking.price) || 0));
+    lines.push('應匯總計：' + formatPrice(Number(booking.price) || 0));
+    if (Number(booking.venueDepositNt) > 0) {
+      lines.push(
+        '（場租 ' +
+          formatPrice(Number(booking.venueRentNt) || 0) +
+          ' ＋ 押金 ' +
+          formatPrice(Number(booking.venueDepositNt) || 0) +
+          '）',
+      );
+    }
     return lines.join('\n');
   }
   if (action === 'cancel') {
@@ -1117,7 +1181,12 @@ async function notifyGroup(booking, action) {
     row('電話', booking.phone || '—'),
   ];
   if (action === 'new') {
-    bodyContents.push(row('金額', formatPrice(Number(booking.price) || 0)));
+    const depAd = Number(booking.venueDepositNt) || 0;
+    if (depAd > 0) {
+      bodyContents.push(row('場租', formatPrice(Number(booking.venueRentNt) || 0)));
+      bodyContents.push(row('押金', formatPrice(depAd)));
+    }
+    bodyContents.push(row(depAd > 0 ? '應匯總計' : '金額', formatPrice(Number(booking.price) || 0)));
     const tierTxt = booking.userId ? getTierDisplayName(booking.userId) : null;
     if (tierTxt) bodyContents.push(row('客戶層級', tierTxt));
   }
@@ -1425,8 +1494,25 @@ function buildEventTypePicker() {
 function buildInfoConfirm(data, userId) {
   const slotDisplay = (data.selectedSlots && data.selectedSlots.length > 0) ? data.selectedSlots.join('、') : data.slot;
   const tierName = getTierDisplayName(userId);
-  const feeLabel = tierName ? formatPrice(Number(data.price)) + '（' + tierName + ' 專屬價）' : formatPrice(Number(data.price));
-  const bodyRows = [row('姓名', data.name), row('日期', data.date), row('時段', slotDisplay), row('類型', data.slotType), row('舉辦類型', data.eventType), row('費用', feeLabel), row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'), row('備註', data.note || '無')];
+  const baseRent = Math.round(Number(data.price) || 0);
+  const deposit = getVenueDepositAmount(data.eventType, userId);
+  const totalDue = baseRent + deposit;
+  let rentLabel = formatPrice(baseRent);
+  if (tierName) rentLabel += '（' + tierName + '）';
+  rentLabel += '（場租）';
+  const bodyRows = [
+    row('姓名', data.name),
+    row('日期', data.date),
+    row('時段', slotDisplay),
+    row('類型', data.slotType),
+    row('舉辦類型', data.eventType),
+    row('場租', rentLabel),
+  ];
+  if (deposit > 0) {
+    bodyRows.push(row('押金', formatPrice(deposit) + '\n無損壞／無須大量清潔可退'));
+  }
+  bodyRows.push(row('應匯款總額', formatPrice(totalDue)));
+  bodyRows.push(row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'), row('備註', data.note || '無'));
   return {
     type: 'flex',
     altText: '請確認以下預約資訊',
@@ -1450,6 +1536,24 @@ function buildSuccessMessages(data) {
       action: { type: 'uri', label: '開啟完整匯款／注意事項（Notion）', uri: PAYMENT_NOTE_URL },
     });
   }
+  const dep = Number(data.venueDepositNt) || 0;
+  const rent = data.venueRentNt != null ? Number(data.venueRentNt) : Math.round(Number(data.price) || 0) - dep;
+  const totalPay = Number(data.price) || 0;
+  const successBodyRows = [
+    row('姓名', data.name),
+    row('日期', data.date),
+    row('時段', slotDisplay),
+    row('舉辦類型', data.eventType),
+    row('場租', formatPrice(rent)),
+  ];
+  if (dep > 0) {
+    successBodyRows.push(row('押金', formatPrice(dep) + '\n無損壞／無須大量清潔可退'));
+  }
+  successBodyRows.push(row('應匯總計', formatPrice(totalPay)), row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'));
+  const depositPaymentNote =
+    dep > 0
+      ? '匯款金額為「場租＋押金」合計；押金於場地歸還無損壞／無須大量清潔後退還。\n'
+      : '';
   return [
     {
       type: 'flex',
@@ -1457,7 +1561,16 @@ function buildSuccessMessages(data) {
       contents: {
         type: 'bubble',
         header: { type: 'box', layout: 'vertical', backgroundColor: '#4CAF82', paddingAll: 'md', contents: [{ type: 'text', text: '✅ 預約成功！', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
-        body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [row('姓名', data.name), row('日期', data.date), row('時段', slotDisplay), row('舉辦類型', data.eventType), row('費用', formatPrice(Number(data.price))), row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'), { type: 'separator', margin: 'md' }, { type: 'text', text: '場域主理人：蘇郁翔\n聯繫電話：' + CONTACT_PHONE, size: 'sm', color: '#555555', wrap: true, margin: 'md' }] },
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          paddingAll: 'md',
+          spacing: 'sm',
+          contents: successBodyRows.concat([
+            { type: 'separator', margin: 'md' },
+            { type: 'text', text: '場域主理人：蘇郁翔\n聯繫電話：' + CONTACT_PHONE, size: 'sm', color: '#555555', wrap: true, margin: 'md' },
+          ]),
+        },
       },
     },
     (function () {
@@ -1470,13 +1583,22 @@ function buildSuccessMessages(data) {
           paddingAll: 'md',
           spacing: 'sm',
           contents: [
-            row('匯款金額', formatPrice(Number(data.price))),
+            row('匯款金額', formatPrice(totalPay)),
             row('銀行', BANK_NAME),
             row('分行', BANK_BRANCH),
             row('帳號', BANK_ACCOUNT),
             row('戶名', BANK_HOLDER),
             { type: 'separator', margin: 'md' },
-            { type: 'text', margin: 'md', size: 'sm', color: '#555555', wrap: true, text: '為確保您的預約檔期，請於本報價單發出後 3 個工作日內，匯款「訂金」至以下指定帳戶，並提供匯款帳號後五碼以利對帳。檔期保留將以訂金入帳為準。' },
+            {
+              type: 'text',
+              margin: 'md',
+              size: 'sm',
+              color: '#555555',
+              wrap: true,
+              text:
+                depositPaymentNote +
+                '為確保您的預約檔期，請於本報價單發出後 3 個工作日內，匯款「訂金」至以下指定帳戶，並提供匯款帳號後五碼以利對帳。檔期保留將以訂金入帳為準。',
+            },
             { type: 'separator', margin: 'md' },
             { type: 'text', margin: 'md', size: 'sm', color: '#3D6B8C', wrap: true, weight: 'bold', text: '感謝您選擇敘事空域 🏛️\n每一個故事，都值得一個好的空間。\n期待與您共創美好時光，若有任何需求請隨時聯繫我們！' },
           ],
@@ -1959,12 +2081,20 @@ async function processBooking(event, userId) {
     return reply(event, { type: 'text', text: '😢 送出前再次確認：時段已被預約（多人同時下單）。\n請輸入「立即預約」重選。' });
   }
 
-  const bookingData = Object.assign({}, data, { userId });
-  const ok = await createBooking(bookingData);
+  const baseVenue = Math.round(Number(data.price) || 0);
+  const depositNt = getVenueDepositAmount(data.eventType, userId);
+  const totalDue = baseVenue + depositNt;
+  const enriched = Object.assign({}, data, {
+    userId,
+    venueRentNt: baseVenue,
+    venueDepositNt: depositNt,
+    price: totalDue,
+  });
+  const ok = await createBooking(enriched);
   clearSession(userId);
   if (ok) {
-    await notifyGroup(Object.assign({}, data, { userId, adminCtx: { action: 'new' } }), 'new');
-    return reply(event, [...buildSuccessMessages(data), buildGoogleNavMessage()]);
+    await notifyGroup(Object.assign({}, enriched, { adminCtx: { action: 'new' } }), 'new');
+    return reply(event, [...buildSuccessMessages(enriched), buildGoogleNavMessage()]);
   }
   return reply(event, { type: 'text', text: '⚠️ 系統錯誤，請直接電話預約：' + CONTACT_PHONE });
 }
