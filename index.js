@@ -6,6 +6,7 @@
  *   /cron/unpaid-ultimatum — 未付款最後 24h 催繳（建議每 1 小時）
  *   /cron/remind-tomorrow — 同 evening-2130（相容舊網址）
  * - 相關環境變數：CRON_SECRET、NAV_GOOGLE_MAPS_URI、PAYMENT_GRACE_DAYS、NOTION_UNPAID_ULTIMATUM_PROPERTY（見程式內常數區）
+ * - 客戶層級：NOTION_CUSTOMER_DATABASE_ID、客戶層級、可選臨時價格倍率；另有 GLOBAL_PRICE_MULTIPLIER、蓁愛表 JSON（見程式內註解）
  */
 const express = require('express');
 const line = require('@line/bot-sdk');
@@ -33,6 +34,27 @@ const lineConfig = {
 const client = new line.Client(lineConfig);
 const notion = new Client({ auth: process.env.NOTION_INTEGRATION_TOKEN });
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;
+/** 客戶名冊（與預約庫分開）：僅供後台維護 LINE User ID → 層級，Bot 只讀 */
+const NOTION_CUSTOMER_DATABASE_ID = (process.env.NOTION_CUSTOMER_DATABASE_ID || '').trim();
+const NOTION_CUSTOMER_LINE_PROPERTY = (process.env.NOTION_CUSTOMER_LINE_PROPERTY || 'LINE ID').trim();
+const NOTION_CUSTOMER_TIER_PROPERTY = (process.env.NOTION_CUSTOMER_TIER_PROPERTY || '客戶層級').trim();
+/** 名冊庫內可選 number 欄位：臨時針對該客戶的價格倍率（如 1.05），與層級無關、在層級計價後再乘上 */
+const NOTION_CUSTOMER_PRICE_ADJUST_PROPERTY = (process.env.NOTION_CUSTOMER_PRICE_ADJUST_PROPERTY || '臨時價格倍率').trim();
+/** 可選：全體客戶在層級價之後再乘上此倍率（臨時調漲/折讓），例如 1.02；未設或 1 則不變 */
+const GLOBAL_PRICE_MULTIPLIER = (() => {
+  const g = Number(process.env.GLOBAL_PRICE_MULTIPLIER);
+  if (Number.isFinite(g) && g > 0 && g <= 10) return g;
+  return 1;
+})();
+/** 敘事 VIP：僅包場（fixed）乘此倍率，預設 0.9；可改 env NARRATIVE_VIP_FIXED_MULTIPLIER */
+const NARRATIVE_VIP_FIXED_MULTIPLIER = (() => {
+  const g = Number(process.env.NARRATIVE_VIP_FIXED_MULTIPLIER);
+  if (Number.isFinite(g) && g > 0 && g <= 2) return g;
+  return 0.9;
+})();
+/** 設為 true 時：若已設定客戶名冊庫，則不再使用 LINE_ID_TO_TIER_JSON 備援 */
+const CUSTOMER_TIER_STRICT_NOTION =
+  process.env.CUSTOMER_TIER_STRICT_NOTION === '1' || /^true$/i.test(String(process.env.CUSTOMER_TIER_STRICT_NOTION || ''));
 const NOTIFY_GROUP_ID = (
   process.env.LINE_NOTIFY_GROUP_ID ||
   process.env.LINE_ADMIN_GROUP_ID ||
@@ -188,18 +210,24 @@ async function linePushLogged(to, message, context) {
 }
 
 const GROUP_QUERY_HELP =
-  '📋 行政群組｜預約查詢（統整）\n' +
-  '可打：預約查詢、查詢、或訊息裡含「查詢」\n\n' +
+  '📋 行政群組｜查詢指令（建議皆以「查詢」開頭）\n\n' +
+  '【預約名單】查詢 + 時間 +（選填）未付款\n' +
+  '例：查詢本週、查詢下週、查詢本月、查詢下個月、查詢 2026-05-10\n' +
+  '　　查詢本月未付款、查詢本週未繳款\n' +
+  '　　今日行程、明日行程（可不寫「查詢」）\n\n' +
+  '【財務／營收】查詢 + 區間 + 營收／財務／報表（擇一）\n' +
+  '例：查詢本月營收、查詢財務本週、查詢 2026-05 報表\n' +
+  '　　查詢 3～6月營收、查詢 2026年3～6月營收\n' +
+  '　　查詢 2026-03～2026-06（跨月）\n\n' +
   '【名單】\n' +
   '• 查詢今天 / 本日 / 今日\n' +
   '• 查詢明天 / 明日\n' +
   '• 查詢本週、查詢下週\n' +
-  '• 查詢本月\n' +
+  '• 查詢本月、查詢下個月\n' +
   '• 查詢 2026-05-10（指定日）\n\n' +
   '【財務（簡易）】\n' +
-  '• 查詢財務 或 查詢報表（預設本月）\n' +
-  '• 查詢財務本週 / 查詢財務本月\n' +
-  '• 查詢財務 2026-05（指定月）\n\n' +
+  '• 查詢本月營收（預設本月；可加：本週／下週／指定月）\n' +
+  '• 查詢財務、查詢報表、查詢收支\n\n' +
   '※ 合計以 Notion「金額」；已收/未收依「付款狀態」。\n' +
   '※ 若資料庫有「實收訂金」或「訂金」「尾款」欄，財務報表會一併加總。';
 
@@ -286,7 +314,7 @@ function generateHourlySlots() {
 }
 const HOURLY_SLOTS = generateHourlySlots();
 
-// ── 價格表 ────────────────────────────────────────────────
+// ── 價格表（一般牌價）────────────────────────────────────────
 const PRICES = {
   fixed: {
     weekday: { morning: 4200, afternoon: 4800, evening: 5400, fullday: 8400 },
@@ -297,9 +325,127 @@ const PRICES = {
     holiday: { morning: 2200, afternoon: 2600, evening: 3100 },
   },
 };
+/** 蓁愛講師：包場時段（fixed）專用絕對價；可用 PRICE_TABLE_ZHENAI_LECTURER_JSON 覆寫（merge） */
+const PRICES_ZHENAI_LECTURER_BASE = {
+  weekday: { morning: 2800, afternoon: 3200, evening: 3600, fullday: 5600 },
+  holiday: { morning: 4000, afternoon: 4800, evening: 5600, fullday: 7200 },
+};
 function getPrice(type, period, holiday) {
   return PRICES[type][holiday ? 'holiday' : 'weekday'][period];
 }
+
+/**
+ * 專屬價（三層級）— 僅後台 Notion 名冊可設定，LINE 無法自選
+ * · 蓁愛講師：包場用下表絕對價；單一鐘點（hourly）與一般客人相同牌價
+ * · 敘事VIP：包場時段為牌價×NARRATIVE_VIP_FIXED_MULTIPLIER（預設九折）；鐘點不打折
+ * · 一般客人：全程牌價
+ * 臨時調價：GLOBAL_PRICE_MULTIPLIER（全體）；名冊「臨時價格倍率」欄位（單客）；蓁愛表可用 PRICE_TABLE_ZHENAI_LECTURER_JSON
+ */
+function parseJsonEnvObject(key, fallback) {
+  try {
+    const v = process.env[key];
+    if (v == null || String(v).trim() === '') return fallback;
+    const j = JSON.parse(String(v));
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : fallback;
+  } catch (e) {
+    console.error('[env] ' + key, e.message);
+    return fallback;
+  }
+}
+const _zhenaiMerge = parseJsonEnvObject('PRICE_TABLE_ZHENAI_LECTURER_JSON', {});
+const PRICES_ZHENAI_LECTURER = {
+  weekday: Object.assign({}, PRICES_ZHENAI_LECTURER_BASE.weekday, _zhenaiMerge.weekday || {}),
+  holiday: Object.assign({}, PRICES_ZHENAI_LECTURER_BASE.holiday, _zhenaiMerge.holiday || {}),
+};
+function getPriceZhenaiLecturerFixed(period, holiday) {
+  return PRICES_ZHENAI_LECTURER[holiday ? 'holiday' : 'weekday'][period];
+}
+
+const LINE_ID_TO_TIER = parseJsonEnvObject('LINE_ID_TO_TIER_JSON', {});
+const TIER_LABELS = Object.assign(
+  {
+    zhenai_lecturer: '蓁愛講師',
+    narrative_vip: '敘事VIP',
+    standard: '一般客人',
+    zhenai: '蓁愛講師',
+    lecturer: '敘事VIP',
+    online: '一般客人',
+  },
+  parseJsonEnvObject('PRICE_TIER_LABELS_JSON', {}),
+);
+/** 僅保留給舊版 env 代碼或未來自訂層級時用 */
+const TIER_MULTIPLIERS = Object.assign(
+  {},
+  parseJsonEnvObject('PRICE_TIER_MULTIPLIERS_JSON', {}),
+);
+
+const CUSTOMER_TIER_CACHE_MS = Math.min(
+  Math.max(Number(process.env.CUSTOMER_TIER_CACHE_MS) || 180000, 30000),
+  3600000,
+);
+const customerTierCache = new Map();
+
+function normalizeTierCode(code) {
+  if (!code || typeof code !== 'string') return null;
+  const legacy = { zhenai: 'zhenai_lecturer', lecturer: 'narrative_vip', online: 'standard' };
+  return legacy[code] || code;
+}
+
+function getCustomerTier(userId) {
+  if (!userId) return null;
+  const hit = customerTierCache.get(userId);
+  let raw = null;
+  if (hit && hit.done) raw = hit.code;
+  else raw = LINE_ID_TO_TIER[String(userId)] || null;
+  return normalizeTierCode(typeof raw === 'string' && raw.length ? raw : null);
+}
+
+function getTierDisplayName(userId) {
+  const t = getCustomerTier(userId);
+  if (!t) return null;
+  return TIER_LABELS[t] != null ? String(TIER_LABELS[t]) : t;
+}
+
+function getPriceAdjustFromCache(userId) {
+  const hit = customerTierCache.get(userId);
+  if (!hit || !hit.done || hit.priceAdjust == null) return null;
+  const n = Number(hit.priceAdjust);
+  if (!Number.isFinite(n) || n <= 0 || n > 10) return null;
+  return n;
+}
+
+function applyGlobalAndPersonalAdjust(amount, userId) {
+  let n = Math.round(Number(amount));
+  const personal = getPriceAdjustFromCache(userId);
+  if (personal != null) n = Math.round(n * personal);
+  if (GLOBAL_PRICE_MULTIPLIER !== 1) n = Math.round(n * GLOBAL_PRICE_MULTIPLIER);
+  return n;
+}
+
+function getPriceForUser(userId, type, period, holiday) {
+  const list = getPrice(type, period, holiday);
+  const tier = getCustomerTier(userId);
+  let subtotal = list;
+
+  if (tier === 'zhenai_lecturer') {
+    if (type === 'fixed') subtotal = getPriceZhenaiLecturerFixed(period, holiday);
+    else subtotal = list;
+  } else if (tier === 'narrative_vip') {
+    if (type === 'fixed') subtotal = Math.round(list * NARRATIVE_VIP_FIXED_MULTIPLIER);
+    else subtotal = list;
+  } else if (tier === 'standard') {
+    subtotal = list;
+  } else if (tier) {
+    const m = Number(TIER_MULTIPLIERS[tier]);
+    if (Number.isFinite(m) && m > 0 && m <= 10) subtotal = Math.round(list * m);
+    else subtotal = list;
+  } else {
+    subtotal = list;
+  }
+
+  return applyGlobalAndPersonalAdjust(subtotal, userId);
+}
+
 function formatPrice(n) {
   return 'NT$ ' + Number(n).toLocaleString();
 }
@@ -421,6 +567,78 @@ async function getUserBookings(userId) {
   }
 }
 
+function mapNotionTierNameToCode(name) {
+  if (!name || typeof name !== 'string') return null;
+  const s = name.trim();
+  const byZh = {
+    蓁愛講師: 'zhenai_lecturer',
+    敘事VIP: 'narrative_vip',
+    一般客人: 'standard',
+    蓁愛協會: 'zhenai_lecturer',
+    敘事講師: 'narrative_vip',
+    網路顧客: 'standard',
+  };
+  if (byZh[s]) return byZh[s];
+  const low = s.toLowerCase();
+  if (low === 'zhenai_lecturer' || low === 'narrative_vip' || low === 'standard') return low;
+  if (low === 'zhenai' || low === 'lecturer' || low === 'online') return normalizeTierCode(low);
+  console.warn('[tier] Notion 選項無法對應層級代碼：', s);
+  return null;
+}
+
+async function fetchCustomerRowFromNotion(userId) {
+  if (!NOTION_CUSTOMER_DATABASE_ID) return null;
+  try {
+    const res = await notion.databases.query({
+      database_id: NOTION_CUSTOMER_DATABASE_ID,
+      filter: { property: NOTION_CUSTOMER_LINE_PROPERTY, rich_text: { equals: userId } },
+      page_size: 5,
+    });
+    if (res.results.length > 1) {
+      console.warn('[tier] Notion 客戶名冊同 LINE ID 多筆資料，使用第一筆');
+    }
+    if (!res.results.length) return null;
+    const props = res.results[0].properties;
+    let code = null;
+    const tp = props[NOTION_CUSTOMER_TIER_PROPERTY];
+    if (tp && tp.select && tp.select.name) {
+      code = mapNotionTierNameToCode(tp.select.name);
+    }
+    let priceAdjust = null;
+    const adj = props[NOTION_CUSTOMER_PRICE_ADJUST_PROPERTY];
+    if (adj && adj.type === 'number' && adj.number != null) {
+      priceAdjust = Number(adj.number);
+    }
+    return { code, priceAdjust };
+  } catch (e) {
+    console.error('[Notion] fetchCustomerRowFromNotion:', e.message);
+  }
+  return null;
+}
+
+async function resolveCustomerTier(userId) {
+  if (!userId) return;
+  const now = Date.now();
+  const hit = customerTierCache.get(userId);
+  if (hit && hit.done && now - hit.at < CUSTOMER_TIER_CACHE_MS) return;
+
+  let code = null;
+  let priceAdjust = null;
+  if (NOTION_CUSTOMER_DATABASE_ID) {
+    const row = await fetchCustomerRowFromNotion(userId);
+    if (row) {
+      code = row.code;
+      priceAdjust = row.priceAdjust;
+    }
+  }
+  const allowEnvFallback = !(CUSTOMER_TIER_STRICT_NOTION && NOTION_CUSTOMER_DATABASE_ID);
+  if (code == null && allowEnvFallback && LINE_ID_TO_TIER[String(userId)]) {
+    code = LINE_ID_TO_TIER[String(userId)];
+  }
+  code = normalizeTierCode(typeof code === 'string' && code.length ? code : null);
+  customerTierCache.set(userId, { code, priceAdjust, done: true, at: now });
+}
+
 async function getBookingsByDateRange(startDate, endDateExclusive) {
   try {
     return await notionQueryAll(DATABASE_ID, {
@@ -486,6 +704,8 @@ async function createBooking(booking) {
         end: booking.date + 'T' + minToTime(rangeEnd.endMin) + ':00+08:00',
       };
     }
+    const tier = getCustomerTier(booking.userId);
+    const tierNote = tier ? '\n專屬層級：' + (getTierDisplayName(booking.userId) || tier) : '';
     await notion.pages.create({
       parent: { database_id: DATABASE_ID },
       properties: {
@@ -496,7 +716,7 @@ async function createBooking(booking) {
         '預約類型': { select: { name: booking.slotType || '包場時段' } },
         '舉辦類型': { select: { name: booking.eventType || '其他' } },
         '金額': { number: Number(booking.price) || 0 },
-        '備註': { rich_text: [{ text: { content: '人數：' + String(booking.headcount || 1) + ' 人' + (booking.note ? '\n備註：' + booking.note : '') } }] },
+        '備註': { rich_text: [{ text: { content: '人數：' + String(booking.headcount || 1) + ' 人' + (booking.note ? '\n備註：' + booking.note : '') + tierNote } }] },
         '預約來源': { select: { name: 'LINE' } },
         'LINE ID': { rich_text: [{ text: { content: booking.userId || '' } }] },
       },
@@ -590,6 +810,176 @@ function getTaipeiMonthRangeStrings() {
   }
   const endExclusive = ny + '-' + String(nm).padStart(2, '0') + '-01';
   return { start, endExclusive, label: y + ' 年 ' + monthNum + ' 月' };
+}
+
+function getTaipeiYM() {
+  const parts = new Intl.DateTimeFormat('en', {
+    timeZone: 'Asia/Taipei',
+    year: 'numeric',
+    month: 'numeric',
+  }).formatToParts(new Date());
+  return {
+    y: parseInt(parts.find((p) => p.type === 'year').value, 10),
+    m: parseInt(parts.find((p) => p.type === 'month').value, 10),
+  };
+}
+
+function monthFirstDay(y, monthNum) {
+  return y + '-' + String(monthNum).padStart(2, '0') + '-01';
+}
+
+function addCalendarMonths(y, monthNum, delta) {
+  let nm = monthNum + delta;
+  let ny = y;
+  while (nm > 12) {
+    nm -= 12;
+    ny += 1;
+  }
+  while (nm < 1) {
+    nm += 12;
+    ny -= 1;
+  }
+  return { y: ny, m: nm };
+}
+
+function getMonthRangeByYearMonth(y, monthNum) {
+  const start = monthFirstDay(y, monthNum);
+  const next = addCalendarMonths(y, monthNum, 1);
+  const endExclusive = monthFirstDay(next.y, next.m);
+  return { startDate: start, endDateExclusive: endExclusive, label: y + ' 年 ' + monthNum + ' 月' };
+}
+
+function getNextMonthRangeStrings() {
+  const { y, m } = getTaipeiYM();
+  const nx = addCalendarMonths(y, m, 1);
+  const r = getMonthRangeByYearMonth(nx.y, nx.m);
+  return { startDate: r.startDate, endDateExclusive: r.endDateExclusive, label: r.label + '（下個月）' };
+}
+
+function spanMonthsInclusiveSameYear(y, startM, endM) {
+  const startDate = monthFirstDay(y, startM);
+  const afterEnd = addCalendarMonths(y, endM, 1);
+  const endDateExclusive = monthFirstDay(afterEnd.y, afterEnd.m);
+  return {
+    startDate,
+    endDateExclusive,
+    label: y + ' 年 ' + startM + '～' + endM + ' 月',
+  };
+}
+
+/** 去掉「查詢」前綴，供行政群組一句話多種關鍵字解析 */
+function stripLeadingQueryKeyword(s) {
+  return String(s || '')
+    .replace(/^\s*查詢\s*/u, '')
+    .trim();
+}
+
+function stripFinanceNoise(s) {
+  return String(s || '')
+    .replace(/營收|財務|報表|收支|金額|統計|簡易|營業額/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function stripUnpaidNoise(s) {
+  return String(s || '')
+    .replace(/未付款|待付款|未繳款|欠款|欠費/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * 解析行政群組日期區間（台北曆、預約日期欄）
+ * @returns {{ startDate: string, endDateExclusive: string, label: string } | null}
+ */
+function parseDateRangeForAdminQuery(q) {
+  const raw = String(q || '').trim();
+  const compact = raw.replace(/\s/g, '');
+  const today = getTwDate();
+  const { y: ty, m: tm } = getTaipeiYM();
+
+  if (/今天|本日|今日/.test(compact)) {
+    return { startDate: today, endDateExclusive: ymdAddDays(today, 1), label: '今天' };
+  }
+  if (/明天|明日/.test(compact)) {
+    const t = getTwDate(1);
+    return { startDate: t, endDateExclusive: ymdAddDays(t, 1), label: '明天' };
+  }
+  if (/本週/.test(compact)) {
+    const r = getWeekRange(0);
+    return { startDate: r.start, endDateExclusive: r.endExclusive, label: '本週' };
+  }
+  if (/下週/.test(compact)) {
+    const r = getWeekRange(1);
+    return { startDate: r.start, endDateExclusive: r.endExclusive, label: '下週' };
+  }
+  if (/本月|這個月|當月/.test(compact)) {
+    const m = getTaipeiMonthRangeStrings();
+    return { startDate: m.start, endDateExclusive: m.endExclusive, label: m.label };
+  }
+  if (/下個月|次月|下月/.test(compact)) {
+    const r = getNextMonthRangeStrings();
+    return { startDate: r.startDate, endDateExclusive: r.endDateExclusive, label: r.label };
+  }
+
+  let m = compact.match(/(\d{4})年(\d{1,2})[~～\-至](\d{1,2})月/);
+  if (m) {
+    const yy = parseInt(m[1], 10);
+    const sm = parseInt(m[2], 10);
+    const em = parseInt(m[3], 10);
+    if (sm >= 1 && sm <= 12 && em >= 1 && em <= 12 && sm <= em) return spanMonthsInclusiveSameYear(yy, sm, em);
+  }
+  m = compact.match(/(\d{1,2})[~～\-至](\d{1,2})月/);
+  if (m) {
+    const sm = parseInt(m[1], 10);
+    const em = parseInt(m[2], 10);
+    if (sm >= 1 && sm <= 12 && em >= 1 && em <= 12 && sm <= em) return spanMonthsInclusiveSameYear(ty, sm, em);
+  }
+
+  m = raw.match(/(\d{4})-(\d{2})\s*[~～]\s*(\d{4})-(\d{2})/);
+  if (m) {
+    const y1 = parseInt(m[1], 10);
+    const mo1 = parseInt(m[2], 10);
+    const y2 = parseInt(m[3], 10);
+    const mo2 = parseInt(m[4], 10);
+    const startDate = monthFirstDay(y1, mo1);
+    const after = addCalendarMonths(y2, mo2, 1);
+    const endDateExclusive = monthFirstDay(after.y, after.m);
+    return {
+      startDate,
+      endDateExclusive,
+      label: m[1] + '-' + m[2] + ' ~ ' + m[3] + '-' + m[4],
+    };
+  }
+
+  const singleDay = raw.match(/(\d{4}-\d{2}-\d{2})/);
+  if (singleDay) {
+    const d0 = singleDay[1];
+    return { startDate: d0, endDateExclusive: ymdAddDays(d0, 1), label: d0 };
+  }
+
+  const ym = raw.match(/(\d{4})-(\d{2})(?![-\d])/);
+  if (ym) {
+    const y = parseInt(ym[1], 10);
+    const mo = parseInt(ym[2], 10);
+    if (mo >= 1 && mo <= 12) {
+      const r = getMonthRangeByYearMonth(y, mo);
+      return { startDate: r.startDate, endDateExclusive: r.endDateExclusive, label: r.label + '（財務月）' };
+    }
+  }
+
+  return null;
+}
+
+function parseDateRangeForAdminQueryLoose(q) {
+  const cleaned = stripFinanceNoise(stripUnpaidNoise(q));
+  let r = parseDateRangeForAdminQuery(cleaned);
+  if (r) return r;
+  if (!cleaned || !cleaned.replace(/\s/g, '').length) {
+    const m = getTaipeiMonthRangeStrings();
+    return { startDate: m.start, endDateExclusive: m.endExclusive, label: m.label + '（預設）' };
+  }
+  return null;
 }
 
 // ── 工具函式 ───────────────────────────────────────────────
@@ -808,7 +1198,8 @@ function buildDatePicker() {
   };
 }
 
-function buildPriceMessage() {
+function buildPriceMessage(userId) {
+  const tierName = getTierDisplayName(userId);
   function pr(items) {
     return items.map((item) => ({
       type: 'box',
@@ -823,6 +1214,22 @@ function buildPriceMessage() {
   function st(text) {
     return { type: 'text', text, weight: 'bold', size: 'sm', color: '#3D6B8C', margin: 'md' };
   }
+  const tierBanner = tierName && getCustomerTier(userId) !== 'standard'
+    ? [
+        {
+          type: 'box',
+          layout: 'vertical',
+          backgroundColor: '#E3F2FD',
+          paddingAll: 'md',
+          cornerRadius: 'md',
+          margin: 'sm',
+          contents: [
+            { type: 'text', text: '👤 您的帳號適用「' + tierName + '」專屬價', size: 'sm', color: '#1565C0', weight: 'bold', wrap: true },
+            { type: 'text', text: '以下金額已依層級換算；實際下單以畫面與匯款通知為準。', size: 'xs', color: '#444444', wrap: true, margin: 'sm' },
+          ],
+        },
+      ]
+    : [];
   return {
     type: 'flex',
     altText: '敘事空域 價目表',
@@ -836,21 +1243,22 @@ function buildPriceMessage() {
         paddingAll: 'md',
         spacing: 'sm',
         contents: [
+          ...tierBanner,
           { type: 'text', text: '📌 包場時段', weight: 'bold', size: 'md', color: '#222222' },
           { type: 'separator', margin: 'sm' },
           st('平日（週一～五）'),
-          ...pr([['早上 9:00~12:30', PRICES.fixed.weekday.morning], ['下午 13:30~17:00', PRICES.fixed.weekday.afternoon], ['晚上 18:00~21:30', PRICES.fixed.weekday.evening], ['全天包場（任選8小時）', PRICES.fixed.weekday.fullday]]),
+          ...pr([['早上 9:00~12:30', getPriceForUser(userId, 'fixed', 'morning', false)], ['下午 13:30~17:00', getPriceForUser(userId, 'fixed', 'afternoon', false)], ['晚上 18:00~21:30', getPriceForUser(userId, 'fixed', 'evening', false)], ['全天包場（任選8小時）', getPriceForUser(userId, 'fixed', 'fullday', false)]]),
           { type: 'separator', margin: 'md' },
           st('假日（週六日＋連假）'),
-          ...pr([['早上 9:00~12:30', PRICES.fixed.holiday.morning], ['下午 13:30~17:00', PRICES.fixed.holiday.afternoon], ['晚上 18:00~21:30', PRICES.fixed.holiday.evening], ['全天包場（任選8小時）', PRICES.fixed.holiday.fullday]]),
+          ...pr([['早上 9:00~12:30', getPriceForUser(userId, 'fixed', 'morning', true)], ['下午 13:30~17:00', getPriceForUser(userId, 'fixed', 'afternoon', true)], ['晚上 18:00~21:30', getPriceForUser(userId, 'fixed', 'evening', true)], ['全天包場（任選8小時）', getPriceForUser(userId, 'fixed', 'fullday', true)]]),
           { type: 'separator', margin: 'md' },
           { type: 'text', text: '⏰ 單一鐘點（每小時）', weight: 'bold', size: 'md', color: '#222222', margin: 'md' },
           { type: 'separator', margin: 'sm' },
           st('平日'),
-          ...pr([['早上', PRICES.hourly.weekday.morning], ['下午', PRICES.hourly.weekday.afternoon], ['晚上', PRICES.hourly.weekday.evening]]),
+          ...pr([['早上', getPriceForUser(userId, 'hourly', 'morning', false)], ['下午', getPriceForUser(userId, 'hourly', 'afternoon', false)], ['晚上', getPriceForUser(userId, 'hourly', 'evening', false)]]),
           { type: 'separator', margin: 'md' },
           st('假日'),
-          ...pr([['早上', PRICES.hourly.holiday.morning], ['下午', PRICES.hourly.holiday.afternoon], ['晚上', PRICES.hourly.holiday.evening]]),
+          ...pr([['早上', getPriceForUser(userId, 'hourly', 'morning', true)], ['下午', getPriceForUser(userId, 'hourly', 'afternoon', true)], ['晚上', getPriceForUser(userId, 'hourly', 'evening', true)]]),
           { type: 'separator', margin: 'md' },
           { type: 'text', text: '※ 24小時內請電話：' + CONTACT_PHONE + '\n※ 休息換場：12:30~13:30、17:00~18:00', size: 'xs', color: '#888888', wrap: true, margin: 'md' },
         ],
@@ -904,7 +1312,7 @@ function buildSlotTypePicker(date, holiday, bookedSlots) {
   };
 }
 
-function buildStartTimeFlex(date, bookedSlots, holiday, duration, isFullDay) {
+function buildStartTimeFlex(date, bookedSlots, holiday, duration, isFullDay, userId) {
   const dayLabel = holiday ? '假日' : '平日';
   const bookedRanges = getBookedRanges(bookedSlots);
   const available = [];
@@ -919,9 +1327,9 @@ function buildStartTimeFlex(date, bookedSlots, holiday, duration, isFullDay) {
   available.forEach((slot) => {
     const startStr = minToTime(slot.startMin);
     if (isFullDay) {
-      buttons.push({ type: 'button', style: 'primary', color: '#8B7355', height: 'sm', action: { type: 'postback', label: startStr + ' 開始(8H) ' + formatPrice(getPrice('fixed', 'fullday', holiday)), data: 'action=confirmHourlyNew&date=' + date + '&startMin=' + slot.startMin + '&duration=8&period=fullday&holiday=' + holiday + '&isFullDay=true', displayText: '全天 ' + startStr + ' 開始' } });
+      buttons.push({ type: 'button', style: 'primary', color: '#8B7355', height: 'sm', action: { type: 'postback', label: startStr + ' 開始(8H) ' + formatPrice(getPriceForUser(userId, 'fixed', 'fullday', holiday)), data: 'action=confirmHourlyNew&date=' + date + '&startMin=' + slot.startMin + '&duration=8&period=fullday&holiday=' + holiday + '&isFullDay=true', displayText: '全天 ' + startStr + ' 開始' } });
     } else {
-      buttons.push({ type: 'button', style: 'primary', color: '#5B8DB8', height: 'sm', action: { type: 'postback', label: startStr + ' 開始 ' + formatPrice(getPrice('hourly', slot.period, holiday)) + '/小時', data: 'action=pickDuration&date=' + date + '&startMin=' + slot.startMin + '&period=' + slot.period + '&holiday=' + holiday, displayText: '選擇 ' + startStr + ' 開始' } });
+      buttons.push({ type: 'button', style: 'primary', color: '#5B8DB8', height: 'sm', action: { type: 'postback', label: startStr + ' 開始 ' + formatPrice(getPriceForUser(userId, 'hourly', slot.period, holiday)) + '/小時', data: 'action=pickDuration&date=' + date + '&startMin=' + slot.startMin + '&period=' + slot.period + '&holiday=' + holiday, displayText: '選擇 ' + startStr + ' 開始' } });
     }
   });
   if (!isFullDay) {
@@ -947,10 +1355,10 @@ function buildStartTimeFlex(date, bookedSlots, holiday, duration, isFullDay) {
   };
 }
 
-function buildDurationFlex(date, startMin, period, holiday) {
+function buildDurationFlex(date, startMin, period, holiday, userId) {
   const dayLabel = holiday ? '假日' : '平日';
   const startStr = minToTime(startMin);
-  const p1 = getPrice('hourly', period, holiday);
+  const p1 = getPriceForUser(userId, 'hourly', period, holiday);
   const p2 = p1 * 2;
   const end1 = startMin + 60;
   const end2 = startMin + 120;
@@ -972,7 +1380,7 @@ function buildDurationFlex(date, startMin, period, holiday) {
   };
 }
 
-function buildFixedSlotFlex(date, available, holiday, bookedSlotLabels) {
+function buildFixedSlotFlex(date, available, holiday, bookedSlotLabels, userId) {
   const dayLabel = holiday ? '假日' : '平日';
   if (available.length === 0) return { type: 'text', text: '😢 ' + date + ' 區段包場已全部預約完畢。' };
   const bookedNote = (bookedSlotLabels && bookedSlotLabels.length)
@@ -983,7 +1391,7 @@ function buildFixedSlotFlex(date, available, holiday, bookedSlotLabels) {
     style: 'primary',
     color: '#5B8DB8',
     height: 'sm',
-    action: { type: 'postback', label: slot.label + '　' + formatPrice(getPrice('fixed', slot.period, holiday)), data: 'action=confirmSlot&date=' + date + '&slot=' + encodeURIComponent(slot.label) + '&type=包場時段&price=' + getPrice('fixed', slot.period, holiday) },
+    action: { type: 'postback', label: slot.label + '　' + formatPrice(getPriceForUser(userId, 'fixed', slot.period, holiday)), data: 'action=confirmSlot&date=' + date + '&slot=' + encodeURIComponent(slot.label) + '&type=包場時段&price=' + getPriceForUser(userId, 'fixed', slot.period, holiday) },
   }));
   return {
     type: 'flex',
@@ -1009,15 +1417,18 @@ function buildEventTypePicker() {
   };
 }
 
-function buildInfoConfirm(data) {
+function buildInfoConfirm(data, userId) {
   const slotDisplay = (data.selectedSlots && data.selectedSlots.length > 0) ? data.selectedSlots.join('、') : data.slot;
+  const tierName = getTierDisplayName(userId);
+  const feeLabel = tierName ? formatPrice(Number(data.price)) + '（' + tierName + ' 專屬價）' : formatPrice(Number(data.price));
+  const bodyRows = [row('姓名', data.name), row('日期', data.date), row('時段', slotDisplay), row('類型', data.slotType), row('舉辦類型', data.eventType), row('費用', feeLabel), row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'), row('備註', data.note || '無')];
   return {
     type: 'flex',
     altText: '請確認以下預約資訊',
     contents: {
       type: 'bubble',
       header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '📋 請確認預約資訊', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
-      body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [row('姓名', data.name), row('日期', data.date), row('時段', slotDisplay), row('類型', data.slotType), row('舉辦類型', data.eventType), row('費用', formatPrice(Number(data.price))), row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'), row('備註', data.note || '無')] },
+      body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: bodyRows },
       footer: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: [{ type: 'button', style: 'primary', color: '#4CAF82', action: { type: 'message', label: '✅ 確認預約', text: '確認預約' } }, { type: 'button', style: 'secondary', action: { type: 'message', label: '🔄 重新選擇', text: '重新選擇' } }] },
     },
   };
@@ -1368,39 +1779,29 @@ function aggregateFinanceStats(pages) {
 }
 
 async function handleFinancialReport(event, queryText) {
-  let startDate;
-  let endDateExclusive;
-  let label;
-
-  const monthMatch = queryText.match(/(\d{4})-(\d{2})/);
-  if (monthMatch) {
-    const y = parseInt(monthMatch[1], 10);
-    const mo = parseInt(monthMatch[2], 10);
-    startDate = y + '-' + String(mo).padStart(2, '0') + '-01';
-    let ny = y;
-    let nm = mo + 1;
-    if (nm > 12) {
-      nm = 1;
-      ny += 1;
-    }
-    endDateExclusive = ny + '-' + String(nm).padStart(2, '0') + '-01';
-    label = y + ' 年 ' + mo + ' 月（財務）';
-  } else if (queryText.includes('本週')) {
-    const r = getWeekRange(0);
-    startDate = r.start;
-    endDateExclusive = r.endExclusive;
-    label = '本週（財務）';
-  } else if (queryText.includes('下週')) {
-    const r = getWeekRange(1);
-    startDate = r.start;
-    endDateExclusive = r.endExclusive;
-    label = '下週（財務）';
-  } else {
+  const inner = stripLeadingQueryKeyword(queryText.trim());
+  const stripped = stripFinanceNoise(inner);
+  let range =
+    parseDateRangeForAdminQuery(stripped) ||
+    parseDateRangeForAdminQuery(inner) ||
+    null;
+  if (!range) {
     const m = getTaipeiMonthRangeStrings();
-    startDate = m.start;
-    endDateExclusive = m.endExclusive;
-    label = m.label + '（財務）';
+    range = {
+      startDate: m.start,
+      endDateExclusive: m.endExclusive,
+      label: m.label + '（財務）',
+    };
+  } else {
+    let lb = range.label
+      .replace(/（財務月）/g, '')
+      .replace(/（預設）/g, '')
+      .trim();
+    if (!/（財務）$/.test(lb)) lb = lb + '（財務）';
+    range = Object.assign({}, range, { label: lb });
   }
+
+  const { startDate, endDateExclusive, label } = range;
 
   const pages = await getBookingsByDateRange(startDate, endDateExclusive);
   const st = aggregateFinanceStats(pages);
@@ -1431,56 +1832,65 @@ async function handleGroupQuery(event, queryText) {
     return client.replyMessage(event.replyToken, { type: 'text', text: GROUP_QUERY_HELP });
   }
 
+  const inner = stripLeadingQueryKeyword(q);
+
   const isFinance =
+    q.includes('營收') ||
     q.includes('財務') ||
     q.includes('報表') ||
-    q.includes('收支') ||
-    /^查詢\s*財務/.test(q) ||
-    /^查詢\s*報表/.test(q);
-  if (isFinance && !q.includes('今天') && !q.includes('明天') && !q.match(/\d{4}-\d{2}-\d{2}/)) {
+    q.includes('收支');
+  if (isFinance) {
     return handleFinancialReport(event, q);
   }
 
-  let startDate;
-  let endDateExclusive;
-  let label;
+  let range = null;
   const today = getTwDate();
 
-  if (q.includes('今天') || q.includes('本日') || q.includes('今日')) {
-    startDate = today;
-    endDateExclusive = ymdAddDays(today, 1);
-    label = '今天';
-  } else if (q.includes('明天') || q.includes('明日')) {
-    startDate = getTwDate(1);
-    endDateExclusive = ymdAddDays(startDate, 1);
-    label = '明天';
-  } else if (q.includes('本週')) {
+  if (q === '預約名單' || q === '班表') {
     const r = getWeekRange(0);
-    startDate = r.start;
-    endDateExclusive = r.endExclusive;
-    label = '本週';
-  } else if (q.includes('下週')) {
+    range = { startDate: r.start, endDateExclusive: r.endExclusive, label: '本週' };
+  } else if (/^(今日|本日)行程$/.test(q)) {
+    range = { startDate: today, endDateExclusive: ymdAddDays(today, 1), label: '今天' };
+  } else if (/^明日行程$/.test(q)) {
+    const t = getTwDate(1);
+    range = { startDate: t, endDateExclusive: ymdAddDays(t, 1), label: '明天' };
+  } else if (/^本週(行程|預約|名單|班表)$/.test(q)) {
+    const r = getWeekRange(0);
+    range = { startDate: r.start, endDateExclusive: r.endExclusive, label: '本週' };
+  } else if (/^下週(行程|預約|名單|班表)$/.test(q)) {
     const r = getWeekRange(1);
-    startDate = r.start;
-    endDateExclusive = r.endExclusive;
-    label = '下週';
-  } else if (q.includes('本月') || q.includes('這個月') || q.includes('當月')) {
+    range = { startDate: r.start, endDateExclusive: r.endExclusive, label: '下週' };
+  } else if (/^本月(行程|預約|名單|班表)$/.test(q)) {
     const m = getTaipeiMonthRangeStrings();
-    startDate = m.start;
-    endDateExclusive = m.endExclusive;
-    label = m.label;
+    range = { startDate: m.start, endDateExclusive: m.endExclusive, label: m.label };
+  } else if (/^下個月(行程|預約|名單|班表)$/.test(q) || /^下月(行程|預約|名單|班表)$/.test(q)) {
+    const nx = getNextMonthRangeStrings();
+    range = {
+      startDate: nx.startDate,
+      endDateExclusive: nx.endDateExclusive,
+      label: '下個月',
+    };
   } else {
-    const match = q.match(/(\d{4}-\d{2}-\d{2})/);
-    if (match) {
-      startDate = match[1];
-      endDateExclusive = ymdAddDays(startDate, 1);
-      label = startDate;
-    } else {
-      return client.replyMessage(event.replyToken, { type: 'text', text: GROUP_QUERY_HELP });
-    }
+    range = parseDateRangeForAdminQueryLoose(inner);
   }
 
-  const pages = await getBookingsByDateRange(startDate, endDateExclusive);
+  if (!range) {
+    return client.replyMessage(event.replyToken, { type: 'text', text: GROUP_QUERY_HELP });
+  }
+
+  let { startDate, endDateExclusive, label } = range;
+  label = String(label || '').replace(/（預設）$/, '');
+
+  const wantUnpaid = /未付款|待付款|未繳款|欠款|欠費/.test(q);
+  const displayLabel = wantUnpaid ? label + '（僅未付款）' : label;
+
+  let pages = await getBookingsByDateRange(startDate, endDateExclusive);
+  if (wantUnpaid) {
+    pages = pages.filter((p) => {
+      const ps = p.properties['付款狀態']?.select?.name || '未付款';
+      return ps !== '已付款';
+    });
+  }
   const totalAmt = sumBookingAmounts(pages);
   const st = aggregateFinanceStats(pages);
   const rangeText =
@@ -1498,7 +1908,10 @@ async function handleGroupQuery(event, queryText) {
     '）';
 
   if (pages.length === 0) {
-    return client.replyMessage(event.replyToken, { type: 'text', text: '📅 ' + label + '\n' + rangeText + '\n\n目前無預約紀錄。' });
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: '📅 ' + displayLabel + '\n' + rangeText + '\n\n目前無預約紀錄。',
+    });
   }
 
   const lines = pages.map((p) => {
@@ -1511,7 +1924,7 @@ async function handleGroupQuery(event, queryText) {
     return '📌 ' + date + '\n時段：' + slot + '\n姓名：' + name + '\n類型：' + type + '\n金額：' + formatPrice(price) + '\n付款：' + pay;
   });
 
-  const body = '📅 ' + label + ' 預約清單\n' + rangeText + '\n\n' + lines.join('\n\n');
+  const body = '📅 ' + displayLabel + ' 預約清單\n' + rangeText + '\n\n' + lines.join('\n\n');
   const chunks = [];
   const maxLen = 4500;
   for (let i = 0; i < body.length; i += maxLen) {
@@ -1629,7 +2042,16 @@ async function handleEvent(event) {
         text.startsWith('查詢財務') ||
         text.startsWith('查詢報表') ||
         text.startsWith('本月財務') ||
-        text.startsWith('本週財務');
+        text.startsWith('本週財務') ||
+        /^(今日|本日)行程$/.test(text) ||
+        /^明日行程$/.test(text) ||
+        /^本週(行程|預約|名單|班表)$/.test(text) ||
+        /^下週(行程|預約|名單|班表)$/.test(text) ||
+        /^本月(行程|預約|名單|班表)$/.test(text) ||
+        /^下個月(行程|預約|名單|班表)$/.test(text) ||
+        /^下月(行程|預約|名單|班表)$/.test(text) ||
+        text === '預約名單' ||
+        text === '班表';
       if (staffCmd) {
         return handleGroupQuery(event, text);
       }
@@ -1639,6 +2061,12 @@ async function handleEvent(event) {
 
   if (event.source.type !== 'user') return Promise.resolve(null);
   const userId = event.source.userId;
+
+  try {
+    await resolveCustomerTier(userId);
+  } catch (e) {
+    console.error('[tier] resolveCustomerTier', e.message);
+  }
 
   if (event.type === 'follow') {
     return reply(event, { type: 'text', text: '歡迎加入敘事空域！🏛️\n\n輸入「立即預約」開始預約\n輸入「價目表」查看費用\n輸入「我的預約」查看預約紀錄' });
@@ -1650,7 +2078,7 @@ async function handleEvent(event) {
 
     if (text === '取消' || text === '重新開始') { clearSession(userId); return reply(event, buildMainMenu()); }
     if (text === '立即預約' || text === '預約') { clearSession(userId); setSession(userId, 'pickDate', {}); return reply(event, buildDatePicker()); }
-    if (text === '價目表') return reply(event, buildPriceMessage());
+    if (text === '價目表') return reply(event, buildPriceMessage(userId));
     if (text === '選單' || text === 'menu') return reply(event, buildMainMenu());
 
     // 我的預約
@@ -1763,7 +2191,7 @@ async function handleEvent(event) {
     // 備註輸入
     if (step === 'inputNote') {
       setSession(userId, 'confirm', { note: text === '略過' ? '' : text });
-      return reply(event, buildInfoConfirm(getData(userId)));
+      return reply(event, buildInfoConfirm(getData(userId), userId));
     }
 
     // 確認預約
@@ -1853,14 +2281,14 @@ async function handleEvent(event) {
         const step = getStep(userId);
         if (step === 'pickRescheduleSlot') {
           setSession(userId, 'confirmReschedule', {});
-          return reply(event, buildFixedSlotFlex(date, available, holiday, booked));
+          return reply(event, buildFixedSlotFlex(date, available, holiday, booked, userId));
         }
         setSession(userId, 'pickFixed', { date, holiday });
-        return reply(event, buildFixedSlotFlex(date, available, holiday, booked));
+        return reply(event, buildFixedSlotFlex(date, available, holiday, booked, userId));
       }
       if (type === 'hourly') {
         setSession(userId, 'pickStartTime', { date, holiday });
-        return reply(event, buildStartTimeFlex(date, booked, holiday, 1, false));
+        return reply(event, buildStartTimeFlex(date, booked, holiday, 1, false, userId));
       }
     }
 
@@ -1870,7 +2298,7 @@ async function handleEvent(event) {
       const isFullDay = params.get('isFullDay') === 'true';
       const sd = getData(userId);
       const booked = await getBookedSlots(date, sd.reschedulePageId || undefined);
-      return reply(event, buildStartTimeFlex(date, booked, holiday, 8, isFullDay));
+      return reply(event, buildStartTimeFlex(date, booked, holiday, 8, isFullDay, userId));
     }
 
     if (action === 'executeReschedule') {
@@ -1885,12 +2313,16 @@ async function handleEvent(event) {
       const date = params.get('date');
       const slot = decodeURIComponent(params.get('slot'));
       const slotType = params.get('type');
-      const price = params.get('price');
       const data = getData(userId);
+      const holiday = Boolean(data.holiday);
+      const fixedSlot = FIXED_SLOTS.find((s) => s.label === slot);
+      const price = fixedSlot
+        ? getPriceForUser(userId, 'fixed', fixedSlot.period, holiday)
+        : Math.round(Number(params.get('price') || 0));
 
       if (data.reschedulePageId) {
         const oldPrice = Number(data.rescheduleOldPrice || 0);
-        const newPrice = Number(params.get('price') || 0) || oldPrice;
+        const newPrice = fixedSlot ? price : (Number(params.get('price') || 0) || oldPrice);
         const newDate = data.rescheduleNewDate || date;
         const bookedForNew = await getBookedSlots(newDate, data.reschedulePageId);
         const br = getBookedRanges(bookedForNew);
@@ -1925,7 +2357,7 @@ async function handleEvent(event) {
       const period = params.get('period');
       const holiday = params.get('holiday') === 'true';
       setSession(userId, 'pickDuration', { date, startMin, period, holiday });
-      return reply(event, buildDurationFlex(date, startMin, period, holiday));
+      return reply(event, buildDurationFlex(date, startMin, period, holiday, userId));
     }
 
     if (action === 'confirmHourlyNew') {
@@ -1939,7 +2371,7 @@ async function handleEvent(event) {
       const startStr = minToTime(startMin), endStr = minToTime(endMin);
       let total = 0, slotLabel = '', occupiedSlots = [];
       if (isFullDay) {
-        total = getPrice('fixed', 'fullday', holiday);
+        total = getPriceForUser(userId, 'fixed', 'fullday', holiday);
         slotLabel = '全天 ' + startStr + '~' + endStr;
         occupiedSlots = [slotLabel];
       } else {
@@ -1949,7 +2381,7 @@ async function handleEvent(event) {
           const oSlot = minToTime(bs) + '~' + minToTime(bs + 60);
           occupiedSlots.push(oSlot);
           const matched = HOURLY_SLOTS.find(s => s.label === oSlot);
-          total += matched ? getPrice('hourly', matched.period, holiday) : getPrice('hourly', period, holiday);
+          total += matched ? getPriceForUser(userId, 'hourly', matched.period, holiday) : getPriceForUser(userId, 'hourly', period, holiday);
         }
       }
       const sessionData = getData(userId);
@@ -1985,7 +2417,7 @@ async function handleEvent(event) {
       const available = FIXED_SLOTS.filter(s => { const r = extractTimeRange(s.label); return r && !isConflict(r.startMin, r.endMin, bookedRanges); });
       if (available.length === 0) return reply(event, { type: 'text', text: '😢 包場時段已無空檔，請選擇其他日期。' });
       setSession(userId, 'pickFixed', { date, holiday });
-      return reply(event, buildFixedSlotFlex(date, available, holiday, booked));
+      return reply(event, buildFixedSlotFlex(date, available, holiday, booked, userId));
     }
 
     // 選擇某筆預約 -> 顯示取消或改期選單
