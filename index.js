@@ -2316,27 +2316,94 @@ async function handleEvent(event) {
     const text = event.message.text.trim();
     const step = getStep(userId);
 
+    /** 與 LINE 圖文選單「預約取消/改期」等文案一致（含斜線與無連接詞） */
+    const manageBookingKeywords = [
+      '我要更改或取消預約',
+      '更改或取消預約',
+      '預約取消或改期',
+      '預約取消/改期',
+      '預約取消／改期',
+      '預約取消改期',
+      '取消或改期',
+      '預約管理',
+      '取消預約',
+      '改期',
+      '退訂',
+      '不來了',
+      '換日期',
+      '改時間',
+      '更改預約',
+      '返回預約管理',
+    ];
+
+    function isPriceIntentMessage(t) {
+      return (
+        t === '價目表' ||
+        t === '價目指南' ||
+        t === '查看價目' ||
+        t === '查看費用' ||
+        t === '費用' ||
+        t === '報價' ||
+        (t.includes('價目') && t.length <= 20)
+      );
+    }
+
+    function isStartBookingIntentMessage(t) {
+      return (
+        t === '立即預約' ||
+        t === '預約' ||
+        t === '我要預約' ||
+        t === '開始預約' ||
+        /立即預約/.test(t)
+      );
+    }
+
+    async function replyManageBookingsOrEmpty() {
+      const pages = await getUserBookings(userId);
+      if (pages.length === 0) {
+        return reply(event, {
+          type: 'text',
+          text: '查詢不到您的未來預約記錄。\n\n如有問題請直接聯繫：\n📞 ' + CONTACT_PHONE,
+        });
+      }
+      return reply(event, [
+        { type: 'text', text: '以下是您的預約記錄，請選擇要操作的場次：' },
+        buildMyBookings(pages),
+      ]);
+    }
+
     if (text === '取消' || text === '重新開始') { clearSession(userId); return reply(event, buildMainMenu()); }
-    if (
-      text === '立即預約' ||
-      text === '預約' ||
-      text === '我要預約' ||
-      text === '開始預約' ||
-      /立即預約/.test(text)
-    ) {
+
+    // 卡在「確認預約」卡片時：優先處理（勿先套全域「立即預約」以免清空尚未確認的資料）
+    if (step === 'confirm') {
+      if (text === '確認預約') return await processBooking(event, userId);
+      if (text === '重新選擇') {
+        clearSession(userId);
+        return reply(event, { type: 'text', text: '已取消，請輸入「立即預約」重新開始。' });
+      }
+      if (manageBookingKeywords.some((k) => text === k || text.includes(k))) return await replyManageBookingsOrEmpty();
+      if (isPriceIntentMessage(text)) return reply(event, buildPriceMessage(userId));
+      if (isStartBookingIntentMessage(text)) {
+        clearSession(userId);
+        setSession(userId, 'pickDate', {});
+        return reply(event, buildDatePicker());
+      }
+      const faqConfirmEarly = guestFaqIfHit(text);
+      if (faqConfirmEarly) {
+        return reply(event, {
+          type: 'text',
+          text: faqConfirmEarly + '\n\n確認資料無誤後，請點選「✅ 確認預約」。',
+        });
+      }
+      return reply(event, { type: 'text', text: '請點選「✅ 確認預約」或「🔄 重新選擇」' });
+    }
+
+    if (isStartBookingIntentMessage(text)) {
       clearSession(userId);
       setSession(userId, 'pickDate', {});
       return reply(event, buildDatePicker());
     }
-    if (
-      text === '價目表' ||
-      text === '價目指南' ||
-      text === '查看價目' ||
-      text === '查看費用' ||
-      text === '費用' ||
-      text === '報價' ||
-      (text.includes('價目') && text.length <= 20)
-    ) {
+    if (isPriceIntentMessage(text)) {
       return reply(event, buildPriceMessage(userId));
     }
     if (text === '選單' || text === 'menu') return reply(event, buildMainMenu());
@@ -2347,11 +2414,6 @@ async function handleEvent(event) {
       if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有未來的預約記錄。\n\n輸入「立即預約」開始預約。' });
       return reply(event, buildMyBookings(pages));
     }
-
-    // 更改/取消預約 - 圖文選單觸發
-    const manageTriggers = ['我要更改或取消預約', '更改或取消預約', '取消預約', '改期', '更改預約', '取消', '退訂', '不來了', '換日期', '改時間'];
-    const cancelOnlyTriggers = ['取消預約', '取消', '退訂', '不來了'];
-    const rescheduleOnlyTriggers = ['改期', '換日期', '改時間', '更改預約'];
 
     // 取消確認中 - 只接受「確認取消」或「返回預約管理」
     if (step === 'confirmCancel') {
@@ -2370,31 +2432,7 @@ async function handleEvent(event) {
     }
 
     // 圖文選單「更改/取消預約」觸發，或文字關鍵字
-    const manageKeywords = [
-      '我要更改或取消預約',
-      '更改或取消預約',
-      '預約取消或改期',
-      '取消或改期',
-      '預約管理',
-      '取消預約',
-      '改期',
-      '退訂',
-      '不來了',
-      '換日期',
-      '改時間',
-      '更改預約',
-      '返回預約管理',
-    ];
-    if (manageKeywords.some(k => text === k || text.includes(k))) {
-      const pages = await getUserBookings(userId);
-      if (pages.length === 0) {
-        return reply(event, { type: 'text', text: '查詢不到您的未來預約記錄。\n\n如有問題請直接聯繫：\n📞 ' + CONTACT_PHONE });
-      }
-      return reply(event, [
-        { type: 'text', text: '以下是您的預約記錄，請選擇要操作的場次：' },
-        buildMyBookings(pages),
-      ]);
-    }
+    if (manageBookingKeywords.some((k) => text === k || text.includes(k))) return await replyManageBookingsOrEmpty();
 
     // 輸入驗證碼
     if (step === 'inputCode') {
@@ -2507,15 +2545,6 @@ async function handleEvent(event) {
       }
       setSession(userId, 'confirm', { note: text === '略過' ? '' : text });
       return reply(event, buildInfoConfirm(getData(userId), userId));
-    }
-
-    // 確認預約
-    if (step === 'confirm') {
-      if (text === '確認預約') return await processBooking(event, userId);
-      if (text === '重新選擇') { clearSession(userId); return reply(event, { type: 'text', text: '已取消，請輸入「立即預約」重新開始。' }); }
-      const faqHitCf = guestFaqIfHit(text);
-      if (faqHitCf) return reply(event, { type: 'text', text: faqHitCf + '\n\n確認資料無誤後，請點選「✅ 確認預約」。' });
-      return reply(event, { type: 'text', text: '請點選「✅ 確認預約」或「🔄 重新選擇」' });
     }
 
     // 確認取消預約
