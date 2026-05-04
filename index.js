@@ -762,9 +762,10 @@ async function notifyGroup(booking, action) {
   };
   try {
     await client.pushMessage(NOTIFY_GROUP_ID, message);
-    console.log('[通知] 群組推播成功');
+    console.log('[行政群組] 推播成功');
   } catch (e) {
-    console.error('[通知] 群組推播失敗:', e.message, e.response && e.response.data ? JSON.stringify(e.response.data) : '');
+    const errDetail = e.response && e.response.data ? JSON.stringify(e.response.data) : e.message;
+    console.error('[行政群組] 推播失敗 status=' + (e.response && e.response.status) + ' detail=' + errDetail);
   }
 }
 
