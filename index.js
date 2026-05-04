@@ -8,6 +8,7 @@
  * - 相關環境變數：CRON_SECRET、NAV_GOOGLE_MAPS_URI、NAV_APPLE_MAPS_URI（可選）、PAYMENT_GRACE_DAYS、NOTION_UNPAID_ULTIMATUM_PROPERTY（見程式內常數區）
  * - 客戶層級：NOTION_CUSTOMER_DATABASE_ID、客戶層級、可選臨時價格倍率；另有 GLOBAL_PRICE_MULTIPLIER、蓁愛表 JSON（見程式內註解）
  * - 客戶電話：名冊庫建議「電話」欄（類型：電話）；NOTION_CUSTOMER_PHONE_PROPERTY（預設 聯絡電話）。曾留號會寫回名冊，下次預約不重複詢問
+ * - 場地會勘→Notion 日曆（可選）：新建獨立資料庫，設 NOTION_SITE_VISIT_DATABASE_ID；預設欄位為「標題」(title)、「日期」(date，寫入送出當日供日曆檢視)、「會勘內容」(rich_text)。欄名可改用 NOTION_SITE_VISIT_*_PROP 覆寫
  * - 活動／課程押金：VENUE_ACTIVITY_DEPOSIT_NT（預設 3000）；講座／其他不收；蓁愛講師免押金
  */
 const express = require('express');
@@ -44,6 +45,13 @@ const NOTION_CUSTOMER_TIER_PROPERTY = (process.env.NOTION_CUSTOMER_TIER_PROPERTY
 const NOTION_CUSTOMER_PRICE_ADJUST_PROPERTY = (process.env.NOTION_CUSTOMER_PRICE_ADJUST_PROPERTY || '臨時價格倍率').trim();
 /** 客戶名冊內「電話」屬性名稱（Notion 類型須為 phone_number）；未建欄位則僅沿用預約庫歷史電話 */
 const NOTION_CUSTOMER_PHONE_PROPERTY = (process.env.NOTION_CUSTOMER_PHONE_PROPERTY || '聯絡電話').trim();
+/** 可選：場地會勘專用資料庫（勿與預約庫混用）；設後會新增一列，「日期」預設為送出當日，可在 Notion 改成實際會勘日 */
+const NOTION_SITE_VISIT_DATABASE_ID = (process.env.NOTION_SITE_VISIT_DATABASE_ID || '').trim();
+const NOTION_SITE_VISIT_TITLE_PROP = (process.env.NOTION_SITE_VISIT_TITLE_PROP || '標題').trim();
+const NOTION_SITE_VISIT_DATE_PROP = (process.env.NOTION_SITE_VISIT_DATE_PROP || '日期').trim();
+const NOTION_SITE_VISIT_BODY_PROP = (process.env.NOTION_SITE_VISIT_BODY_PROP || '會勘內容').trim();
+/** 可選：rich_text；若資料庫無此欄請留空環境變數 */
+const NOTION_SITE_VISIT_LINE_NAME_PROP = (process.env.NOTION_SITE_VISIT_LINE_NAME_PROP || '').trim();
 /** 可選：全體客戶在層級價之後再乘上此倍率（臨時調漲/折讓），例如 1.02；未設或 1 則不變 */
 const GLOBAL_PRICE_MULTIPLIER = (() => {
   const g = Number(process.env.GLOBAL_PRICE_MULTIPLIER);
@@ -1875,7 +1883,7 @@ async function notifyGroupSiteVisitRequest(userId, displayName, bodyText) {
     appendBotLog('[場地會勘] 行政群組未設定，略過推播');
     if (Date.now() - lastAlertNoGroupMs > 3600000) {
       lastAlertNoGroupMs = Date.now();
-      await sendOwnerAlert('場地會勘無法推播', '請設定 LINE_NOTIFY_GROUP_ID。\n客人 User ID：' + maskId(userId));
+      await sendOwnerAlert('場地會勘無法推播', '請設定 LINE_NOTIFY_GROUP_ID。');
     }
     return false;
   }
@@ -1884,7 +1892,6 @@ async function notifyGroupSiteVisitRequest(userId, displayName, bodyText) {
     '🏛️【場地會勘】客人提交\n' +
     '══════════════════\n' +
     '顯示名稱：' + (displayName || '—') + '\n' +
-    'LINE User ID：\n' + userId + '\n' +
     '══════════════════\n' +
     body +
     '\n══════════════════\n' +
@@ -1895,6 +1902,45 @@ async function notifyGroupSiteVisitRequest(userId, displayName, bodyText) {
   }
   appendBotLog('[場地會勘] 已轉發行政群 user=' + maskId(userId) + ' len=' + body.length);
   return ok;
+}
+
+function truncateForNotionRichText(s, maxLen) {
+  const t = String(s || '');
+  if (t.length <= maxLen) return t;
+  return t.slice(0, Math.max(0, maxLen - 1)) + '…';
+}
+
+async function appendSiteVisitToNotion(displayName, bodyText) {
+  if (!NOTION_SITE_VISIT_DATABASE_ID) return false;
+  try {
+    const dateStr = formatTaipeiYmd(new Date());
+    const dn = String(displayName || '').trim();
+    const titleText = truncateForNotionRichText('[場勘]' + (dn ? ' ' + dn : ' LINE'), 180);
+    const body = truncateForNotionRichText(bodyText || '', 1900);
+    const props = {};
+    props[NOTION_SITE_VISIT_TITLE_PROP] = {
+      title: [{ text: { content: titleText || '[場勘]' } }],
+    };
+    props[NOTION_SITE_VISIT_DATE_PROP] = { date: { start: dateStr } };
+    props[NOTION_SITE_VISIT_BODY_PROP] = {
+      rich_text: [{ text: { content: body || '—' } }],
+    };
+    if (NOTION_SITE_VISIT_LINE_NAME_PROP) {
+      props[NOTION_SITE_VISIT_LINE_NAME_PROP] = {
+        rich_text: [{ text: { content: truncateForNotionRichText(dn || '—', 180) } }],
+      };
+    }
+    await notion.pages.create({
+      parent: { database_id: NOTION_SITE_VISIT_DATABASE_ID },
+      properties: props,
+    });
+    appendBotLog('[場地會勘] Notion 已新增列');
+    return true;
+  } catch (e) {
+    console.error('[Notion] appendSiteVisitToNotion:', e.message);
+    appendBotLog('[場地會勘] Notion 寫入失敗 ' + String(e.message || e));
+    return false;
+  }
 }
 
 async function notifyGroup(booking, action) {
@@ -3094,6 +3140,7 @@ async function handleEvent(event) {
       }
       const displayNameSv = await getLineDisplayName(userId);
       await notifyGroupSiteVisitRequest(userId, displayNameSv, trimmedSv);
+      await appendSiteVisitToNotion(displayNameSv, trimmedSv);
       clearSession(userId);
       return reply(event, { type: 'text', text: SITE_VISIT_SUBMITTED_REPLY });
     }
