@@ -580,8 +580,8 @@ const CANCEL_POLICY_TEXT = '📋 預約取消政策\n\n' +
   '• 7天內改期：視同取消，訂金不退\n' +
   '• 颱風/地震等天災（依台北市停班停課公告）：可免費改期或全額退訂金';
 
-function buildMyBookings(pages, action) {
-  if (pages.length === 0) return { type: 'text', text: action === 'cancel' ? '目前沒有可取消的預約。' : '目前沒有可改期的預約。' };
+function buildMyBookings(pages) {
+  if (pages.length === 0) return { type: 'text', text: '目前查無未來的預約記錄。\n\n如有問題請聯繫：📞 0939-607867' };
   const items = pages.map(function(p) {
     const date = (p.properties['預約日期']?.date?.start || '').split('T')[0];
     const slot = p.properties['預約時段']?.select?.name || '';
@@ -589,70 +589,112 @@ function buildMyBookings(pages, action) {
     const slotType = p.properties['預約類型']?.select?.name || '';
     const payStatus = p.properties['付款狀態']?.select?.name || '未付款';
     const isPaid = payStatus === '已付款';
-
-    let policyRow, btnColor, btnLabel, btnData;
-
-    if (action === 'cancel') {
-      const pol = getCancelPolicy(date, price, isPaid);
-      const bgColor = pol.blocked ? '#FADBD8' : '#FFF3CD';
-      const txtColor = pol.blocked ? '#922B21' : '#856404';
-      policyRow = { type: 'box', layout: 'vertical', backgroundColor: bgColor, cornerRadius: 'md', paddingAll: 'sm', margin: 'md',
-        contents: [
-          { type: 'text', text: (isPaid ? '已付款 | ' : '未付款 | ') + '距活動 ' + pol.days + ' 天', size: 'xs', weight: 'bold', color: txtColor },
-          { type: 'text', text: pol.refundNote, size: 'xs', color: txtColor, wrap: true },
-        ]
-      };
-      if (pol.blocked) {
-        btnColor = '#888888';
-        btnLabel = '⛔ 無法取消，請聯繫主理人';
-        btnData = 'action=blocked';
-      } else {
-        btnColor = '#C0392B';
-        btnLabel = '❌ 確認取消此預約';
-        btnData = 'requestCancel&pageId=' + p.id + '&date=' + date + '&slot=' + encodeURIComponent(slot) + '&price=' + price + '&isPaid=' + isPaid;
-      }
-    } else {
-      const pol = getReschedulePolicy(date, isPaid);
-      const bgColor = pol.blocked ? '#FADBD8' : (pol.surcharge > 0 ? '#FFF3CD' : '#E8F4FD');
-      const txtColor = pol.blocked ? '#922B21' : (pol.surcharge > 0 ? '#856404' : '#1A5276');
-      policyRow = { type: 'box', layout: 'vertical', backgroundColor: bgColor, cornerRadius: 'md', paddingAll: 'sm', margin: 'md',
-        contents: [
-          { type: 'text', text: (isPaid ? '已付款 | ' : '未付款 | ') + '距活動 ' + pol.days + ' 天', size: 'xs', weight: 'bold', color: txtColor },
-          { type: 'text', text: pol.feeNote, size: 'xs', color: txtColor, wrap: true },
-        ]
-      };
-      if (pol.blocked) {
-        btnColor = '#888888';
-        btnLabel = '⛔ 無法改期，請聯繫主理人';
-        btnData = 'action=blocked';
-      } else {
-        btnColor = '#2980B9';
-        btnLabel = '🔄 確認改期此預約';
-        btnData = 'requestReschedule&pageId=' + p.id + '&date=' + date + '&slot=' + encodeURIComponent(slot) + '&price=' + price + '&isPaid=' + isPaid + '&surcharge=' + pol.surcharge;
-      }
-    }
+    const days = calcDaysUntil(date);
 
     return {
       type: 'bubble',
-      header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'sm', contents: [{ type: 'text', text: date + '　' + slotType, weight: 'bold', color: '#FFFFFF', size: 'sm' }] },
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'sm',
+        contents: [
+          { type: 'text', text: date, weight: 'bold', color: '#FFFFFF', size: 'md' },
+          { type: 'text', text: slotType + '　距活動 ' + days + ' 天', color: '#FFFFFFCC', size: 'xs' },
+        ],
+      },
       body: {
         type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
         contents: [
           row('時段', slot),
           row('費用', formatPrice(price)),
-          policyRow,
+          row('付款', isPaid ? '✅ 已付款' : '⏳ 未付款'),
         ],
       },
       footer: {
         type: 'box', layout: 'vertical', paddingAll: 'md',
-        contents: [{ type: 'button', style: 'primary', color: btnColor, height: 'sm', action: { type: 'postback', label: btnLabel, data: 'action=' + btnData, displayText: btnLabel } }],
+        contents: [{
+          type: 'button', style: 'primary', color: '#3D6B8C', height: 'sm',
+          action: {
+            type: 'postback',
+            label: '選擇此預約',
+            data: 'action=selectBooking&pageId=' + p.id + '&date=' + date + '&slot=' + encodeURIComponent(slot) + '&price=' + price + '&isPaid=' + isPaid,
+            displayText: '選擇 ' + date + ' ' + slot,
+          },
+        }],
       },
     };
   });
 
   return {
-    type: 'flex', altText: action === 'cancel' ? '請選擇要取消的預約' : '請選擇要改期的預約',
+    type: 'flex', altText: '請選擇您的預約',
     contents: { type: 'carousel', contents: items },
+  };
+}
+
+function buildCancelOrReschedulePicker(pageId, date, slot, price, isPaid) {
+  const pol = getCancelPolicy(date, Number(price), isPaid === 'true');
+  const polR = getReschedulePolicy(date, isPaid === 'true');
+  const encodedSlot = encodeURIComponent(slot);
+
+  const cancelBtn = pol.blocked
+    ? { type: 'button', style: 'secondary', color: '#AAAAAA', action: { type: 'postback', label: '⛔ 無法取消（請電話聯繫）', data: 'action=blocked' } }
+    : { type: 'button', style: 'primary', color: '#C0392B', action: { type: 'postback', label: '❌ 取消預約', data: 'action=showCancelConfirm&pageId=' + pageId + '&date=' + date + '&slot=' + encodedSlot + '&price=' + price + '&isPaid=' + isPaid, displayText: '取消預約' } };
+
+  const rescheduleBtn = polR.blocked
+    ? { type: 'button', style: 'secondary', color: '#AAAAAA', action: { type: 'postback', label: '⛔ 無法改期（請電話聯繫）', data: 'action=blocked' } }
+    : { type: 'button', style: 'primary', color: '#2980B9', action: { type: 'postback', label: '🔄 改期', data: 'action=startReschedule&pageId=' + pageId + '&date=' + date + '&slot=' + encodedSlot + '&price=' + price + '&isPaid=' + isPaid, displayText: '申請改期' } };
+
+  return {
+    type: 'flex', altText: '請選擇操作',
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md',
+        contents: [
+          { type: 'text', text: '📋 預約管理', weight: 'bold', color: '#FFFFFF', size: 'lg' },
+          { type: 'text', text: date + '　' + slot, color: '#FFFFFFCC', size: 'sm', wrap: true },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
+        contents: [
+          row('費用', formatPrice(Number(price))),
+          row('付款', isPaid === 'true' ? '✅ 已付款' : '⏳ 未付款'),
+          { type: 'separator', margin: 'md' },
+          { type: 'text', text: '請選擇您要執行的操作：', size: 'sm', color: '#555555', margin: 'md' },
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
+        contents: [cancelBtn, rescheduleBtn],
+      },
+    },
+  };
+}
+
+function buildCancelConfirmCard(date, slot, price, isPaid, polNote) {
+  return {
+    type: 'flex', altText: '確認取消預約',
+    contents: {
+      type: 'bubble',
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#C0392B', paddingAll: 'md', contents: [{ type: 'text', text: '⚠️ 確認取消預約', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+      body: {
+        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
+        contents: [
+          row('日期', date),
+          row('時段', slot),
+          row('費用', formatPrice(Number(price))),
+          { type: 'box', layout: 'vertical', backgroundColor: '#FFF3CD', cornerRadius: 'md', paddingAll: 'sm', margin: 'md',
+            contents: [{ type: 'text', text: polNote, size: 'xs', color: '#856404', wrap: true }] },
+          { type: 'text', text: '確認後將無法復原，請謹慎操作。', size: 'xs', color: '#888888', wrap: true, margin: 'md' },
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
+        contents: [
+          { type: 'button', style: 'primary', color: '#C0392B', action: { type: 'message', label: '✅ 確認取消', text: '確認取消' } },
+          { type: 'button', style: 'secondary', action: { type: 'message', label: '← 返回', text: '我要更改或取消預約' } },
+        ],
+      },
+    },
   };
 }
 
@@ -759,12 +801,7 @@ async function handleEvent(event) {
     if (text === '我的預約') {
       const pages = await getUserBookings(userId);
       if (pages.length === 0) return reply(event, { type: 'text', text: '目前沒有未來的預約記錄。\n\n輸入「立即預約」開始預約。' });
-      const lines = pages.map(p => {
-        const date = (p.properties['預約日期']?.date?.start || '').split('T')[0];
-        const slot = p.properties['預約時段']?.select?.name || '';
-        return '📌 ' + date + '　' + slot;
-      });
-      return reply(event, { type: 'text', text: '您的預約紀錄：\n\n' + lines.join('\n') });
+      return reply(event, buildMyBookings(pages));
     }
 
     // 更改/取消預約 - 圖文選單觸發
@@ -772,46 +809,16 @@ async function handleEvent(event) {
     const cancelOnlyTriggers = ['取消預約', '取消', '退訂', '不來了'];
     const rescheduleOnlyTriggers = ['改期', '換日期', '改時間', '更改預約'];
 
-    if (text === '我要更改或取消預約' || text === '更改或取消預約') {
-      // 圖文選單觸發：先問要取消還是改期
-      return reply(event, {
-        type: 'flex', altText: '請選擇操作',
-        contents: {
-          type: 'bubble',
-          header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '📋 預約管理', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
-          body: {
-            type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'md',
-            contents: [
-              { type: 'text', text: '請選擇您要執行的操作：', size: 'sm', color: '#555555' },
-              { type: 'button', style: 'secondary', color: '#C0392B',
-                action: { type: 'message', label: '❌ 取消預約', text: '取消預約' } },
-              { type: 'button', style: 'primary', color: '#2980B9',
-                action: { type: 'message', label: '🔄 改期申請', text: '改期' } },
-            ],
-          },
-        },
-      });
-    }
-
-    if (cancelOnlyTriggers.some(k => text.includes(k)) && !text.includes('改期')) {
+    // 圖文選單「更改/取消預約」觸發，或文字關鍵字
+    const manageKeywords = ['我要更改或取消預約', '更改或取消預約', '取消預約', '取消', '改期', '退訂', '不來了', '換日期', '改時間', '更改預約'];
+    if (manageKeywords.some(k => text === k || text.includes(k))) {
       const pages = await getUserBookings(userId);
       if (pages.length === 0) {
-        return reply(event, { type: 'text', text: '查詢不到您的預約紀錄。\n\n如有問題請直接聯繫：\n📞 0939-607867' });
+        return reply(event, { type: 'text', text: '查詢不到您的未來預約記錄。\n\n如有問題請直接聯繫：\n📞 0939-607867' });
       }
       return reply(event, [
-        { type: 'text', text: CANCEL_POLICY_TEXT },
-        buildMyBookings(pages, 'cancel'),
-      ]);
-    }
-
-    if (rescheduleOnlyTriggers.some(k => text.includes(k))) {
-      const pages = await getUserBookings(userId);
-      if (pages.length === 0) {
-        return reply(event, { type: 'text', text: '查詢不到您的預約紀錄。\n\n如有問題請直接聯繫：\n📞 0939-607867' });
-      }
-      return reply(event, [
-        { type: 'text', text: CANCEL_POLICY_TEXT },
-        buildMyBookings(pages, 'reschedule'),
+        { type: 'text', text: '以下是您的預約記錄，請選擇要操作的場次：' },
+        buildMyBookings(pages),
       ]);
     }
 
@@ -887,6 +894,30 @@ async function handleEvent(event) {
       if (text === '確認預約') return await processBooking(event, userId);
       if (text === '重新選擇') { clearSession(userId); return reply(event, { type: 'text', text: '已取消，請輸入「立即預約」重新開始。' }); }
       return reply(event, { type: 'text', text: '請點選「✅ 確認預約」或「🔄 重新選擇」' });
+    }
+
+    // 確認取消預約
+    if (step === 'confirmCancel' && text === '確認取消') {
+      const d = getData(userId);
+      const pol = getCancelPolicy(d.cancelDate || '', d.cancelPrice || 0, d.cancelIsPaid === 'true');
+      const ok = await cancelBooking(d.cancelPageId);
+      clearSession(userId);
+      if (ok) {
+        const isPaidBool = d.cancelIsPaid === 'true';
+        const groupNote = (isPaidBool ? '已付款 | ' : '未付款 | ') + pol.refundNote;
+        await notifyGroup({ name: '', date: d.cancelDate || '', slot: d.cancelSlot || '', phone: '', extraNote: groupNote }, 'cancel');
+        let msg = '✅ 預約已成功取消\n══════════════════\n📅 ' + d.cancelDate + '\n🕘 ' + d.cancelSlot + '\n══════════════════\n';
+        if (isPaidBool) {
+          msg += '退款說明：' + pol.refundNote;
+          if (pol.refundAmount > 0) msg += '\n退款將於 5~7 個工作天內匯還。';
+        } else {
+          msg += '尚未付款，取消無需退款。';
+        }
+        msg += '\n\n如需重新預約請輸入「立即預約」\n如有疑問請聯繫：📞 0939-607867';
+        return reply(event, { type: 'text', text: msg });
+      } else {
+        return reply(event, { type: 'text', text: '⚠️ 取消失敗，請聯繫主理人：0939-607867' });
+      }
     }
 
     return reply(event, buildMainMenu());
@@ -1061,6 +1092,55 @@ async function handleEvent(event) {
       if (available.length === 0) return reply(event, { type: 'text', text: '😢 包場時段已無空檔，請選擇其他日期。' });
       setSession(userId, 'pickFixed', { date, holiday });
       return reply(event, buildFixedSlotFlex(date, available, holiday));
+    }
+
+    // 選擇某筆預約 -> 顯示取消或改期選單
+    if (action === 'selectBooking') {
+      const pageId = params.get('pageId');
+      const date = params.get('date');
+      const slot = decodeURIComponent(params.get('slot') || '');
+      const price = params.get('price');
+      const isPaid = params.get('isPaid');
+      return reply(event, [
+        { type: 'text', text: CANCEL_POLICY_TEXT },
+        buildCancelOrReschedulePicker(pageId, date, slot, price, isPaid),
+      ]);
+    }
+
+    // 顯示取消確認卡片
+    if (action === 'showCancelConfirm') {
+      const pageId = params.get('pageId');
+      const date = params.get('date');
+      const slot = decodeURIComponent(params.get('slot') || '');
+      const price = Number(params.get('price') || 0);
+      const isPaid = params.get('isPaid') === 'true';
+      const pol = getCancelPolicy(date, price, isPaid);
+      // 存入 session 供確認時使用
+      setSession(userId, 'confirmCancel', {
+        cancelPageId: pageId, cancelDate: date, cancelSlot: slot,
+        cancelPrice: price, cancelIsPaid: String(isPaid),
+      });
+      return reply(event, buildCancelConfirmCard(date, slot, price, isPaid, pol.refundNote));
+    }
+
+    // 開始改期流程 - 直接進入日期選擇
+    if (action === 'startReschedule') {
+      const pageId = params.get('pageId');
+      const date = params.get('date');
+      const slot = decodeURIComponent(params.get('slot') || '');
+      const price = Number(params.get('price') || 0);
+      const isPaid = params.get('isPaid') === 'true';
+      const surcharge = isPaid && calcDaysUntil(date) < 14 && calcDaysUntil(date) >= 7 ? 20 : 0;
+      const lineName = await getLineDisplayName(userId);
+      setSession(userId, 'pickRescheduleDate', {
+        reschedulePageId: pageId, rescheduleOldDate: date, rescheduleOldSlot: slot,
+        rescheduleOldPrice: price, rescheduleIsPaid: String(isPaid),
+        rescheduleSurcharge: surcharge, rescheduleName: lineName,
+      });
+      return reply(event, [
+        { type: 'text', text: '請選擇新的預約日期：' },
+        buildDatePicker(),
+      ]);
     }
 
     // 取消預約請求
