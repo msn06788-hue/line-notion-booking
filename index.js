@@ -7,6 +7,7 @@
  *   /cron/remind-tomorrow — 同 evening-2130（相容舊網址）
  * - 相關環境變數：CRON_SECRET、NAV_GOOGLE_MAPS_URI、NAV_APPLE_MAPS_URI（可選）、PAYMENT_GRACE_DAYS、NOTION_UNPAID_ULTIMATUM_PROPERTY（見程式內常數區）
  * - 客戶層級：NOTION_CUSTOMER_DATABASE_ID、客戶層級、可選臨時價格倍率；另有 GLOBAL_PRICE_MULTIPLIER、蓁愛表 JSON（見程式內註解）
+ * - 客戶電話：名冊庫建議「電話」欄（類型：電話）；NOTION_CUSTOMER_PHONE_PROPERTY（預設 聯絡電話）。曾留號會寫回名冊，下次預約不重複詢問
  * - 活動／課程押金：VENUE_ACTIVITY_DEPOSIT_NT（預設 3000）；講座／其他不收；蓁愛講師免押金
  */
 const express = require('express');
@@ -35,12 +36,14 @@ const lineConfig = {
 const client = new line.Client(lineConfig);
 const notion = new Client({ auth: process.env.NOTION_INTEGRATION_TOKEN });
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;
-/** 客戶名冊（與預約庫分開）：僅供後台維護 LINE User ID → 層級，Bot 只讀 */
+/** 客戶名冊（與預約庫分開）：維護 LINE User ID → 層級；若設電話欄位則 Bot 會讀寫聯絡電話以利下次預約 */
 const NOTION_CUSTOMER_DATABASE_ID = (process.env.NOTION_CUSTOMER_DATABASE_ID || '').trim();
 const NOTION_CUSTOMER_LINE_PROPERTY = (process.env.NOTION_CUSTOMER_LINE_PROPERTY || 'LINE ID').trim();
 const NOTION_CUSTOMER_TIER_PROPERTY = (process.env.NOTION_CUSTOMER_TIER_PROPERTY || '客戶層級').trim();
 /** 名冊庫內可選 number 欄位：臨時針對該客戶的價格倍率（如 1.05），與層級無關、在層級計價後再乘上 */
 const NOTION_CUSTOMER_PRICE_ADJUST_PROPERTY = (process.env.NOTION_CUSTOMER_PRICE_ADJUST_PROPERTY || '臨時價格倍率').trim();
+/** 客戶名冊內「電話」屬性名稱（Notion 類型須為 phone_number）；未建欄位則僅沿用預約庫歷史電話 */
+const NOTION_CUSTOMER_PHONE_PROPERTY = (process.env.NOTION_CUSTOMER_PHONE_PROPERTY || '聯絡電話').trim();
 /** 可選：全體客戶在層級價之後再乘上此倍率（臨時調漲/折讓），例如 1.02；未設或 1 則不變 */
 const GLOBAL_PRICE_MULTIPLIER = (() => {
   const g = Number(process.env.GLOBAL_PRICE_MULTIPLIER);
@@ -530,8 +533,10 @@ const GUEST_FAQ_RULES = [
   {
     match: (q) =>
       q.includes('電子菸') ||
+      q.includes('電子煙') ||
       q.includes('電子烟') ||
       q.includes('加熱菸') ||
+      q.includes('加熱煙') ||
       q.includes('加熱烟') ||
       q.toLowerCase().includes('iqos') ||
       q.toLowerCase().includes('vape'),
@@ -541,17 +546,21 @@ const GUEST_FAQ_RULES = [
   {
     match: (q) =>
       q.includes('抽菸') ||
+      q.includes('抽煙') ||
       q.includes('抽烟') ||
       q.includes('吸菸') ||
+      q.includes('吸煙') ||
       q.includes('吸烟') ||
       q.includes('禁煙') ||
       q.includes('禁烟') ||
       (q.includes('香菸') &&
         (q.includes('可以') || q.includes('能否') || q.includes('嗎') || q.includes('室內') || q.includes('陽台'))) ||
-      (q.includes('抽') && q.includes('菸')) ||
-      (q.includes('抽') && q.includes('烟')),
+      (q.includes('香煙') &&
+        (q.includes('可以') || q.includes('能否') || q.includes('嗎') || q.includes('室內') || q.includes('陽台'))) ||
+      (q.includes('抽') && (q.includes('菸') || q.includes('煙') || q.includes('烟'))) ||
+      (q.includes('吸') && (q.includes('菸') || q.includes('煙') || q.includes('烟'))),
     reply:
-      '全室禁煙（含電子菸、加熱菸）。如需吸菸請至一樓戶外；請勿在室內、走廊、梯間使用。',
+      '全室禁煙（含電子菸、加熱菸）。抽菸或抽煙皆請至一樓戶外；請勿在室內、走廊、梯間使用。',
   },
   {
     match: (q) =>
@@ -1159,6 +1168,60 @@ async function getLatestPhoneFromPastBookings(userId) {
   return null;
 }
 
+/** 將電話寫入客戶名冊（該 LINE User 須已存在於名冊中一筆資料） */
+async function saveCustomerPhoneToNotion(userId, phoneRaw) {
+  if (!NOTION_CUSTOMER_DATABASE_ID || !NOTION_CUSTOMER_PHONE_PROPERTY || !userId) return false;
+  const cleaned = String(phoneRaw || '').replace(/[-\s]/g, '');
+  if (!/^\d{8,10}$/.test(cleaned)) return false;
+  try {
+    const res = await notion.databases.query({
+      database_id: NOTION_CUSTOMER_DATABASE_ID,
+      filter: { property: NOTION_CUSTOMER_LINE_PROPERTY, rich_text: { equals: userId } },
+      page_size: 1,
+    });
+    if (!res.results.length) {
+      appendBotLog('[客戶電話] 名冊無此 LINE ID，無法回寫電話（請於名冊新增該客人列）：' + maskId(userId));
+      return false;
+    }
+    await notion.pages.update({
+      page_id: res.results[0].id,
+      properties: {
+        [NOTION_CUSTOMER_PHONE_PROPERTY]: { phone_number: cleaned },
+      },
+    });
+    return true;
+  } catch (e) {
+    console.error('[Notion] saveCustomerPhoneToNotion:', e.message);
+    return false;
+  }
+}
+
+/** 記住電話：寫回名冊（若有列）並更新本機層級快取，下次 getKnownPhoneForLineUser 可直接沿用 */
+async function persistKnownPhoneForUser(userId, phoneRaw) {
+  if (!userId || phoneRaw == null) return;
+  const trimmed = String(phoneRaw).trim();
+  const cleaned = trimmed.replace(/[-\s]/g, '');
+  if (!/^\d{8,10}$/.test(cleaned)) return;
+  await saveCustomerPhoneToNotion(userId, trimmed);
+  const hit = customerTierCache.get(userId) || {};
+  customerTierCache.set(userId, {
+    code: hit.code != null ? hit.code : normalizeTierCode(LINE_ID_TO_TIER[String(userId)] || null),
+    priceAdjust: hit.priceAdjust != null ? hit.priceAdjust : null,
+    phone: trimmed,
+    done: true,
+    at: Date.now(),
+  });
+}
+
+/** 名冊電話 → 預約庫最近電話；請先 resolveCustomerTier 或於函式內呼叫 */
+async function getKnownPhoneForLineUser(userId) {
+  if (!userId) return null;
+  await resolveCustomerTier(userId);
+  const hit = customerTierCache.get(userId);
+  if (hit && hit.phone && String(hit.phone).trim()) return String(hit.phone).trim();
+  return await getLatestPhoneFromPastBookings(userId);
+}
+
 function mapNotionTierNameToCode(name) {
   if (!name || typeof name !== 'string') return null;
   const s = name.trim();
@@ -1201,7 +1264,15 @@ async function fetchCustomerRowFromNotion(userId) {
     if (adj && adj.type === 'number' && adj.number != null) {
       priceAdjust = Number(adj.number);
     }
-    return { code, priceAdjust };
+    let cachedPhone = null;
+    if (NOTION_CUSTOMER_PHONE_PROPERTY) {
+      const phProp = props[NOTION_CUSTOMER_PHONE_PROPERTY];
+      if (phProp && phProp.type === 'phone_number' && phProp.phone_number) {
+        const p = String(phProp.phone_number).trim();
+        if (p) cachedPhone = p;
+      }
+    }
+    return { code, priceAdjust, cachedPhone };
   } catch (e) {
     console.error('[Notion] fetchCustomerRowFromNotion:', e.message);
   }
@@ -1211,16 +1282,18 @@ async function fetchCustomerRowFromNotion(userId) {
 async function resolveCustomerTier(userId) {
   if (!userId) return;
   const now = Date.now();
-  const hit = customerTierCache.get(userId);
-  if (hit && hit.done && now - hit.at < CUSTOMER_TIER_CACHE_MS) return;
+  const prevHit = customerTierCache.get(userId);
+  if (prevHit && prevHit.done && now - prevHit.at < CUSTOMER_TIER_CACHE_MS) return;
 
   let code = null;
   let priceAdjust = null;
+  let phoneFromNotion = null;
   if (NOTION_CUSTOMER_DATABASE_ID) {
     const row = await fetchCustomerRowFromNotion(userId);
     if (row) {
       code = row.code;
       priceAdjust = row.priceAdjust;
+      phoneFromNotion = row.cachedPhone || null;
     }
   }
   const allowEnvFallback = !(CUSTOMER_TIER_STRICT_NOTION && NOTION_CUSTOMER_DATABASE_ID);
@@ -1228,7 +1301,13 @@ async function resolveCustomerTier(userId) {
     code = LINE_ID_TO_TIER[String(userId)];
   }
   code = normalizeTierCode(typeof code === 'string' && code.length ? code : null);
-  customerTierCache.set(userId, { code, priceAdjust, done: true, at: now });
+  let phone =
+    phoneFromNotion && String(phoneFromNotion).trim()
+      ? String(phoneFromNotion).trim()
+      : prevHit && prevHit.phone && String(prevHit.phone).trim()
+        ? String(prevHit.phone).trim()
+        : null;
+  customerTierCache.set(userId, { code, priceAdjust, phone, done: true, at: now });
 }
 
 async function getBookingsByDateRange(startDate, endDateExclusive) {
@@ -1710,6 +1789,112 @@ function buildAdminPlainSummary(booking, action) {
     return lines.join('\n');
   }
   return '通知';
+}
+
+/** 場地會勘：關鍵字觸發引導文案（不需另建資料庫，客人回覆後轉發行政群） */
+const SITE_VISIT_GUIDE_REPLY =
+  '您好，如需安排「場地會勘」，請複製下方格式填寫後，將內容「一次傳送」給我們：\n\n' +
+  '【場地會勘】\n' +
+  '姓名：\n' +
+  '電話：\n' +
+  '會勘時間（可填 1～3 個方便時段）：\n' +
+  '1.\n' +
+  '2.\n' +
+  '3.\n\n' +
+  '※ 請盡量寫明日期與大概時段（例：6/15（日）14:00–16:00）。\n' +
+  '※ 送出後我們將儘快與您聯繫，謝謝您！';
+
+const SITE_VISIT_SUBMITTED_REPLY =
+  '✅ 已收到您的場地會勘申請，我們將儘快與您聯繫。\n\n如需預約正式場次，請輸入「立即預約」。';
+
+function normalizeSiteVisitQuery(raw) {
+  return String(raw || '').trim().replace(/\s+/g, '');
+}
+
+function matchesSiteVisitIntent(text) {
+  const q = normalizeSiteVisitQuery(text);
+  const low = q.toLowerCase();
+  if (q.length < 2) return false;
+
+  const keys = [
+    '會勘',
+    '場勘',
+    '約會勘',
+    '申請會勘',
+    '預約會勘',
+    '會勘時間',
+    '會勘預約',
+    '看場地',
+    '現場看場地',
+    '去現場看',
+    '想先看場地',
+    '租用前看場地',
+    '租之前想看',
+    '簽約前看',
+    '參觀場地',
+    '預約參觀',
+    '場地參觀',
+    '現場參觀',
+    '場地導覽',
+    '導覽預約',
+    '勘查',
+    '現場勘查',
+    '場地勘查',
+    '評估場地',
+    '勘查時間',
+    '可以看場地嗎',
+    '能不能來看',
+    '可否約看',
+    '想約時間看',
+    '踩點',
+    '先踩點',
+    '想踩個點',
+    '實地看',
+    '親自看',
+    '線下看',
+    '看空間',
+    '看環境',
+  ];
+  for (let i = 0; i < keys.length; i++) {
+    if (q.includes(keys[i])) return true;
+  }
+
+  const en = ['sitevisit', 'venuetour', 'inspect', 'walkthrough', 'preview'];
+  for (let i = 0; i < en.length; i++) {
+    if (low.includes(en[i])) return true;
+  }
+  if (low.includes('site') && low.includes('visit')) return true;
+
+  if (q.includes('看') && (q.includes('場地') || q.includes('空間') || q.includes('現場') || q.includes('環境'))) return true;
+
+  return false;
+}
+
+async function notifyGroupSiteVisitRequest(userId, displayName, bodyText) {
+  if (!NOTIFY_GROUP_ID) {
+    appendBotLog('[場地會勘] 行政群組未設定，略過推播');
+    if (Date.now() - lastAlertNoGroupMs > 3600000) {
+      lastAlertNoGroupMs = Date.now();
+      await sendOwnerAlert('場地會勘無法推播', '請設定 LINE_NOTIFY_GROUP_ID。\n客人 User ID：' + maskId(userId));
+    }
+    return false;
+  }
+  const body = String(bodyText || '').trim() || '（無內文）';
+  const msg =
+    '🏛️【場地會勘】客人提交\n' +
+    '══════════════════\n' +
+    '顯示名稱：' + (displayName || '—') + '\n' +
+    'LINE User ID：\n' + userId + '\n' +
+    '══════════════════\n' +
+    body +
+    '\n══════════════════\n' +
+    '（請將以上內容轉發簡訊或回電與客人聯繫）';
+  const ok = await linePushLogged(NOTIFY_GROUP_ID, { type: 'text', text: msg }, '行政群組·場地會勘');
+  if (!ok) {
+    await sendOwnerAlert('場地會勘推播失敗', 'target=' + maskId(NOTIFY_GROUP_ID) + '\n' + body.slice(0, 900));
+  }
+  appendBotLog('[場地會勘] 已轉發行政群 user=' + maskId(userId) + ' len=' + body.length);
+  return ok;
 }
 
 async function notifyGroup(booking, action) {
@@ -2720,6 +2905,7 @@ async function processBooking(event, userId) {
     price: totalDue,
   });
   const ok = await createBooking(enriched);
+  if (ok && enriched.phone) await persistKnownPhoneForUser(userId, enriched.phone);
   clearSession(userId);
   if (ok) {
     await notifyGroup(Object.assign({}, enriched, { adminCtx: { action: 'new' } }), 'new');
@@ -2898,6 +3084,26 @@ async function handleEvent(event) {
 
     if (text === '取消' || text === '重新開始') { clearSession(userId); return reply(event, buildMainMenu()); }
 
+    if (step === 'siteVisitAwaiting') {
+      const trimmedSv = String(text || '').trim();
+      if (!trimmedSv) {
+        return reply(event, {
+          type: 'text',
+          text: '請貼上您的會勘資料（姓名、電話、時段）。若需重新查看格式，請再輸入「會勘」。',
+        });
+      }
+      const displayNameSv = await getLineDisplayName(userId);
+      await notifyGroupSiteVisitRequest(userId, displayNameSv, trimmedSv);
+      clearSession(userId);
+      return reply(event, { type: 'text', text: SITE_VISIT_SUBMITTED_REPLY });
+    }
+
+    if (step !== 'inputCode' && matchesSiteVisitIntent(text)) {
+      clearSession(userId);
+      setSession(userId, 'siteVisitAwaiting', {});
+      return reply(event, { type: 'text', text: SITE_VISIT_GUIDE_REPLY });
+    }
+
     // 卡在「確認預約」卡片時：優先處理（勿先套全域「立即預約」以免清空尚未確認的資料）
     if (step === 'confirm') {
       if (text === '確認預約') return await processBooking(event, userId);
@@ -3011,6 +3217,7 @@ async function handleEvent(event) {
     if (step === 'confirmPhone') {
       const cleaned = text.replace(/[-\s]/g, '');
       if (/^\d{8,10}$/.test(cleaned)) {
+        await persistKnownPhoneForUser(userId, text);
         setSession(userId, 'inputHeadcount', { phone: text });
         return reply(event, { type: 'text', text: '已更新電話。\n\n請問這次預約幾位？（請直接輸入數字，例如：15）' });
       }
@@ -3040,6 +3247,7 @@ async function handleEvent(event) {
         if (faqHitIp) return reply(event, { type: 'text', text: faqHitIp + '\n\n⚠️ 請輸入正確的電話號碼（8~10碼），例如：0939607867' });
         return reply(event, { type: 'text', text: '⚠️ 請輸入正確的電話號碼（8~10碼），例如：0939607867' });
       }
+      await persistKnownPhoneForUser(userId, text);
       setSession(userId, 'inputHeadcount', { phone: text });
       return reply(event, { type: 'text', text: '請問這次預約幾位？（請直接輸入數字，例如：15）' });
     }
@@ -3147,6 +3355,7 @@ async function handleEvent(event) {
       if (getStep(userId) !== 'confirmPhone') return reply(event, { type: 'text', text: '請先完成預約步驟，或輸入「立即預約」重新開始。' });
       const cd = getData(userId);
       if (!cd.cachedPhone) return reply(event, { type: 'text', text: '資料已過期，請輸入「立即預約」重新開始。' });
+      await persistKnownPhoneForUser(userId, cd.cachedPhone);
       setSession(userId, 'inputHeadcount', { phone: cd.cachedPhone });
       return reply(event, { type: 'text', text: '電話已確認。\n\n請問這次預約幾位？（請直接輸入數字，例如：15）' });
     }
@@ -3268,7 +3477,7 @@ async function handleEvent(event) {
     if (action === 'pickEventType') {
       const eventType = decodeURIComponent(params.get('eventType'));
       const pdata = getData(userId);
-      const cachedPhone = await getLatestPhoneFromPastBookings(userId);
+      const cachedPhone = await getKnownPhoneForLineUser(userId);
       if (cachedPhone) {
         setSession(userId, 'confirmPhone', { eventType, cachedPhone });
         return reply(event, buildPhoneConfirmFlex(cachedPhone, pdata.name || ''));
