@@ -767,11 +767,33 @@ async function handleEvent(event) {
       return reply(event, { type: 'text', text: '您的預約紀錄：\n\n' + lines.join('\n') });
     }
 
-    // 取消預約關鍵字觸發
-    const cancelKeywords = ['取消預約', '取消', '退訂', '退預約', '取消場地', '不來了'];
-    const rescheduleKeywords = ['改期', '換日期', '改時間', '換時段', '改預約', '更改預約'];
+    // 更改/取消預約 - 圖文選單觸發
+    const manageTriggers = ['我要更改或取消預約', '更改或取消預約', '取消預約', '改期', '更改預約', '取消', '退訂', '不來了', '換日期', '改時間'];
+    const cancelOnlyTriggers = ['取消預約', '取消', '退訂', '不來了'];
+    const rescheduleOnlyTriggers = ['改期', '換日期', '改時間', '更改預約'];
 
-    if (cancelKeywords.some(k => text.includes(k))) {
+    if (text === '我要更改或取消預約' || text === '更改或取消預約') {
+      // 圖文選單觸發：先問要取消還是改期
+      return reply(event, {
+        type: 'flex', altText: '請選擇操作',
+        contents: {
+          type: 'bubble',
+          header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '📋 預約管理', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'md',
+            contents: [
+              { type: 'text', text: '請選擇您要執行的操作：', size: 'sm', color: '#555555' },
+              { type: 'button', style: 'secondary', color: '#C0392B',
+                action: { type: 'message', label: '❌ 取消預約', text: '取消預約' } },
+              { type: 'button', style: 'primary', color: '#2980B9',
+                action: { type: 'message', label: '🔄 改期申請', text: '改期' } },
+            ],
+          },
+        },
+      });
+    }
+
+    if (cancelOnlyTriggers.some(k => text.includes(k)) && !text.includes('改期')) {
       const pages = await getUserBookings(userId);
       if (pages.length === 0) {
         return reply(event, { type: 'text', text: '查詢不到您的預約紀錄。\n\n如有問題請直接聯繫：\n📞 0939-607867' });
@@ -782,7 +804,7 @@ async function handleEvent(event) {
       ]);
     }
 
-    if (rescheduleKeywords.some(k => text.includes(k))) {
+    if (rescheduleOnlyTriggers.some(k => text.includes(k))) {
       const pages = await getUserBookings(userId);
       if (pages.length === 0) {
         return reply(event, { type: 'text', text: '查詢不到您的預約紀錄。\n\n如有問題請直接聯繫：\n📞 0939-607867' });
@@ -1138,7 +1160,27 @@ async function processBooking(event, userId) {
   clearSession(userId);
   if (ok) {
     await notifyGroup(data, 'new');
-    return reply(event, buildSuccessMessages(data));
+    const navMsg = {
+      type: 'flex', altText: '📍 敘事空域 導航',
+      contents: {
+        type: 'bubble',
+        header: { type: 'box', layout: 'vertical', backgroundColor: '#27AE60', paddingAll: 'md', contents: [{ type: 'text', text: '📍 前往敘事空域', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+        body: {
+          type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'md',
+          contents: [
+            { type: 'text', text: '點下方按鈕開啟 Google 導航，我們在那裡等您 🏛️', size: 'sm', color: '#555555', wrap: true },
+          ],
+        },
+        footer: {
+          type: 'box', layout: 'vertical', paddingAll: 'md',
+          contents: [{
+            type: 'button', style: 'primary', color: '#27AE60',
+            action: { type: 'uri', label: '🗺️ 開啟 Google 導航', uri: 'https://share.google/scBlKep6NLkHHNwsQ' },
+          }],
+        },
+      },
+    };
+    return reply(event, [...buildSuccessMessages(data), navMsg]);
   } else {
     return reply(event, { type: 'text', text: '⚠️ 系統錯誤，請直接電話預約：0939-607867' });
   }
