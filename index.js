@@ -8,7 +8,7 @@
  * - 相關環境變數：CRON_SECRET、NAV_GOOGLE_MAPS_URI、NAV_APPLE_MAPS_URI（可選）、PAYMENT_GRACE_DAYS、NOTION_UNPAID_ULTIMATUM_PROPERTY（見程式內常數區）
  * - 客戶層級：NOTION_CUSTOMER_DATABASE_ID、客戶層級、可選臨時價格倍率；另有 GLOBAL_PRICE_MULTIPLIER、蓁愛表 JSON（見程式內註解）
  * - 客戶電話：名冊庫建議「電話」欄（類型：電話）；NOTION_CUSTOMER_PHONE_PROPERTY（預設 聯絡電話）。曾留號會寫回名冊，下次預約不重複詢問
- * - 場地會勘→Notion 日曆（可選）：新建獨立資料庫，設 NOTION_SITE_VISIT_DATABASE_ID；預設欄位為「標題」(title)、「日期」(date)、「會勘內容」(rich_text)。姓名採 LINE 顯示名；電話與可解析之會勘時間皆必填始成立。欄名可改用 NOTION_SITE_VISIT_*_PROP 覆寫
+ * - 場地會勘→Notion 日曆（可選）：新建獨立資料庫，設 NOTION_SITE_VISIT_DATABASE_ID；預設欄位為「標題」(title)、「日期」(date)、「會勘內容」(rich_text)。姓名採 LINE 顯示名；電話與可解析之會勘時間皆必填始成立。欄名可改用 NOTION_SITE_VISIT_*_PROP 覆寫。「我要預約」與勘場／會勘意圖並存時先詢問「會勘場地／預約場地」
  * - 活動／課程押金：VENUE_ACTIVITY_DEPOSIT_NT（預設 3000）；講座／其他不收；蓁愛講師免押金
  */
 const express = require('express');
@@ -1822,6 +1822,15 @@ const SITE_VISIT_REJECT_NO_PHONE =
 const SITE_VISIT_REJECT_NO_TIME =
   '⚠️ 場地會勘尚未成立：請務必寫明「會勘時間」（須含月／日與時段，例：6/9下午三點），並與電話一起「一次傳送」。';
 
+const BOOKING_VS_SITE_VISIT_PROMPT =
+  '請問您這次是想：\n\n' +
+  '① 會勘場地（先看場地，尚未正式訂場）\n' +
+  '② 預約場地（正式選日期／時段訂場）\n\n' +
+  '請直接回覆「會勘場地」或「預約場地」，謝謝。';
+
+const BOOKING_VS_SITE_VISIT_BOGUS =
+  '請回覆「會勘場地」或「預約場地」其中一種即可。\n若要取消請輸入「取消」。';
+
 function normalizeSiteVisitQuery(raw) {
   return String(raw || '').trim().replace(/\s+/g, '');
 }
@@ -1834,6 +1843,9 @@ function matchesSiteVisitIntent(text) {
   const keys = [
     '會勘',
     '場勘',
+    '勘場',
+    '約勘場',
+    '預約勘場',
     '約會勘',
     '申請會勘',
     '預約會勘',
@@ -1883,6 +1895,41 @@ function matchesSiteVisitIntent(text) {
   if (q.includes('看') && (q.includes('場地') || q.includes('空間') || q.includes('現場') || q.includes('環境'))) return true;
 
   return false;
+}
+
+/** 「預約／我要預約」與「勘場／會勘」意圖並存時多問一句分流 */
+function impliesSiteInspectionCueForDisambiguation(t) {
+  const flat = normalizeSiteVisitQuery(t);
+  if (matchesSiteVisitIntent(t)) return true;
+  return flat.includes('勘場') || flat.includes('約勘場');
+}
+
+function impliesFormalBookingCueForDisambiguation(t) {
+  const q = String(t || '').trim();
+  if (!q) return false;
+  const flat = normalizeSiteVisitQuery(q);
+  return (
+    /^我要預約/.test(q) ||
+    q === '預約' ||
+    q === '開始預約' ||
+    /立即預約/.test(q) ||
+    flat.includes('預約勘場')
+  );
+}
+
+function needsBookingVsSiteVisitClarification(text, step) {
+  if (
+    step === 'inputCode' ||
+    step === 'siteVisitAwaiting' ||
+    step === 'bookingVsSiteVisitChoose' ||
+    step === 'confirm'
+  ) {
+    return false;
+  }
+  return (
+    impliesFormalBookingCueForDisambiguation(text) &&
+    impliesSiteInspectionCueForDisambiguation(text)
+  );
 }
 
 /** 自會勘回覆文中抽取台灣手機（09 + 8 碼）；無則 null */
@@ -3288,6 +3335,7 @@ async function handleEvent(event) {
         t === '預約' ||
         t === '我要預約' ||
         t === '開始預約' ||
+        t === '預約場地' ||
         /立即預約/.test(t)
       );
     }
@@ -3307,6 +3355,21 @@ async function handleEvent(event) {
     }
 
     if (text === '取消' || text === '重新開始') { clearSession(userId); return reply(event, buildMainMenu()); }
+
+    if (step === 'bookingVsSiteVisitChoose') {
+      const qPick = text.trim();
+      if (qPick === '會勘場地' || qPick === '①' || /^會勘場地/.test(qPick)) {
+        clearSession(userId);
+        setSession(userId, 'siteVisitAwaiting', {});
+        return reply(event, { type: 'text', text: SITE_VISIT_GUIDE_REPLY });
+      }
+      if (qPick === '預約場地' || qPick === '②' || /^預約場地/.test(qPick)) {
+        clearSession(userId);
+        setSession(userId, 'pickDate', {});
+        return reply(event, buildDatePicker());
+      }
+      return reply(event, { type: 'text', text: BOOKING_VS_SITE_VISIT_BOGUS });
+    }
 
     if (step === 'siteVisitAwaiting') {
       const trimmedSv = String(text || '').trim();
@@ -3330,6 +3393,12 @@ async function handleEvent(event) {
       await persistKnownPhoneForUser(userId, phoneSv);
       clearSession(userId);
       return reply(event, { type: 'text', text: SITE_VISIT_SUBMITTED_REPLY });
+    }
+
+    if (step !== 'inputCode' && needsBookingVsSiteVisitClarification(text, step)) {
+      clearSession(userId);
+      setSession(userId, 'bookingVsSiteVisitChoose', {});
+      return reply(event, { type: 'text', text: BOOKING_VS_SITE_VISIT_PROMPT });
     }
 
     if (step !== 'inputCode' && matchesSiteVisitIntent(text)) {
