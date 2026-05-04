@@ -16,7 +16,6 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { matchGuestFaqReply } = require('./guest-faq');
 
 let Sentry = null;
 try {
@@ -488,6 +487,531 @@ function getBookingTotalDue(baseVenueCharge, eventType, userId) {
 }
 
 const VENUE_RULE_NO_SMOKING_ZH = '全室禁煙（含電子菸、加熱菸）；吸菸請至一樓戶外。';
+
+// ── 客人常見問答（內嵌於 index.js：Vercel 等作用於單檔時無須另送 guest-faq.js）────────
+/**
+ * 客人常見問題：僅在訊息命中關鍵字時回覆（不主動播送全文）。
+ * 文案一律為繁體中文（台灣用字）。
+ */
+
+function normalizeQuery(raw) {
+  return String(raw || '')
+    .trim()
+    .replace(/\s+/g, '');
+}
+
+/**
+ * @param {string} raw - 使用者輸入原文
+ * @returns {string|null}
+ */
+function matchGuestFaqReply(raw) {
+  const q = normalizeQuery(raw);
+  if (q.length < 2) return null;
+
+  for (const rule of GUEST_FAQ_RULES) {
+    if (rule.match(q)) return rule.reply;
+  }
+  return null;
+}
+
+/** @typedef {{ match: (q: string) => boolean, reply: string }} FaqRule */
+
+/** @type {FaqRule[]} 順序愈前面愈優先（較特定的規則放前面） */
+const GUEST_FAQ_RULES = [
+  {
+    match: (q) =>
+      q.includes('導盲犬') ||
+      q.includes('工作犬') ||
+      q.includes('視障') ||
+      q.includes('聽障犬'),
+    reply:
+      '導盲犬及合格工作犬不適用一般寵物規範（不必全程置於推車／提袋內）。請於行前告知，以利動線安排。',
+  },
+  {
+    match: (q) =>
+      q.includes('電子菸') ||
+      q.includes('電子烟') ||
+      q.includes('加熱菸') ||
+      q.includes('加熱烟') ||
+      q.toLowerCase().includes('iqos') ||
+      q.toLowerCase().includes('vape'),
+    reply:
+      '電子菸、加熱菸與一般香菸相同：室內全面禁止；請至一樓戶外指定區域，勿在走廊、梯間等非戶外開放空間使用。',
+  },
+  {
+    match: (q) =>
+      q.includes('抽菸') ||
+      q.includes('抽烟') ||
+      q.includes('吸菸') ||
+      q.includes('吸烟') ||
+      q.includes('禁煙') ||
+      q.includes('禁烟') ||
+      (q.includes('香菸') &&
+        (q.includes('可以') || q.includes('能否') || q.includes('嗎') || q.includes('室內') || q.includes('陽台'))) ||
+      (q.includes('抽') && q.includes('菸')) ||
+      (q.includes('抽') && q.includes('烟')),
+    reply:
+      '全室禁煙（含電子菸、加熱菸）。如需吸菸請至一樓戶外；請勿在室內、走廊、梯間使用。',
+  },
+  {
+    match: (q) =>
+      q.includes('寵物') ||
+      q.includes('毛小孩') ||
+      q.includes('狗狗') ||
+      q.includes('貓咪') ||
+      q.includes('帶狗') ||
+      q.includes('帶貓') ||
+      (q.includes('狗') && (q.includes('可以') || q.includes('能否') || q.includes('帶'))) ||
+      (q.includes('貓') && (q.includes('可以') || q.includes('能否') || q.includes('帶'))),
+    reply:
+      '可攜帶寵物；惟寵物須全程待在寵物推車或寵物袋／籠內，禁止落地。若吠叫、便溺或影響他人，請將寵物帶離場地。',
+  },
+  {
+    match: (q) =>
+      (q.includes('外送') || q.includes('外賣') || q.includes('便當') || q.includes('foodpanda') || q.includes('uber')) &&
+      (q.includes('可以') || q.includes('能否') || q.includes('嗎') || q.includes('叫')),
+    reply:
+      '可以叫外送或外購餐點；用餐後請依規定做好垃圾分類。本場另有外食／套餐菜單可選，需提早預約，歡迎行前詢問。',
+  },
+  {
+    match: (q) =>
+      q.includes('外送員') ||
+      q.includes('送餐') ||
+      (q.includes('外送') && q.includes('進來')) ||
+      (q.includes('外送') && q.includes('上樓')),
+    reply:
+      '可以。外送員可依您指示將餐點送至指定位置（桌面等），請注意動線與其他人安全。',
+  },
+  {
+    match: (q) =>
+      q.includes('垃圾') &&
+      (q.includes('自己') || q.includes('帶走') || q.includes('丟') || q.includes('分類') || q.includes('清潔費')),
+    reply:
+      '一般垃圾由場地協助處理並請依分類規定配合。若垃圾量異常偏多，將酌收清潔費；參考：臺北市專用垃圾袋 76 公升約兩袋為基準，超過部分酌收新台幣 300 元（實際以現場與行前說明為準）。',
+  },
+  {
+    match: (q) =>
+      q.includes('冰塊') ||
+      q.includes('製冰') ||
+      q.includes('冰桶'),
+    reply:
+      '冰塊可依現場狀況補給；若預期需要大量冰塊，請於預訂時事先告知。場地未設製冰機。',
+  },
+  {
+    match: (q) =>
+      (q.includes('微波爐') || q.includes('電鍋') || q.includes('電磁爐') || q.includes('加熱')) &&
+      (q.includes('可以') || q.includes('能否') || q.includes('嗎') || q.includes('現場')),
+    reply:
+      '場地附設微波爐、電鍋及小型電磁爐等簡易加熱設備，請依現場規範與負載安全使用。',
+  },
+  {
+    match: (q) =>
+      q.includes('喝酒') ||
+      q.includes('飲酒') ||
+      q.includes('啤酒') ||
+      q.includes('紅酒') ||
+      q.includes('酒精') ||
+      (q.includes('酒') && (q.includes('可以') || q.includes('能否'))),
+    reply:
+      '可在場地內適量飲酒並注意安全。是否開放及範圍以場地公告與行前確認為準；酒品相關請遵守法令，主辦方應確保未對未成年人供酒或使其飲酒。',
+  },
+  {
+    match: (q) =>
+      q.includes('未成年') ||
+      q.includes('未滿18') ||
+      (q.includes('小朋友') && (q.includes('酒') || q.includes('喝'))) ||
+      (q.includes('兒童') && q.includes('酒')),
+    reply:
+      '依相關法令，兒童及少年飲酒有所限制；供應酒品予未成年人亦可能涉及行政罰鍰。活動若有未成年人參與，請主辦方自行管理飲酒行為；細節請依最新法令或諮詢專業人士。',
+  },
+  {
+    match: (q) =>
+      q.includes('無痕') ||
+      (q.includes('膠帶') && (q.includes('可以') || q.includes('能否') || q.includes('海報') || q.includes('貼'))) ||
+      (q.includes('布置') && q.includes('膠')),
+    reply:
+      '牆面／布置請僅使用無痕膠帶（無痕貼）；請勿使用易留膠、傷漆面或易燃之黏著方式。',
+  },
+  {
+    match: (q) =>
+      q.includes('藍芽') ||
+      q.includes('藍牙') ||
+      ((q.includes('喇叭') || q.includes('音響')) &&
+        (q.includes('自己') || q.includes('外帶') || q.includes('自備') || q.includes('可否') || q.includes('可以'))),
+    reply:
+      '無須自備藍牙喇叭；現場備有音響設備為主，請配合現場音量，避免影響鄰居。',
+  },
+  {
+    match: (q) =>
+      q.includes('麥克風') ||
+      (q.includes('回音') && (q.includes('音響') || q.includes('麥克風'))) ||
+      q.includes('mic'),
+    reply:
+      '現場麥克風共 4 支，一般無須自備。若覺得回音偏重，將視情況協助調整設定。',
+  },
+  {
+    match: (q) =>
+      q.includes('投影') ||
+      q.includes('簡報') ||
+      q.includes('投影片'),
+    reply:
+      '場地已設投影機，一般簡報無須自備；若仍須使用自有設備，請事前告知以利線材與動線確認。',
+  },
+  {
+    match: (q) =>
+      (q.includes('唱') && (q.includes('k') || q.includes('K') || q.includes('卡拉'))) ||
+      q.includes('ktv') ||
+      q.toLowerCase().includes('ktv'),
+    reply:
+      '不提供／不開放唱 K、包廂式 KTV 類活動。背景音樂播送與版權由主辦方自行決定並自負責任；場地僅提供空間使用。',
+  },
+  {
+    match: (q) =>
+      q.includes('生日') ||
+      (q.includes('蛋糕') && (q.includes('可以') || q.includes('蠟燭'))),
+    reply:
+      '歡迎在場地慶生（含蛋糕、蠟燭、唱生日快樂等），請注意安全與環境整理。惟本場非 KTV／包廂式高歌慶生場域。',
+  },
+  {
+    match: (q) =>
+      q.includes('dj') ||
+      q.toLowerCase().includes('dj') ||
+      (q.includes('重低音') && (q.includes('可以') || q.includes('能否'))) ||
+      (q.includes('舞會') && (q.includes('可以') || q.includes('能否'))),
+    reply:
+      '若需外接自有音訊設備連接現場音響，接點與線材請於預約時提出，由場地依實際設備確認。另，為兼顧鄰居住家安寧與場地品質，高音量、長時間重低音或類夜店 DJ 表演等型態可能無法承接，請行前說明活動性質以利評估。',
+  },
+  {
+    match: (q) =>
+      q.includes('停車') ||
+      q.includes('車位') ||
+      q.includes('卸貨') ||
+      q.includes('貨車'),
+    reply:
+      '場地未附設停車場。如需短暫卸貨請提早告知，場地將視現況協助，無法保證一定可行；大型貨車無法配合，請見諒。',
+  },
+  {
+    match: (q) =>
+      q.includes('無障礙') ||
+      q.includes('輪椅') ||
+      q.includes('友善廁所') ||
+      (q.includes('身障') && (q.includes('廁所') || q.includes('電梯'))),
+    reply:
+      '本大樓未設無障礙／輪椅友善廁所；空間位於地下室一樓，且無電梯僅樓梯。若有行動輔具需求，建議行前再確認是否適合。',
+  },
+  {
+    match: (q) =>
+      q.includes('電梯') && (q.includes('有沒有') || q.includes('嗎') || q.includes('沒有')),
+    reply:
+      '本動線無電梯，僅樓梯；大型器材或板車進出請事前與場地確認搬運方式與安全。',
+  },
+  {
+    match: (q) =>
+      q.includes('嬰兒車') ||
+      q.includes('嬰兒推車') ||
+      (q.includes('推車') && q.includes('樓')),
+    reply:
+      '可攜帶嬰兒推車；因動線含樓梯，上下樓請自行搬運。若需協助，得於現場工作人員在班時提出（能否支援以現場人力與安全為準）。',
+  },
+  {
+    match: (q) =>
+      q.includes('拖鞋') ||
+      q.includes('高跟鞋') ||
+      q.includes('釘鞋') ||
+      (q.includes('跳舞') && (q.includes('可以') || q.includes('能否'))),
+    reply:
+      '不可穿高跟鞋、釘鞋等易損傷地面之鞋具於室內活動。進入室內請一律更換室內拖鞋。',
+  },
+  {
+    match: (q) =>
+      q.includes('攝影') ||
+      q.includes('錄影') ||
+      q.includes('拍照') ||
+      q.includes('反光板') ||
+      (q.includes('攝影師') && (q.includes('可以') || q.includes('能否'))),
+    reply:
+      '歡迎攝影／錄影（含攝影師、簡易燈具、反光板等），無需另付攝影費。大型商業拍攝或大型器材請事前告知；請注意動線與愛護設備。',
+  },
+  {
+    match: (q) =>
+      q.includes('插座') ||
+      q.includes('跳電') ||
+      q.includes('延長線') ||
+      q.includes('瓦數') ||
+      q.includes('高功率'),
+    reply:
+      '場內插座配置充足，正常使用不致跳電；禁止高瓦數或大功率電器，以免安全風險；實際限制以行前說明為準。',
+  },
+  {
+    match: (q) =>
+      q.includes('明火') ||
+      q.includes('拜拜') ||
+      q.includes('香爐') ||
+      q.includes('燒香') ||
+      q.includes('檀香'),
+    reply:
+      '原則禁止明火與室內燒香、點燃拜拜相關用品。若有特殊需求，請事先與場地人員確認，並配合防火與安全措施。',
+  },
+  {
+    match: (q) =>
+      q.includes('仙女棒') ||
+      q.includes('噴雪') ||
+      q.includes('雪花噴罐') ||
+      (q.includes('蠟燭') && (q.includes('大量') || q.includes('很多'))),
+    reply:
+      '少量蠟燭作點綴可（請遠離易燃物並注意消防安全）。大量蠟燭、仙女棒、噴雪（雪花噴罐）等不可。',
+  },
+  {
+    match: (q) =>
+      q.includes('噴罐') ||
+      q.includes('彩帶') ||
+      q.includes('紙屑') ||
+      q.includes('花瓣') ||
+      q.includes('亮片') ||
+      q.includes('撒米'),
+    reply:
+      '使用噴罐彩帶、紙屑、花瓣、亮片等，結束後須完全整理乾淨；若造成額外清潔負擔，將酌收清潔費，並得依約自押金扣抵。',
+  },
+  {
+    match: (q) =>
+      q.includes('泡泡機') ||
+      q.includes('煙霧機') ||
+      q.includes('乾冰'),
+    reply:
+      '禁止使用泡泡機、煙霧機、乾冰及類易造成滑倒、偵煙或消防風險之效果器材。',
+  },
+  {
+    match: (q) =>
+      q.includes('氦氣') ||
+      (q.includes('氣球') && (q.includes('很多') || q.includes('大量') || q.includes('打氣'))),
+    reply:
+      '場地屬相對密閉空間，不建議使用氦氣桶或大量充氣布置；若有需求請事前提出，並以安全為前提評估。',
+  },
+  {
+    match: (q) =>
+      q.includes('時段') ||
+      q.includes('幾點結束') ||
+      q.includes('最晚') ||
+      q.includes('午夜') ||
+      q.includes('待到晚上') ||
+      (q.includes('21') && q.includes('30')) ||
+      q.includes('十點') ||
+      q.includes('22點'),
+    reply:
+      '本場地使用最晚 21:30 結束；請於 22:00 前完成離場。未提供開放至午夜或跨夜方案。',
+  },
+  {
+    match: (q) =>
+      q.includes('提早') ||
+      q.includes('提前') ||
+      q.includes('布置') ||
+      q.includes('佈置') ||
+      q.includes('進場'),
+    reply:
+      '預約時段含可提早約半小時進場布置，無須另付布置進場費（實際以訂單與行前通知為準）。',
+  },
+  {
+    match: (q) =>
+      q.includes('逾時') ||
+      q.includes('超過時間') ||
+      q.includes('拖場') ||
+      (q.includes('延長') && q.includes('分鐘')),
+    reply:
+      '撤場若未及完成，提供至多 15 分鐘免費緩衝。為保障下一組來賓，原則不接續逾時占用；特殊需求僅能於不影響下一檔前提下個案協商，並可能收取逾時費用。',
+  },
+  {
+    match: (q) =>
+      q.includes('破壞') ||
+      q.includes('賠償') ||
+      q.includes('刮傷') ||
+      q.includes('押金') ||
+      (q.includes('杯子') && q.includes('打破')),
+    reply:
+      '蓄意或人為破壞依實際損害照價賠償；非蓄意不慎視情形協商。建議課程或特殊活動自備桌墊或桌布，保護桌面。',
+  },
+  {
+    match: (q) =>
+      q.includes('收拾') ||
+      q.includes('拖地') ||
+      q.includes('洗碗') ||
+      (q.includes('結束') && q.includes('清潔')),
+    reply:
+      '結束前請將桌面收拾整潔、杯子置於水槽並完成垃圾分類；其餘清潔由場地工作人員處理。',
+  },
+  {
+    match: (q) =>
+      q.includes('寄存') ||
+      q.includes('寄放') ||
+      q.includes('隔夜') ||
+      (q.includes('前一天') && q.includes('放')),
+    reply:
+      '非貴重物品若有前置寄存／隔日領取需求，請事前提出並視隔日檔期協調；不提供貴重物品保管，不負保管責任。',
+  },
+  {
+    match: (q) =>
+      q.includes('代收') ||
+      q.includes('花籃') ||
+      q.includes('背景板'),
+    reply:
+      '可協助代收花籃或廠商大型背景板等；請提早告知送達時間與件數，場地將交代工作人員配合。',
+  },
+  {
+    match: (q) =>
+      q.includes('離場') ||
+      q.includes('出去買') ||
+      q.includes('再進來') ||
+      q.includes('暫離'),
+    reply:
+      '活動進行中如需短暫離場後再進場，原則可以；請配合現場進出與安全管理。',
+  },
+  {
+    match: (q) =>
+      q.includes('空氣清淨') ||
+      q.includes('清淨機') ||
+      (q.includes('過敏') && (q.includes('味道') || q.includes('香精'))),
+    reply:
+      '場地備有空氣清淨機。若有過敏或對氣味敏感，建議行前告知，並請避免大量使用強烈芳香／噴霧類用品。',
+  },
+  {
+    match: (q) =>
+      q.includes('wifi') ||
+      q.toLowerCase().includes('wifi') ||
+      q.includes(' wi-fi') ||
+      q.includes('網路') ||
+      q.includes('連線') ||
+      q.includes('直播'),
+    reply:
+      'Wi-Fi／連線資訊於現場提供。一般直播順暢度尚可，仍可能受設備與電信環境影響。',
+  },
+  {
+    match: (q) =>
+      q.includes('急救') ||
+      (q.includes('受傷') && (q.includes('怎麼辦') || q.includes('責任'))),
+    reply:
+      '現場備有急救箱；重大傷病請立即就醫並通知工作人員。相關責任依活動約定與事實認定處理。',
+  },
+  {
+    match: (q) =>
+      (q.includes('地震') && (q.includes('避難') || q.includes('逃生'))) ||
+      (q.includes('地下室') && (q.includes('安全') || q.includes('逃生') || q.includes('避難'))),
+    reply:
+      '若遇地震等緊急狀況，請依建物與現場避難方向／逃生標示行動，並勿堆放物品阻塞通道與出入口。',
+  },
+  {
+    match: (q) =>
+      q.includes('雨傘') ||
+      q.includes('雨天') ||
+      q.includes('下雨') ||
+      q.includes('騎樓'),
+    reply:
+      '一樓入口有騎樓遮蔽，進場較不易淋濕；現場備有傘桶請將雨傘置於指定處，並留意地濕防滑。',
+  },
+  {
+    match: (q) =>
+      q.includes('發票') ||
+      q.includes('統編') ||
+      q.includes('電子發票'),
+    reply:
+      '發票或統編開立方式請於預約後與場地確認（流程將另行通知或協調）。',
+  },
+  {
+    match: (q) =>
+      q.includes('退款') ||
+      q.includes('改期') ||
+      q.includes('颱風') ||
+      q.includes('不可抗力') ||
+      (q.includes('取消') &&
+        (q.includes('預約') || q.includes('訂金') || q.includes('費用') || q.includes('扣') || q.includes('退') || q.includes('錢'))),
+    reply:
+      '改期、退款依預約時提供之退款／改期須知辦理。遇重大風災、地震等不可抗力因素，依公告辦理全額退款。',
+  },
+  {
+    match: (q) =>
+      q.includes('付款') ||
+      q.includes('付現') ||
+      q.includes('轉帳') ||
+      q.includes('訂金') ||
+      q.includes('尾款'),
+    reply:
+      '場地使用費於預訂時須完成約定付款；若尚有尾款或差額，請於預約開始時間向場地方當面結清。',
+  },
+  {
+    match: (q) =>
+      q.includes('臨時') ||
+      ((q.includes('今天') || q.includes('明天')) && (q.includes('租') || q.includes('場') || q.includes('約') || q.includes('包'))) ||
+      (q.includes('急') && (q.includes('租') || q.includes('場') || q.includes('約'))),
+    reply:
+      '若該時段無人預約，有機會承接臨時檔期；仍請來電與場地主理人確認。\n📞 {{CONTACT_PHONE}}',
+  },
+  {
+    match: (q) =>
+      q.includes('市集') ||
+      q.includes('擺攤') ||
+      q.includes('販售') ||
+      (q.includes('賣東西') && (q.includes('可以') || q.includes('能否'))),
+    reply:
+      '可舉辦市集或擺攤型活動；交易與收款由主辦方／攤商自行處理，場地方不經手現金。',
+  },
+  {
+    match: (q) =>
+      q.includes('售票') ||
+      q.includes('公開報名') ||
+      q.includes('商業') ||
+      q.includes('商拍'),
+    reply:
+      '若為公開售票、公開報名或具商業對外性質之活動，請事前完整說明並提供主辦與活動資料，經場地同意後始得承接。',
+  },
+  {
+    match: (q) =>
+      q.includes('木工') ||
+      q.includes('噴漆') ||
+      q.includes('施工') ||
+      q.includes('現場切割'),
+    reply:
+      '無法承接需現場施工、木作、噴漆或易造成粉塵、明火、噪音風險之課程或活動。',
+  },
+  {
+    match: (q) =>
+      q.includes('法會') ||
+      q.includes('宗教儀式') ||
+      (q.includes('唱歌') && q.includes('派對')),
+    reply:
+      '以下活動型態原則不開放承接：音樂 DJ、舞會、類 KTV 高歌派對、法會或宗教儀式為主之活动等。若屬一般聚會／課程／慶生（非上述型態），請行前完整說明內容，由場地審核。',
+  },
+  {
+    match: (q) =>
+      q.includes('防疫') ||
+      q.includes('確診') ||
+      q.includes('口罩') ||
+      q.includes('停班') ||
+      q.includes('停課'),
+    reply:
+      '防疫措施、停班停課或天然災害應變等事項，依政府發布之命令／公告為準，並請配合場地調整。',
+  },
+  {
+    match: (q) =>
+      q.includes('失物') ||
+      q.includes('遺失') ||
+      q.includes('拾獲'),
+    reply:
+      '拾得物品將視為登記並限期招領；貴重物品建議報警協尋。逾期未領者得依內規處理；詳細請洽現場人員。',
+  },
+  {
+    match: (q) =>
+      (q.includes('人數') || q.includes('幾個人')) &&
+      (q.includes('小孩') || q.includes('嬰兒') || q.includes('幼童')),
+    reply:
+      '嬰兒不計入人數；已會行走、會於場內跑動之幼童列入人數。上限 40 人、建議 35 人以內。',
+  },
+  {
+    match: (q) =>
+      q.includes('椅子') ||
+      q.includes('桌椅') ||
+      q.includes('摺疊椅'),
+    reply:
+      '本場座椅數量充足，一般無須自備摺疊椅；若堅持使用自有桌椅，請事前告知。',
+  },
+];
 
 /** 客人問答命中內部 FAQ 時回覆；{{CONTACT_PHONE}} 會替換為 CONTACT_PHONE */
 function guestFaqIfHit(text) {
