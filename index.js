@@ -8,7 +8,7 @@
  * - 相關環境變數：CRON_SECRET、NAV_GOOGLE_MAPS_URI、NAV_APPLE_MAPS_URI（可選）、PAYMENT_GRACE_DAYS、NOTION_UNPAID_ULTIMATUM_PROPERTY（見程式內常數區）
  * - 客戶層級：NOTION_CUSTOMER_DATABASE_ID、客戶層級、可選臨時價格倍率；另有 GLOBAL_PRICE_MULTIPLIER、蓁愛表 JSON（見程式內註解）
  * - 客戶電話：名冊庫建議「電話」欄（類型：電話）；NOTION_CUSTOMER_PHONE_PROPERTY（預設 聯絡電話）。曾留號會寫回名冊，下次預約不重複詢問
- * - 場地會勘→Notion 日曆（可選）：新建獨立資料庫，設 NOTION_SITE_VISIT_DATABASE_ID；預設欄位為「標題」(title)、「日期」(date)、「會勘內容」(rich_text)。姓名採 LINE 顯示名；電話與可解析之會勘時間皆必填始成立。欄名可改用 NOTION_SITE_VISIT_*_PROP 覆寫。「我要預約」與勘場／會勘意圖並存時先詢問「會勘場地／預約場地」
+ * - 場地會勘：命中意圖後先給 Quick Reply（填會勘資料／價目／主選單）；送出後寫入預約庫 NOTION_DATABASE_ID，預約類型選項預設「會勘場地」（NOTION_SITE_VISIT_BOOKING_TYPE_SELECT）；預約時段選項見 NOTION_SITE_VISIT_BOOKING_SLOT_SELECT。「我要預約」與勘場／會勘意圖並存時先詢問「會勘場地／預約場地」
  * - 活動／課程押金：VENUE_ACTIVITY_DEPOSIT_NT（預設 3000）；講座／其他不收；蓁愛講師免押金
  */
 const express = require('express');
@@ -45,13 +45,10 @@ const NOTION_CUSTOMER_TIER_PROPERTY = (process.env.NOTION_CUSTOMER_TIER_PROPERTY
 const NOTION_CUSTOMER_PRICE_ADJUST_PROPERTY = (process.env.NOTION_CUSTOMER_PRICE_ADJUST_PROPERTY || '臨時價格倍率').trim();
 /** 客戶名冊內「電話」屬性名稱（Notion 類型須為 phone_number）；未建欄位則僅沿用預約庫歷史電話 */
 const NOTION_CUSTOMER_PHONE_PROPERTY = (process.env.NOTION_CUSTOMER_PHONE_PROPERTY || '聯絡電話').trim();
-/** 可選：場地會勘專用資料庫（勿與預約庫混用）；設後會新增一列，「日期」預設為送出當日，可在 Notion 改成實際會勘日 */
-const NOTION_SITE_VISIT_DATABASE_ID = (process.env.NOTION_SITE_VISIT_DATABASE_ID || '').trim();
-const NOTION_SITE_VISIT_TITLE_PROP = (process.env.NOTION_SITE_VISIT_TITLE_PROP || '標題').trim();
-const NOTION_SITE_VISIT_DATE_PROP = (process.env.NOTION_SITE_VISIT_DATE_PROP || '日期').trim();
-const NOTION_SITE_VISIT_BODY_PROP = (process.env.NOTION_SITE_VISIT_BODY_PROP || '會勘內容').trim();
-/** 可選：rich_text；若資料庫無此欄請留空環境變數 */
-const NOTION_SITE_VISIT_LINE_NAME_PROP = (process.env.NOTION_SITE_VISIT_LINE_NAME_PROP || '').trim();
+/** 會勘核准後寫入預約庫「預約類型」select（須與 Notion 選項完全一致） */
+const NOTION_SITE_VISIT_BOOKING_TYPE_SELECT = (process.env.NOTION_SITE_VISIT_BOOKING_TYPE_SELECT || '會勘場地').trim();
+/** 會勘核准後「預約時段」select 名稱（須為資料庫既有選項；請依實際欄位新增如「會勘／待定」） */
+const NOTION_SITE_VISIT_BOOKING_SLOT_SELECT = (process.env.NOTION_SITE_VISIT_BOOKING_SLOT_SELECT || '會勘／待定').trim();
 /** 可選：全體客戶在層級價之後再乘上此倍率（臨時調漲/折讓），例如 1.02；未設或 1 則不變 */
 const GLOBAL_PRICE_MULTIPLIER = (() => {
   const g = Number(process.env.GLOBAL_PRICE_MULTIPLIER);
@@ -1867,6 +1864,27 @@ const BOOKING_VS_SITE_VISIT_PROMPT =
 const BOOKING_VS_SITE_VISIT_BOGUS =
   '我這邊需要二選一才不會接錯～ 麻煩回覆「會勘場地」或「預約場地」其中一種就好。\n若想從頭開始，可輸入「取消」。';
 
+/** 進行線上預約／改期流程中不打斷改走會勘（須先取消或完成步驟） */
+const BOOKING_FLOW_STEPS_BLOCK_SITE_VISIT = new Set([
+  'pickDate',
+  'pickEventType',
+  'pickFixed',
+  'pickStartTime',
+  'pickDuration',
+  'pickType',
+  'confirmPhone',
+  'inputPhone',
+  'inputHeadcount',
+  'inputNote',
+  'confirm',
+  'pickRescheduleDate',
+  'pickRescheduleSlot',
+  'confirmReschedule',
+  'rescheduleConfirm',
+  'confirmCancel',
+  'inputCode',
+]);
+
 function normalizeSiteVisitQuery(raw) {
   return String(raw || '').trim().replace(/\s+/g, '');
 }
@@ -1930,6 +1948,12 @@ function matchesSiteVisitIntent(text) {
 
   if (q.includes('看') && (q.includes('場地') || q.includes('空間') || q.includes('現場') || q.includes('環境'))) return true;
 
+  if (q.includes('過去看看')) return true;
+  if (q.includes('去看看嗎') || q.includes('去看看')) return true;
+  if (q.includes('約時間') && (q.includes('看') || q.includes('過去') || q.includes('過來'))) return true;
+  if ((q.includes('約個時間') || q.includes('約一下時間')) && q.includes('看')) return true;
+  if (q.includes('可以到現場') && (q.includes('看') || q.includes('談'))) return true;
+
   return false;
 }
 
@@ -1954,11 +1978,12 @@ function impliesFormalBookingCueForDisambiguation(t) {
 }
 
 function needsBookingVsSiteVisitClarification(text, step) {
+  if (BOOKING_FLOW_STEPS_BLOCK_SITE_VISIT.has(step)) return false;
   if (
     step === 'inputCode' ||
     step === 'siteVisitAwaiting' ||
-    step === 'bookingVsSiteVisitChoose' ||
-    step === 'confirm'
+    step === 'siteVisitPrompt' ||
+    step === 'bookingVsSiteVisitChoose'
   ) {
     return false;
   }
@@ -2170,36 +2195,40 @@ function parseSiteVisitLooseDateTime(rawText, refNow) {
   return isoLocal;
 }
 
-async function appendSiteVisitToNotion(displayName, bodyText, phone, parsedIso) {
-  if (!NOTION_SITE_VISIT_DATABASE_ID || !parsedIso) return false;
+async function appendSiteVisitToNotion(userId, displayName, bodyText, phone, parsedIso) {
+  if (!DATABASE_ID || !parsedIso) return false;
   try {
     const dateProp = { date: { start: parsedIso } };
     const dn = String(displayName || '').trim();
-    const titleText = truncateForNotionRichText('[場勘] ' + (dn || 'LINE'), 180);
-    const richBody = '電話：' + phone + '\n────────\n' + String(bodyText || '').trim();
-    const body = truncateForNotionRichText(richBody, 1900);
-    const props = {};
-    props[NOTION_SITE_VISIT_TITLE_PROP] = {
-      title: [{ text: { content: titleText || '[場勘]' } }],
-    };
-    props[NOTION_SITE_VISIT_DATE_PROP] = dateProp;
-    props[NOTION_SITE_VISIT_BODY_PROP] = {
-      rich_text: [{ text: { content: body || '—' } }],
-    };
-    if (NOTION_SITE_VISIT_LINE_NAME_PROP) {
-      props[NOTION_SITE_VISIT_LINE_NAME_PROP] = {
-        rich_text: [{ text: { content: truncateForNotionRichText(dn || '—', 180) } }],
-      };
-    }
+    const noteRaw =
+      '【會勘場地】客人自填\n' +
+      '電話：' +
+      phone +
+      '\n────────\n' +
+      String(bodyText || '').trim() +
+      '\n' +
+      VENUE_RULE_NO_SMOKING_ZH;
+    const note = truncateForNotionRichText(noteRaw, 1900);
     await notion.pages.create({
-      parent: { database_id: NOTION_SITE_VISIT_DATABASE_ID },
-      properties: props,
+      parent: { database_id: DATABASE_ID },
+      properties: {
+        '預約姓名': { title: [{ text: { content: dn || '會勘客人' } }] },
+        '預約日期': dateProp,
+        '預約時段': { select: { name: NOTION_SITE_VISIT_BOOKING_SLOT_SELECT } },
+        '聯絡電話': { phone_number: phone || '' },
+        '預約類型': { select: { name: NOTION_SITE_VISIT_BOOKING_TYPE_SELECT } },
+        '舉辦類型': { select: { name: '其他' } },
+        '金額': { number: 0 },
+        '備註': { rich_text: [{ text: { content: note } }] },
+        '預約來源': { select: { name: 'LINE' } },
+        'LINE ID': { rich_text: [{ text: { content: userId || '' } }] },
+      },
     });
-    appendBotLog('[場地會勘] Notion 已新增列');
+    appendBotLog('[場地會勘] Notion 預約庫已新增列（預約類型=' + NOTION_SITE_VISIT_BOOKING_TYPE_SELECT + '）');
     return true;
   } catch (e) {
     console.error('[Notion] appendSiteVisitToNotion:', e.message);
-    appendBotLog('[場地會勘] Notion 寫入失敗 ' + String(e.message || e));
+    appendBotLog('[場地會勘] Notion 預約庫寫入失敗 ' + String(e.message || e));
     return false;
   }
 }
@@ -2312,6 +2341,40 @@ function buildMainMenu() {
       ],
     },
   };
+}
+
+/** Quick Reply 觸發會勘填寫（勿與真人打字衝突） */
+const SITE_VISIT_QUICK_ACTION_FILL = '__SITE_VISIT_FILL__';
+
+function buildSiteVisitOfferQuickReply() {
+  return {
+    items: [
+      { type: 'action', action: { type: 'message', label: '📋 填寫會勘資料', text: SITE_VISIT_QUICK_ACTION_FILL } },
+      { type: 'action', action: { type: 'message', label: '💰 先看價目', text: '價目表' } },
+      { type: 'action', action: { type: 'message', label: '🏠 回主選單', text: '選單' } },
+    ],
+  };
+}
+
+function buildSiteVisitEntryOffer() {
+  return {
+    type: 'text',
+    text:
+      '了解～聽起來您是想約時間來現場看看／談談對嗎？\n\n' +
+      '請先選下一步，我好接對線：',
+    quickReply: buildSiteVisitOfferQuickReply(),
+  };
+}
+
+function buildSiteVisitPromptNudge() {
+  return Object.assign(
+    {
+      type: 'text',
+      text:
+        '我先幫您停在這一步～ 請點下方「📋 填寫會勘資料」開始；若想先看費用可點「💰 先看價目」，或點「🏠 回主選單」。',
+    },
+    { quickReply: buildSiteVisitOfferQuickReply() }
+  );
 }
 
 function buildDatePicker() {
@@ -3413,8 +3476,8 @@ async function handleEvent(event) {
       const qPick = text.trim();
       if (qPick === '會勘場地' || qPick === '①' || /^會勘場地/.test(qPick)) {
         clearSession(userId);
-        setSession(userId, 'siteVisitAwaiting', {});
-        return reply(event, { type: 'text', text: SITE_VISIT_GUIDE_REPLY });
+        setSession(userId, 'siteVisitPrompt', {});
+        return reply(event, buildSiteVisitEntryOffer());
       }
       if (qPick === '預約場地' || qPick === '②' || /^預約場地/.test(qPick)) {
         clearSession(userId);
@@ -3424,6 +3487,19 @@ async function handleEvent(event) {
       return reply(event, { type: 'text', text: BOOKING_VS_SITE_VISIT_BOGUS });
     }
 
+    if (step === 'siteVisitPrompt') {
+      if (text === SITE_VISIT_QUICK_ACTION_FILL) {
+        setSession(userId, 'siteVisitAwaiting', {});
+        return reply(event, { type: 'text', text: SITE_VISIT_GUIDE_REPLY });
+      }
+      if (text === '選單' || text === 'menu') {
+        clearSession(userId);
+        return reply(event, buildMainMenu());
+      }
+      if (isPriceIntentMessage(text)) return reply(event, buildPriceMessage(userId));
+      return reply(event, buildSiteVisitPromptNudge());
+    }
+
     if (step === 'siteVisitAwaiting') {
       const trimmedSv = String(text || '').trim();
       if (!trimmedSv) {
@@ -3431,7 +3507,7 @@ async function handleEvent(event) {
           type: 'text',
           text:
             '我在這裡等您的資料喔～ 請貼上「電話」與「會勘時間」（姓名會直接用您的 LINE 名稱）。\n' +
-            '若想再看一次格式，輸入「會勘」就可以。',
+            '若想再看選項或格式，可以再輸入「會勘」。',
         });
       }
       const phoneSv = extractTaiwanMobileFromSiteVisitText(trimmedSv);
@@ -3444,7 +3520,7 @@ async function handleEvent(event) {
       }
       const displayNameSv = await getLineDisplayName(userId);
       await notifyGroupSiteVisitRequest(userId, displayNameSv, phoneSv, parsedIsoSv, trimmedSv);
-      await appendSiteVisitToNotion(displayNameSv, trimmedSv, phoneSv, parsedIsoSv);
+      await appendSiteVisitToNotion(userId, displayNameSv, trimmedSv, phoneSv, parsedIsoSv);
       await persistKnownPhoneForUser(userId, phoneSv);
       clearSession(userId);
       return reply(event, { type: 'text', text: SITE_VISIT_SUBMITTED_REPLY });
@@ -3456,10 +3532,14 @@ async function handleEvent(event) {
       return reply(event, { type: 'text', text: BOOKING_VS_SITE_VISIT_PROMPT });
     }
 
-    if (step !== 'inputCode' && matchesSiteVisitIntent(text)) {
+    if (
+      step !== 'inputCode' &&
+      !BOOKING_FLOW_STEPS_BLOCK_SITE_VISIT.has(step) &&
+      matchesSiteVisitIntent(text)
+    ) {
       clearSession(userId);
-      setSession(userId, 'siteVisitAwaiting', {});
-      return reply(event, { type: 'text', text: SITE_VISIT_GUIDE_REPLY });
+      setSession(userId, 'siteVisitPrompt', {});
+      return reply(event, buildSiteVisitEntryOffer());
     }
 
     // 卡在「確認預約」卡片時：優先處理（勿先套全域「立即預約」以免清空尚未確認的資料）
