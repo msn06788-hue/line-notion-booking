@@ -1,8 +1,9 @@
 /**
- * 敘事空域 LINE Bot — 修復版
- * - 行政群組通知：新預約 / 取消（含退款說明）/ 改期（含補退差額與補償金）
- * - 群組查詢：查詢明天、今天、本週、下週、本月、指定日期（YYYY-MM-DD），並顯示筆數與金額合計
- * - 修正：驗證碼取消流程資料遺失、指定日期查詢範圍、改期鐘點路徑、Notion 分頁、群組 ID 改走環境變數
+ * 敘事空域 LINE Bot
+ * - 行政群組：新預約 / 取消 / 改期（先推播「文字摘要」再推播 Flex，退款與價差寫在文字裡）
+ * - 群組查詢：查詢本日/明日/本週/下週/本月/指定日；查詢財務、查詢報表、財務報告（簡易財務）
+ * - 日期選單最遠日：環境變數 BOOKING_MAX_DAYS_AHEAD（預設 730 天）
+ * - LINE_NOTIFY_GROUP_ID 請設行政群組 ID；留空則用程式內預設
  */
 const express = require('express');
 const line = require('@line/bot-sdk');
@@ -17,8 +18,25 @@ const lineConfig = {
 const client = new line.Client(lineConfig);
 const notion = new Client({ auth: process.env.NOTION_INTEGRATION_TOKEN });
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;
-const NOTIFY_GROUP_ID = process.env.LINE_NOTIFY_GROUP_ID || 'C6f36b9fa93777db373fa52dedbc43d66';
+const NOTIFY_GROUP_ID = (process.env.LINE_NOTIFY_GROUP_ID || '').trim() || 'C6f36b9fa93777db373fa52dedbc43d66';
+/** 日期選擇器可預約之最遠日期（自「明日」起算天數），預設 730 天；設環境變數 BOOKING_MAX_DAYS_AHEAD */
+const BOOKING_MAX_DAYS_AHEAD = Math.min(Math.max(Number(process.env.BOOKING_MAX_DAYS_AHEAD) || 730, 30), 3650);
 const app = express();
+
+const GROUP_QUERY_HELP =
+  '📋 行政群組｜預約查詢指令\n' +
+  '（訊息開頭加「查詢」或依下列關鍵字）\n\n' +
+  '【名單】\n' +
+  '• 查詢今天 / 本日 / 今日\n' +
+  '• 查詢明天 / 明日\n' +
+  '• 查詢本週、查詢下週\n' +
+  '• 查詢本月\n' +
+  '• 查詢 2026-05-10（指定日）\n\n' +
+  '【財務（簡易）】\n' +
+  '• 查詢財務 或 查詢報表（預設本月）\n' +
+  '• 查詢財務本週 / 查詢財務本月\n' +
+  '• 查詢財務 2026-05（指定月）\n\n' +
+  '※ 金額以 Notion「金額」欄加總；已付/未付依「付款狀態」欄。';
 
 // ── 台灣國定假日快取 ───────────────────────────────────────
 let holidayCache = new Set();
@@ -435,8 +453,66 @@ function adminMoneyLines(ctx) {
   return lines;
 }
 
+function buildAdminPlainSummary(booking, action) {
+  action = action || 'new';
+  const slotDisplay = (booking.selectedSlots && booking.selectedSlots.length > 0)
+    ? booking.selectedSlots.join('、')
+    : (booking.slot || '—');
+  const ctx = Object.assign({ action }, booking.adminCtx || {});
+  const lines = [];
+  if (action === 'new') {
+    lines.push('🔔【新預約】敘事空域');
+    lines.push('姓名：' + (booking.name || '—'));
+    lines.push('日期：' + (booking.date || '—'));
+    lines.push('時段：' + slotDisplay);
+    lines.push('電話：' + (booking.phone || '—'));
+    lines.push('金額：' + formatPrice(Number(booking.price) || 0));
+    return lines.join('\n');
+  }
+  if (action === 'cancel') {
+    lines.push('🚫【預約取消】敘事空域');
+    lines.push('姓名：' + (booking.name || '—'));
+    lines.push('日期：' + (booking.date || '—'));
+    lines.push('時段：' + slotDisplay);
+    lines.push('電話：' + (booking.phone || '—'));
+    if (ctx.isPaid && ctx.polCancel) {
+      lines.push('── 退款 ──');
+      lines.push(ctx.polCancel.refundNote);
+      if (ctx.polCancel.refundAmount > 0) {
+        lines.push('↳ 建議退款金額：' + formatPrice(ctx.polCancel.refundAmount));
+      } else if (ctx.polCancel.blocked) {
+        lines.push('↳ 依規則可能無須退款或請人工確認。');
+      }
+    } else {
+      lines.push('付款：未付款（無須退款）');
+    }
+    if (booking.extraNote) lines.push('備註：' + booking.extraNote);
+    return lines.join('\n');
+  }
+  if (action === 'reschedule') {
+    lines.push('🔄【改期完成】敘事空域');
+    lines.push('姓名：' + (booking.name || '—'));
+    lines.push('原檔期：' + (booking.oldDate || '—') + ' ' + (booking.oldSlot || ''));
+    lines.push('新檔期：' + (booking.date || '—') + ' ' + slotDisplay);
+    lines.push('電話：' + (booking.phone || '—'));
+    if (ctx.polReschedule) lines.push('改期規則：' + ctx.polReschedule.feeNote);
+    if (ctx.isPaid) {
+      if (ctx.surchargeAmt > 0) lines.push('改期補償金：' + formatPrice(ctx.surchargeAmt));
+      if (ctx.priceDiff > 0) lines.push('價差需補匯：' + formatPrice(ctx.priceDiff));
+      else if (ctx.priceDiff < 0) lines.push('價差應退：' + formatPrice(Math.abs(ctx.priceDiff)));
+      else lines.push('價差：無');
+    } else {
+      lines.push('新檔期報價：' + formatPrice(Number(ctx.newPrice) || 0) + '（尚未付款）');
+    }
+    if (booking.extraNote) lines.push('備註：' + booking.extraNote);
+    return lines.join('\n');
+  }
+  return '通知';
+}
+
 async function notifyGroup(booking, action) {
   action = action || 'new';
+  const plainSummary = buildAdminPlainSummary(booking, action);
   const slotDisplay = (booking.selectedSlots && booking.selectedSlots.length > 0)
     ? booking.selectedSlots.join('、')
     : booking.slot;
@@ -446,14 +522,14 @@ async function notifyGroup(booking, action) {
   const ctx = Object.assign({ action }, booking.adminCtx || {});
   const moneyLines = adminMoneyLines(ctx);
   const bodyContents = [
-    row('姓名', booking.name || ''),
-    row('日期', booking.date || ''),
-    row('時段', slotDisplay),
-    row('電話', booking.phone || ''),
+    row('姓名', booking.name || '—'),
+    row('日期', booking.date || '—'),
+    row('時段', slotDisplay || '—'),
+    row('電話', booking.phone || '—'),
   ];
   if (action === 'reschedule' && (booking.oldDate || booking.oldSlot)) {
-    bodyContents.push(row('原日期', booking.oldDate || ''));
-    bodyContents.push(row('原時段', booking.oldSlot || ''));
+    bodyContents.push(row('原日期', booking.oldDate || '—'));
+    bodyContents.push(row('原時段', booking.oldSlot || '—'));
   }
   if (moneyLines.length) {
     bodyContents.push({ type: 'separator', margin: 'md' });
@@ -468,7 +544,7 @@ async function notifyGroup(booking, action) {
   }
   if (booking.extraNote) {
     bodyContents.push({ type: 'separator', margin: 'md' });
-    bodyContents.push({ type: 'text', text: booking.extraNote, size: 'xs', color: '#555555', wrap: true, margin: 'md' });
+    bodyContents.push({ type: 'text', text: String(booking.extraNote), size: 'xs', color: '#555555', wrap: true, margin: 'md' });
   }
   const message = {
     type: 'flex',
@@ -485,12 +561,35 @@ async function notifyGroup(booking, action) {
       body: { type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm', contents: bodyContents },
     },
   };
-  try {
-    await client.pushMessage(NOTIFY_GROUP_ID, message);
-    console.log('[行政群組] 推播成功');
-  } catch (e) {
-    const errDetail = e.response && e.response.data ? JSON.stringify(e.response.data) : e.message;
-    console.error('[行政群組] 推播失敗 status=' + (e.response && e.response.status) + ' detail=' + errDetail);
+
+  async function pushText() {
+    try {
+      await client.pushMessage(NOTIFY_GROUP_ID, { type: 'text', text: plainSummary });
+      console.log('[行政群組] 文字摘要 OK');
+    } catch (e) {
+      const errDetail = e.response && e.response.data ? JSON.stringify(e.response.data) : e.message;
+      console.error('[行政群組] 文字推播失敗 status=' + (e.response && e.response.status) + ' detail=' + errDetail);
+    }
+  }
+
+  async function pushFlex() {
+    try {
+      await client.pushMessage(NOTIFY_GROUP_ID, message);
+      console.log('[行政群組] Flex OK');
+      return true;
+    } catch (e) {
+      const errDetail = e.response && e.response.data ? JSON.stringify(e.response.data) : e.message;
+      console.error('[行政群組] Flex 失敗 status=' + (e.response && e.response.status) + ' detail=' + errDetail);
+      return false;
+    }
+  }
+
+  if (action === 'cancel' || action === 'reschedule') {
+    await pushText();
+    await pushFlex();
+  } else {
+    const flexOk = await pushFlex();
+    if (!flexOk) await pushText();
   }
 }
 
@@ -513,7 +612,7 @@ function buildDatePicker() {
   const now = new Date();
   const twOffset = 8 * 60 * 60 * 1000;
   const minDate = new Date(now.getTime() + twOffset + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-  const maxDate = new Date(now.getTime() + twOffset + 60 * 86400000).toISOString().split('T')[0];
+  const maxDate = new Date(now.getTime() + twOffset + BOOKING_MAX_DAYS_AHEAD * 86400000).toISOString().split('T')[0];
   return {
     type: 'template',
     altText: '請選擇預約日期',
@@ -931,52 +1030,149 @@ function sumBookingAmounts(pages) {
   return pages.reduce((acc, p) => acc + (Number(p.properties['金額']?.number) || 0), 0);
 }
 
+function aggregateFinanceStats(pages) {
+  let sumTotal = 0;
+  let sumPaid = 0;
+  let sumUnpaid = 0;
+  let nPaid = 0;
+  let nUnpaid = 0;
+  pages.forEach((p) => {
+    const amt = Number(p.properties['金額']?.number) || 0;
+    const ps = p.properties['付款狀態']?.select?.name || '未付款';
+    sumTotal += amt;
+    if (ps === '已付款') {
+      sumPaid += amt;
+      nPaid += 1;
+    } else {
+      sumUnpaid += amt;
+      nUnpaid += 1;
+    }
+  });
+  return { sumTotal, sumPaid, sumUnpaid, nPaid, nUnpaid, count: pages.length };
+}
+
+async function handleFinancialReport(event, queryText) {
+  let startDate;
+  let endDateExclusive;
+  let label;
+
+  const monthMatch = queryText.match(/(\d{4})-(\d{2})/);
+  if (monthMatch) {
+    const y = parseInt(monthMatch[1], 10);
+    const mo = parseInt(monthMatch[2], 10);
+    startDate = y + '-' + String(mo).padStart(2, '0') + '-01';
+    let ny = y;
+    let nm = mo + 1;
+    if (nm > 12) {
+      nm = 1;
+      ny += 1;
+    }
+    endDateExclusive = ny + '-' + String(nm).padStart(2, '0') + '-01';
+    label = y + ' 年 ' + mo + ' 月（財務）';
+  } else if (queryText.includes('本週')) {
+    const r = getWeekRange(0);
+    startDate = r.start;
+    endDateExclusive = r.endExclusive;
+    label = '本週（財務）';
+  } else if (queryText.includes('下週')) {
+    const r = getWeekRange(1);
+    startDate = r.start;
+    endDateExclusive = r.endExclusive;
+    label = '下週（財務）';
+  } else {
+    const m = getTaipeiMonthRangeStrings();
+    startDate = m.start;
+    endDateExclusive = m.endExclusive;
+    label = m.label + '（財務）';
+  }
+
+  const pages = await getBookingsByDateRange(startDate, endDateExclusive);
+  const st = aggregateFinanceStats(pages);
+  const rangeStr = startDate + ' ~ ' + ymdAddDays(endDateExclusive, -1);
+  const text =
+    '📊 簡易財務報告｜' + label + '\n' +
+    '區間：' + rangeStr + '\n' +
+    '────────────────\n' +
+    '預約筆數：' + st.count + '（已付 ' + st.nPaid + ' / 未付 ' + st.nUnpaid + '）\n' +
+    '金額合計：' + formatPrice(st.sumTotal) + '\n' +
+    '• 已收款：' + formatPrice(st.sumPaid) + '\n' +
+    '• 未收款：' + formatPrice(st.sumUnpaid) + '\n' +
+    '────────────────\n' +
+    '※ 資料來自 Notion「金額」「付款狀態」欄，歸檔的預約不會列入。';
+  return client.replyMessage(event.replyToken, { type: 'text', text });
+}
+
 async function handleGroupQuery(event, queryText) {
+  const q = queryText.trim();
+  if (q === '查詢' || q === '預約查詢' || q === '查詢幫助' || q === '查詢說明') {
+    return client.replyMessage(event.replyToken, { type: 'text', text: GROUP_QUERY_HELP });
+  }
+
+  const isFinance =
+    q.includes('財務') ||
+    q.includes('報表') ||
+    q.includes('收支') ||
+    /^查詢\s*財務/.test(q) ||
+    /^查詢\s*報表/.test(q);
+  if (isFinance && !q.includes('今天') && !q.includes('明天') && !q.match(/\d{4}-\d{2}-\d{2}/)) {
+    return handleFinancialReport(event, q);
+  }
+
   let startDate;
   let endDateExclusive;
   let label;
   const today = getTwDate();
 
-  if (queryText.includes('今天')) {
+  if (q.includes('今天') || q.includes('本日') || q.includes('今日')) {
     startDate = today;
     endDateExclusive = ymdAddDays(today, 1);
     label = '今天';
-  } else if (queryText.includes('明天')) {
+  } else if (q.includes('明天') || q.includes('明日')) {
     startDate = getTwDate(1);
     endDateExclusive = ymdAddDays(startDate, 1);
     label = '明天';
-  } else if (queryText.includes('本週')) {
+  } else if (q.includes('本週')) {
     const r = getWeekRange(0);
     startDate = r.start;
     endDateExclusive = r.endExclusive;
     label = '本週';
-  } else if (queryText.includes('下週')) {
+  } else if (q.includes('下週')) {
     const r = getWeekRange(1);
     startDate = r.start;
     endDateExclusive = r.endExclusive;
     label = '下週';
-  } else if (queryText.includes('本月') || queryText.includes('這個月') || queryText.includes('當月')) {
+  } else if (q.includes('本月') || q.includes('這個月') || q.includes('當月')) {
     const m = getTaipeiMonthRangeStrings();
     startDate = m.start;
     endDateExclusive = m.endExclusive;
     label = m.label;
   } else {
-    const match = queryText.match(/(\d{4}-\d{2}-\d{2})/);
+    const match = q.match(/(\d{4}-\d{2}-\d{2})/);
     if (match) {
       startDate = match[1];
       endDateExclusive = ymdAddDays(startDate, 1);
       label = startDate;
     } else {
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: '📋 查詢格式範例：\n查詢今天\n查詢明天\n查詢本週\n查詢下週\n查詢本月\n查詢 2026-05-10',
-      });
+      return client.replyMessage(event.replyToken, { type: 'text', text: GROUP_QUERY_HELP });
     }
   }
 
   const pages = await getBookingsByDateRange(startDate, endDateExclusive);
   const totalAmt = sumBookingAmounts(pages);
-  const rangeText = startDate + ' ~ ' + ymdAddDays(endDateExclusive, -1) + '（共 ' + pages.length + ' 筆，合計 ' + formatPrice(totalAmt) + '）';
+  const st = aggregateFinanceStats(pages);
+  const rangeText =
+    startDate +
+    ' ~ ' +
+    ymdAddDays(endDateExclusive, -1) +
+    '（共 ' +
+    pages.length +
+    ' 筆，合計 ' +
+    formatPrice(totalAmt) +
+    '｜已收 ' +
+    formatPrice(st.sumPaid) +
+    '／未收 ' +
+    formatPrice(st.sumUnpaid) +
+    '）';
 
   if (pages.length === 0) {
     return client.replyMessage(event.replyToken, { type: 'text', text: '📅 ' + label + '\n' + rangeText + '\n\n目前無預約紀錄。' });
@@ -988,7 +1184,8 @@ async function handleGroupQuery(event, queryText) {
     const name = p.properties['預約姓名']?.title?.[0]?.plain_text || '';
     const type = p.properties['舉辦類型']?.select?.name || '';
     const price = Number(p.properties['金額']?.number) || 0;
-    return '📌 ' + date + '\n時段：' + slot + '\n姓名：' + name + '\n類型：' + type + '\n金額：' + formatPrice(price);
+    const pay = p.properties['付款狀態']?.select?.name || '未付款';
+    return '📌 ' + date + '\n時段：' + slot + '\n姓名：' + name + '\n類型：' + type + '\n金額：' + formatPrice(price) + '\n付款：' + pay;
   });
 
   const body = '📅 ' + label + ' 預約清單\n' + rangeText + '\n\n' + lines.join('\n\n');
@@ -1031,11 +1228,19 @@ async function processBooking(event, userId) {
   return reply(event, { type: 'text', text: '⚠️ 系統錯誤，請直接電話預約：0939-607867' });
 }
 async function handleEvent(event) {
-  // 群組訊息：只處理查詢指令
+  // 群組訊息：預約查詢 / 財務報表
   if (event.source.type === 'group') {
     if (event.type === 'message' && event.message.type === 'text') {
       const text = event.message.text.trim();
-      if (text.startsWith('查詢')) {
+      const staffCmd =
+        text.startsWith('查詢') ||
+        text === '預約查詢' ||
+        text === '財務報告' ||
+        text.startsWith('查詢財務') ||
+        text.startsWith('查詢報表') ||
+        text.startsWith('本月財務') ||
+        text.startsWith('本週財務');
+      if (staffCmd) {
         return handleGroupQuery(event, text);
       }
     }
