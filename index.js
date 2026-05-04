@@ -486,6 +486,8 @@ function getBookingTotalDue(baseVenueCharge, eventType, userId) {
   return Math.round(Number(baseVenueCharge) || 0) + getVenueDepositAmount(eventType, userId);
 }
 
+const VENUE_RULE_NO_SMOKING_ZH = '全室禁煙。';
+
 // ── 對話狀態機 ─────────────────────────────────────────────
 const sessions = new Map();
 function getSession(userId) {
@@ -601,6 +603,24 @@ async function getUserBookings(userId) {
     console.error('[Notion] getUserBookings:', e.message);
     return [];
   }
+}
+
+/** 自曾成功寫入預約庫的紀錄取最近一筆電話（含歷史訂單），供老客免重填 */
+async function getLatestPhoneFromPastBookings(userId) {
+  if (!DATABASE_ID || !userId) return null;
+  try {
+    const pages = await notionQueryAll(DATABASE_ID, {
+      filter: { property: 'LINE ID', rich_text: { equals: userId } },
+      sorts: [{ timestamp: 'created_time', direction: 'descending' }],
+    });
+    for (let i = 0; i < pages.length; i++) {
+      const raw = pages[i].properties['聯絡電話']?.phone_number;
+      if (raw != null && String(raw).trim() !== '') return String(raw).trim();
+    }
+  } catch (e) {
+    console.error('[Notion] getLatestPhoneFromPastBookings:', e.message);
+  }
+  return null;
 }
 
 function mapNotionTierNameToCode(name) {
@@ -768,7 +788,9 @@ async function createBooking(booking) {
                 ' 人' +
                 (booking.note ? '\n備註：' + booking.note : '') +
                 tierNote +
-                depositNote,
+                depositNote +
+                '\n' +
+                VENUE_RULE_NO_SMOKING_ZH,
             },
           }],
         },
@@ -1479,14 +1501,74 @@ function buildFixedSlotFlex(date, available, holiday, bookedSlotLabels, userId) 
   };
 }
 
-function buildEventTypePicker() {
+function buildPhoneConfirmFlex(phone, displayName) {
+  const hi = displayName ? 'Hi ' + displayName + '！' : '您好！';
   return {
     type: 'flex',
-    altText: '請選擇舉辦類型',
+    altText: '確認沿用電話',
     contents: {
       type: 'bubble',
+      header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '📞 確認聯絡電話', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: 'md',
+        spacing: 'sm',
+        contents: [
+          { type: 'text', text: hi + '\n\n偵測到您曾透過 LINE 完成預約，將沿用 Notion 中最近一筆電話。請確認：', size: 'sm', color: '#444444', wrap: true },
+          row('電話', phone),
+          { type: 'text', text: '🚭 ' + VENUE_RULE_NO_SMOKING_ZH, size: 'xs', color: '#C0392B', wrap: true, margin: 'md', weight: 'bold' },
+        ],
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: 'md',
+        spacing: 'sm',
+        contents: [
+          { type: 'button', style: 'primary', color: '#4CAF82', action: { type: 'postback', label: '✅ 確認電話無誤', data: 'action=confirmCachedPhone', displayText: '確認電話' } },
+          { type: 'button', style: 'secondary', action: { type: 'postback', label: '✏️ 改填其他號碼', data: 'action=changeCachedPhone', displayText: '更改電話' } },
+        ],
+      },
+    },
+  };
+}
+
+function buildEventTypePicker(userId) {
+  const zhenaiFree = getCustomerTier(userId) === 'zhenai_lecturer';
+  const depositLines = zhenaiFree
+    ? '您是「蓁愛講師」身分：不論選哪一種類型，皆不收場地押金。'
+    : '‧ 課程／活動：須加收場地押金 ' +
+      formatPrice(VENUE_ACTIVITY_DEPOSIT_NT) +
+      '（退場無損壞、無須大量清潔可退）\n' +
+      '‧ 講座／其他：無場地押金';
+  const noteBox = {
+    type: 'box',
+    layout: 'vertical',
+    backgroundColor: '#FFF9E6',
+    paddingAll: 'md',
+    cornerRadius: 'md',
+    margin: 'none',
+    contents: [
+      { type: 'text', text: '📌 押金說明', size: 'sm', weight: 'bold', color: '#856404' },
+      { type: 'text', text: depositLines, size: 'xs', color: '#5D4E37', wrap: true, margin: 'sm' },
+      { type: 'text', text: '🚭 ' + VENUE_RULE_NO_SMOKING_ZH, size: 'xs', color: '#C0392B', wrap: true, margin: 'md', weight: 'bold' },
+    ],
+  };
+  const typeButtons = ['講座', '課程', '活動', '其他'].map((t) => ({
+    type: 'button',
+    style: 'secondary',
+    height: 'sm',
+    action: { type: 'postback', label: t, data: 'action=pickEventType&eventType=' + encodeURIComponent(t), displayText: '舉辦類型：' + t },
+  }));
+  return {
+    type: 'flex',
+    altText: '請選擇舉辦類型（含押金說明）',
+    contents: {
+      type: 'bubble',
+      size: 'giga',
       header: { type: 'box', layout: 'vertical', backgroundColor: '#3D6B8C', paddingAll: 'md', contents: [{ type: 'text', text: '🎯 請選擇舉辦類型', weight: 'bold', color: '#FFFFFF', size: 'lg' }] },
-      body: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: 'md', contents: ['講座', '課程', '活動', '其他'].map((t) => ({ type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: t, data: 'action=pickEventType&eventType=' + encodeURIComponent(t), displayText: '舉辦類型：' + t } })) },
+      body: { type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: 'md', contents: [noteBox].concat(typeButtons) },
     },
   };
 }
@@ -1513,6 +1595,15 @@ function buildInfoConfirm(data, userId) {
   }
   bodyRows.push(row('應匯款總額', formatPrice(totalDue)));
   bodyRows.push(row('電話', data.phone), row('人數', String(data.headcount || '') + ' 人'), row('備註', data.note || '無'));
+  bodyRows.push({
+    type: 'text',
+    text: '🚭 ' + VENUE_RULE_NO_SMOKING_ZH,
+    size: 'xs',
+    color: '#C0392B',
+    wrap: true,
+    margin: 'md',
+    weight: 'bold',
+  });
   return {
     type: 'flex',
     altText: '請確認以下預約資訊',
@@ -1568,6 +1659,7 @@ function buildSuccessMessages(data) {
           spacing: 'sm',
           contents: successBodyRows.concat([
             { type: 'separator', margin: 'md' },
+            { type: 'text', text: '🚭 ' + VENUE_RULE_NO_SMOKING_ZH, size: 'xs', color: '#C0392B', wrap: true, weight: 'bold', margin: 'sm' },
             { type: 'text', text: '場域主理人：蘇郁翔\n聯繫電話：' + CONTACT_PHONE, size: 'sm', color: '#555555', wrap: true, margin: 'md' },
           ]),
         },
@@ -1597,7 +1689,8 @@ function buildSuccessMessages(data) {
               wrap: true,
               text:
                 depositPaymentNote +
-                '為確保您的預約檔期，請於本報價單發出後 3 個工作日內，匯款「訂金」至以下指定帳戶，並提供匯款帳號後五碼以利對帳。檔期保留將以訂金入帳為準。',
+                '為確保您的預約檔期，請於本報價單發出後 3 個工作日內，匯款「訂金」至以下指定帳戶，並提供匯款帳號後五碼以利對帳。檔期保留將以訂金入帳為準。\n\n🚭 ' +
+                VENUE_RULE_NO_SMOKING_ZH,
             },
             { type: 'separator', margin: 'md' },
             { type: 'text', margin: 'md', size: 'sm', color: '#3D6B8C', wrap: true, weight: 'bold', text: '感謝您選擇敘事空域 🏛️\n每一個故事，都值得一個好的空間。\n期待與您共創美好時光，若有任何需求請隨時聯繫我們！' },
@@ -2306,6 +2399,21 @@ async function handleEvent(event) {
       }
     }
 
+    // 老客沿用電話確認中
+    if (step === 'confirmPhone') {
+      const cleaned = text.replace(/[-\s]/g, '');
+      if (/^\d{8,10}$/.test(cleaned)) {
+        setSession(userId, 'inputHeadcount', { phone: text });
+        return reply(event, { type: 'text', text: '已更新電話。\n\n請問這次預約幾位？（請直接輸入數字，例如：15）' });
+      }
+      return reply(event, {
+        type: 'text',
+        text:
+          '請點選上方「✅ 確認電話無誤」沿用號碼，或直接傳送新的手機號碼（8~10 碼數字）。\n\n🚭 ' +
+          VENUE_RULE_NO_SMOKING_ZH,
+      });
+    }
+
     // 電話輸入
     if (step === 'inputPhone') {
       const cleaned = text.replace(/[-\s]/g, '');
@@ -2376,6 +2484,20 @@ async function handleEvent(event) {
 
     if (action === 'alreadyBooked') return reply(event, { type: 'text', text: '🚫 此時段已被預約，請選擇其他可用時段。' });
     if (action === 'blocked') return reply(event, { type: 'text', text: '⛔ 此預約已無法線上操作。\n\n請直接聯繫主理人：\n📞 ' + CONTACT_PHONE });
+
+    if (action === 'confirmCachedPhone') {
+      if (getStep(userId) !== 'confirmPhone') return reply(event, { type: 'text', text: '請先完成預約步驟，或輸入「立即預約」重新開始。' });
+      const cd = getData(userId);
+      if (!cd.cachedPhone) return reply(event, { type: 'text', text: '資料已過期，請輸入「立即預約」重新開始。' });
+      setSession(userId, 'inputHeadcount', { phone: cd.cachedPhone });
+      return reply(event, { type: 'text', text: '電話已確認。\n\n請問這次預約幾位？（請直接輸入數字，例如：15）' });
+    }
+    if (action === 'changeCachedPhone') {
+      if (getStep(userId) !== 'confirmPhone') return reply(event, { type: 'text', text: '請先完成預約步驟，或輸入「立即預約」重新開始。' });
+      const cd = getData(userId);
+      setSession(userId, 'inputPhone', { eventType: cd.eventType });
+      return reply(event, { type: 'text', text: '請輸入您的聯絡電話（必填，8~10碼數字）：\n例如：0939607867' });
+    }
 
     if (action === 'pickDate') {
       const date = event.postback.params && event.postback.params.date;
@@ -2476,14 +2598,19 @@ async function handleEvent(event) {
 
       const lineName = await getLineDisplayName(userId);
       setSession(userId, 'pickEventType', { date, slot, slotType, price, selectedSlots: [], name: lineName });
-      return reply(event, buildEventTypePicker());
+      return reply(event, buildEventTypePicker(userId));
     }
 
     if (action === 'pickEventType') {
       const eventType = decodeURIComponent(params.get('eventType'));
+      const pdata = getData(userId);
+      const cachedPhone = await getLatestPhoneFromPastBookings(userId);
+      if (cachedPhone) {
+        setSession(userId, 'confirmPhone', { eventType, cachedPhone });
+        return reply(event, buildPhoneConfirmFlex(cachedPhone, pdata.name || ''));
+      }
       setSession(userId, 'inputPhone', { eventType });
-      const data = getData(userId);
-      return reply(event, { type: 'text', text: 'Hi ' + data.name + '！\n\n請輸入您的聯絡電話（必填，10碼數字）：\n例如：0939607867' });
+      return reply(event, { type: 'text', text: 'Hi ' + (pdata.name || '') + '！\n\n請輸入您的聯絡電話（必填，8~10碼數字）：\n例如：0939607867' });
     }
 
     if (action === 'pickDuration') {
@@ -2541,7 +2668,7 @@ async function handleEvent(event) {
 
       const lineName = await getLineDisplayName(userId);
       setSession(userId, 'pickEventType', { date, slot: slotLabel, slotType: isFullDay ? '包場時段' : '單一鐘點', price: total, selectedSlots: occupiedSlots, holiday, name: lineName });
-      return reply(event, buildEventTypePicker());
+      return reply(event, buildEventTypePicker(userId));
     }
 
     if (action === 'suggestFixed') {
