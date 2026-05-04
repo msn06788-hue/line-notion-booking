@@ -691,7 +691,7 @@ function buildCancelConfirmCard(date, slot, price, isPaid, polNote) {
         type: 'box', layout: 'vertical', paddingAll: 'md', spacing: 'sm',
         contents: [
           { type: 'button', style: 'primary', color: '#C0392B', action: { type: 'message', label: '✅ 確認取消', text: '確認取消' } },
-          { type: 'button', style: 'secondary', action: { type: 'message', label: '← 返回', text: '我要更改或取消預約' } },
+          { type: 'button', style: 'secondary', action: { type: 'message', label: '← 返回上一步', text: '返回預約管理' } },
         ],
       },
     },
@@ -810,8 +810,24 @@ async function handleEvent(event) {
     const cancelOnlyTriggers = ['取消預約', '取消', '退訂', '不來了'];
     const rescheduleOnlyTriggers = ['改期', '換日期', '改時間', '更改預約'];
 
+    // 取消確認中 - 只接受「確認取消」或「返回預約管理」
+    if (step === 'confirmCancel') {
+      if (text === '返回預約管理') {
+        clearSession(userId);
+        const pages = await getUserBookings(userId);
+        if (pages.length === 0) return reply(event, { type: 'text', text: '查無預約記錄。' });
+        return reply(event, [
+          { type: 'text', text: '以下是您的預約記錄，請選擇要操作的場次：' },
+          buildMyBookings(pages),
+        ]);
+      }
+      if (text !== '確認取消') {
+        return reply(event, { type: 'text', text: '請點選「✅ 確認取消」確認，或「← 返回上一步」取消操作。' });
+      }
+    }
+
     // 圖文選單「更改/取消預約」觸發，或文字關鍵字
-    const manageKeywords = ['我要更改或取消預約', '更改或取消預約', '取消預約', '取消', '改期', '退訂', '不來了', '換日期', '改時間', '更改預約'];
+    const manageKeywords = ['我要更改或取消預約', '更改或取消預約', '取消預約', '取消', '改期', '退訂', '不來了', '換日期', '改時間', '更改預約', '返回預約管理'];
     if (manageKeywords.some(k => text === k || text.includes(k))) {
       const pages = await getUserBookings(userId);
       if (pages.length === 0) {
