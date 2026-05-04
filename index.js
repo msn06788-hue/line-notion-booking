@@ -8,7 +8,7 @@
  * - 相關環境變數：CRON_SECRET、NAV_GOOGLE_MAPS_URI、NAV_APPLE_MAPS_URI（可選）、PAYMENT_GRACE_DAYS、NOTION_UNPAID_ULTIMATUM_PROPERTY（見程式內常數區）
  * - 客戶層級：NOTION_CUSTOMER_DATABASE_ID、客戶層級、可選臨時價格倍率；另有 GLOBAL_PRICE_MULTIPLIER、蓁愛表 JSON（見程式內註解）
  * - 客戶電話：名冊庫建議「電話」欄（類型：電話）；NOTION_CUSTOMER_PHONE_PROPERTY（預設 聯絡電話）。曾留號會寫回名冊，下次預約不重複詢問
- * - 場地會勘→Notion 日曆（可選）：新建獨立資料庫，設 NOTION_SITE_VISIT_DATABASE_ID；預設欄位為「標題」(title)、「日期」(date，寫入送出當日供日曆檢視)、「會勘內容」(rich_text)。欄名可改用 NOTION_SITE_VISIT_*_PROP 覆寫
+ * - 場地會勘→Notion 日曆（可選）：新建獨立資料庫，設 NOTION_SITE_VISIT_DATABASE_ID；預設欄位為「標題」(title)、「日期」(date)、「會勘內容」(rich_text)。姓名採 LINE 顯示名；電話與可解析之會勘時間皆必填始成立。欄名可改用 NOTION_SITE_VISIT_*_PROP 覆寫
  * - 活動／課程押金：VENUE_ACTIVITY_DEPOSIT_NT（預設 3000）；講座／其他不收；蓁愛講師免押金
  */
 const express = require('express');
@@ -1799,21 +1799,28 @@ function buildAdminPlainSummary(booking, action) {
   return '通知';
 }
 
-/** 場地會勘：關鍵字觸發引導文案（不需另建資料庫，客人回覆後轉發行政群） */
+/** 場地會勘：關鍵字觸發引導文案（姓名＝LINE 顯示名；電話與時間須通過驗證才算數） */
 const SITE_VISIT_GUIDE_REPLY =
   '您好，如需安排「場地會勘」，請複製下方格式填寫後，將內容「一次傳送」給我們：\n\n' +
   '【場地會勘】\n' +
-  '姓名：\n' +
-  '電話：\n' +
+  '（姓名將直接使用您的 LINE 顯示名稱，無須填寫）\n' +
+  '電話：（必填，例：0912345678）\n' +
   '會勘時間（可填 1～3 個方便時段）：\n' +
   '1.\n' +
   '2.\n' +
   '3.\n\n' +
-  '※ 請盡量寫明日期與大概時段（例：6/15（日）14:00–16:00）。\n' +
+  '※ 電話與「至少一組可解析的日期＋時段」皆必填；缺一則申請不成立。\n' +
+  '※ 時間請寫清楚（例：6/15下午三點、6/9下午3:00）。\n' +
   '※ 送出後我們將儘快與您聯繫，謝謝您！';
 
 const SITE_VISIT_SUBMITTED_REPLY =
   '✅ 已收到您的場地會勘申請，我們將儘快與您聯繫。\n\n如需預約正式場次，請輸入「立即預約」。';
+
+const SITE_VISIT_REJECT_NO_PHONE =
+  '⚠️ 場地會勘尚未成立：請務必留下「手機號碼」（10 碼，09 開頭，例：0912345678），並與會勘時間一起「一次傳送」。';
+
+const SITE_VISIT_REJECT_NO_TIME =
+  '⚠️ 場地會勘尚未成立：請務必寫明「會勘時間」（須含月／日與時段，例：6/9下午三點），並與電話一起「一次傳送」。';
 
 function normalizeSiteVisitQuery(raw) {
   return String(raw || '').trim().replace(/\s+/g, '');
@@ -1878,7 +1885,48 @@ function matchesSiteVisitIntent(text) {
   return false;
 }
 
-async function notifyGroupSiteVisitRequest(userId, displayName, bodyText) {
+/** 自會勘回覆文中抽取台灣手機（09 + 8 碼）；無則 null */
+function extractTaiwanMobileFromSiteVisitText(text) {
+  const digits = String(text || '').replace(/\D/g, '');
+  let pos = digits.indexOf('09');
+  while (pos !== -1) {
+    const chunk = digits.slice(pos, pos + 10);
+    if (/^09\d{8}$/.test(chunk)) return chunk;
+    pos = digits.indexOf('09', pos + 1);
+  }
+  const ix = digits.indexOf('886');
+  if (ix !== -1) {
+    const tail = digits.slice(ix + 3);
+    const p = tail.indexOf('9');
+    if (p !== -1 && tail.length >= p + 9) {
+      const nine = tail.slice(p, p + 9);
+      if (/^9\d{8}$/.test(nine)) return '0' + nine;
+    }
+  }
+  return null;
+}
+
+function formatSiteVisitParsedForAdmin(isoLocal) {
+  if (!isoLocal) return '—';
+  const d = new Date(isoLocal);
+  if (isNaN(d.getTime())) return String(isoLocal);
+  try {
+    return new Intl.DateTimeFormat('zh-TW', {
+      timeZone: 'Asia/Taipei',
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(d);
+  } catch (e) {
+    return String(isoLocal);
+  }
+}
+
+async function notifyGroupSiteVisitRequest(userId, displayName, phone, parsedIso, guestRawBody) {
   if (!NOTIFY_GROUP_ID) {
     appendBotLog('[場地會勘] 行政群組未設定，略過推播');
     if (Date.now() - lastAlertNoGroupMs > 3600000) {
@@ -1887,20 +1935,23 @@ async function notifyGroupSiteVisitRequest(userId, displayName, bodyText) {
     }
     return false;
   }
-  const body = String(bodyText || '').trim() || '（無內文）';
+  const guestRaw = String(guestRawBody || '').trim() || '（無）';
   const msg =
-    '🏛️【場地會勘】客人提交\n' +
+    '🏛️【場地會勘】客人提交（已驗證）\n' +
     '══════════════════\n' +
-    '顯示名稱：' + (displayName || '—') + '\n' +
+    '姓名（LINE）：' + (displayName || '—') + '\n' +
+    '電話：' + phone + '\n' +
+    '會勘時間（解析・台北）：' + formatSiteVisitParsedForAdmin(parsedIso) + '\n' +
     '══════════════════\n' +
-    body +
+    '客人原文：\n' +
+    guestRaw +
     '\n══════════════════\n' +
     '（請將以上內容轉發簡訊或回電與客人聯繫）';
   const ok = await linePushLogged(NOTIFY_GROUP_ID, { type: 'text', text: msg }, '行政群組·場地會勘');
   if (!ok) {
-    await sendOwnerAlert('場地會勘推播失敗', 'target=' + maskId(NOTIFY_GROUP_ID) + '\n' + body.slice(0, 900));
+    await sendOwnerAlert('場地會勘推播失敗', 'target=' + maskId(NOTIFY_GROUP_ID) + '\n' + guestRaw.slice(0, 900));
   }
-  appendBotLog('[場地會勘] 已轉發行政群 user=' + maskId(userId) + ' len=' + body.length);
+  appendBotLog('[場地會勘] 已轉發行政群 user=' + maskId(userId) + ' len=' + guestRaw.length);
   return ok;
 }
 
@@ -1910,18 +1961,145 @@ function truncateForNotionRichText(s, maxLen) {
   return t.slice(0, Math.max(0, maxLen - 1)) + '…';
 }
 
-async function appendSiteVisitToNotion(displayName, bodyText) {
-  if (!NOTION_SITE_VISIT_DATABASE_ID) return false;
+/** 將會勘自由文字中的「6/9下午3:00」「6/9下午3點」「6/9下午三點」等解析為台北時區 ISO（失敗回傳 null） */
+function parseSiteVisitLooseDateTime(rawText, refNow) {
+  refNow = refNow || new Date();
+  let s = String(rawText || '')
+    .replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .replace(/\u3000/g, ' ');
+  s = s.replace(/\s+/g, '');
+  if (!s) return null;
+
+  const pad2 = (n) => String(n).padStart(2, '0');
+  let mdPick = null;
+  for (let si = 0; si < s.length; si++) {
+    const ch = s.charAt(si);
+    if (ch !== '/' && ch !== '／') continue;
+    let le = si - 1;
+    while (le >= 0 && /\d/.test(s.charAt(le))) le--;
+    const leftDigits = s.slice(le + 1, si);
+    if (!leftDigits) continue;
+    let ri = si + 1;
+    while (ri < s.length && /\d/.test(s.charAt(ri))) ri++;
+    const dayNum = parseInt(s.slice(si + 1, ri), 10);
+    if (!(dayNum >= 1 && dayNum <= 31)) continue;
+    let month = null;
+    for (let ml = Math.min(2, leftDigits.length); ml >= 1; ml--) {
+      const candMo = parseInt(leftDigits.slice(leftDigits.length - ml), 10);
+      if (candMo >= 1 && candMo <= 12) {
+        month = candMo;
+        break;
+      }
+    }
+    if (month === null) continue;
+    mdPick = { month: month, day: dayNum, tailStart: ri };
+    break;
+  }
+  if (!mdPick) return null;
+  const month = mdPick.month;
+  const dayNum = mdPick.day;
+
+  const tail = s.slice(mdPick.tailStart);
+  const periodMatch = tail.match(/^(上午|中午|下午|晚上)?/);
+  const period = periodMatch && periodMatch[1] ? periodMatch[1] : '';
+
+  let rest = tail.slice((periodMatch && periodMatch[1]) ? periodMatch[1].length : 0);
+
+  let hour12 = null;
+  let minute = 0;
+
+  const mDigit = rest.match(/^(\d{1,2})(?:[:：](\d{2}))?(?:點(?!\d))?/);
+  if (mDigit) {
+    hour12 = parseInt(mDigit[1], 10);
+    if (mDigit[2] !== undefined) minute = parseInt(mDigit[2], 10);
+    rest = rest.slice(mDigit[0].length);
+  } else {
+    const cnBlock = [
+      ['十二', 12],
+      ['十一', 11],
+      ['十', 10],
+      ['兩', 2],
+      ['二', 2],
+      ['三', 3],
+      ['四', 4],
+      ['五', 5],
+      ['六', 6],
+      ['七', 7],
+      ['八', 8],
+      ['九', 9],
+      ['一', 1],
+    ];
+    let matchedCn = false;
+    for (let i = 0; i < cnBlock.length; i++) {
+      const [word, num] = cnBlock[i];
+      if (rest.startsWith(word)) {
+        const after = rest.slice(word.length);
+        if (after.startsWith('點') || after.startsWith(':') || after.startsWith('：') || after === '') {
+          hour12 = num;
+          rest = after.startsWith('點') ? after.slice(1) : after;
+          matchedCn = true;
+          break;
+        }
+      }
+    }
+    if (!matchedCn) return null;
+  }
+
+  if (hour12 === null || hour12 < 0 || hour12 > 23 || minute < 0 || minute > 59) return null;
+
+  let hour24 = hour12;
+  if (period === '上午') {
+    if (hour12 === 12) hour24 = 0;
+    else hour24 = hour12;
+  } else if (period === '中午') {
+    hour24 = hour12 <= 12 ? 12 : hour12;
+  } else if (period === '下午' || period === '晚上') {
+    if (hour12 !== 12) hour24 = hour12 + 12;
+    else hour24 = 12;
+  } else if (!period) {
+    hour24 = hour12;
+    if (hour24 >= 1 && hour24 <= 11) hour24 = hour24 + 12;
+  }
+
+  if (hour24 < 0 || hour24 > 23) return null;
+
+  const refY = parseInt(formatTaipeiYmd(refNow).slice(0, 4), 10);
+  const todayStr = formatTaipeiYmd(refNow);
+  const todayNoon = new Date(todayStr + 'T12:00:00+08:00');
+  let pickedYear = refY;
+  const noonThatDay = (yy) => new Date(yy + '-' + pad2(month) + '-' + pad2(dayNum) + 'T12:00:00+08:00');
+  if (noonThatDay(pickedYear).getTime() < todayNoon.getTime() - 3 * 86400000) pickedYear += 1;
+
+  const isoLocal =
+    pickedYear +
+    '-' +
+    pad2(month) +
+    '-' +
+    pad2(dayNum) +
+    'T' +
+    pad2(hour24) +
+    ':' +
+    pad2(minute) +
+    ':00+08:00';
+
+  const dt = new Date(isoLocal);
+  if (isNaN(dt.getTime())) return null;
+  return isoLocal;
+}
+
+async function appendSiteVisitToNotion(displayName, bodyText, phone, parsedIso) {
+  if (!NOTION_SITE_VISIT_DATABASE_ID || !parsedIso) return false;
   try {
-    const dateStr = formatTaipeiYmd(new Date());
+    const dateProp = { date: { start: parsedIso } };
     const dn = String(displayName || '').trim();
-    const titleText = truncateForNotionRichText('[場勘]' + (dn ? ' ' + dn : ' LINE'), 180);
-    const body = truncateForNotionRichText(bodyText || '', 1900);
+    const titleText = truncateForNotionRichText('[場勘] ' + (dn || 'LINE'), 180);
+    const richBody = '電話：' + phone + '\n────────\n' + String(bodyText || '').trim();
+    const body = truncateForNotionRichText(richBody, 1900);
     const props = {};
     props[NOTION_SITE_VISIT_TITLE_PROP] = {
       title: [{ text: { content: titleText || '[場勘]' } }],
     };
-    props[NOTION_SITE_VISIT_DATE_PROP] = { date: { start: dateStr } };
+    props[NOTION_SITE_VISIT_DATE_PROP] = dateProp;
     props[NOTION_SITE_VISIT_BODY_PROP] = {
       rich_text: [{ text: { content: body || '—' } }],
     };
@@ -3135,12 +3313,21 @@ async function handleEvent(event) {
       if (!trimmedSv) {
         return reply(event, {
           type: 'text',
-          text: '請貼上您的會勘資料（姓名、電話、時段）。若需重新查看格式，請再輸入「會勘」。',
+          text: '請貼上電話與會勘時間（姓名將使用您的 LINE 名稱）。若需重新查看格式，請再輸入「會勘」。',
         });
       }
+      const phoneSv = extractTaiwanMobileFromSiteVisitText(trimmedSv);
+      const parsedIsoSv = parseSiteVisitLooseDateTime(trimmedSv);
+      if (!phoneSv) {
+        return reply(event, { type: 'text', text: SITE_VISIT_REJECT_NO_PHONE });
+      }
+      if (!parsedIsoSv) {
+        return reply(event, { type: 'text', text: SITE_VISIT_REJECT_NO_TIME });
+      }
       const displayNameSv = await getLineDisplayName(userId);
-      await notifyGroupSiteVisitRequest(userId, displayNameSv, trimmedSv);
-      await appendSiteVisitToNotion(displayNameSv, trimmedSv);
+      await notifyGroupSiteVisitRequest(userId, displayNameSv, phoneSv, parsedIsoSv, trimmedSv);
+      await appendSiteVisitToNotion(displayNameSv, trimmedSv, phoneSv, parsedIsoSv);
+      await persistKnownPhoneForUser(userId, phoneSv);
       clearSession(userId);
       return reply(event, { type: 'text', text: SITE_VISIT_SUBMITTED_REPLY });
     }
