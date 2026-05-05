@@ -77,6 +77,7 @@ const NOTIFY_GROUP_ID_SOURCE = LINE_NOTIFY_GROUP_ID_ENV
     : 'BUILTIN_DEFAULT';
 function getAdminNotifyTargets() {
   const raw = [
+    { id: runtimeNotifyGroupId, source: 'AUTO_DISCOVERED_GROUP_ID' },
     { id: LINE_NOTIFY_GROUP_ID_ENV, source: 'LINE_NOTIFY_GROUP_ID' },
     { id: LINE_ADMIN_GROUP_ID_ENV, source: 'LINE_ADMIN_GROUP_ID' },
     { id: BUILTIN_NOTIFY_GROUP_ID, source: 'BUILTIN_DEFAULT' },
@@ -94,6 +95,7 @@ function getAdminNotifyTargets() {
 const ENABLE_NOTIFY_DEBUG_LOG =
   process.env.ENABLE_NOTIFY_DEBUG_LOG === '1' || /^true$/i.test(String(process.env.ENABLE_NOTIFY_DEBUG_LOG || ''));
 const LOG_DIR = process.env.LOG_DIR || path.join(process.cwd(), 'logs');
+const DYNAMIC_NOTIFY_GROUP_FILE = path.join(LOG_DIR, 'notify-group.id');
 const CONTACT_PHONE = (process.env.CONTACT_PHONE || '0939-607867').trim();
 const BANK_NAME = process.env.BANK_NAME || '星展銀行 810';
 const BANK_BRANCH = process.env.BANK_BRANCH || '世貿分行';
@@ -130,6 +132,26 @@ function appendBotLog(line) {
 function maskId(id) {
   if (!id || id.length < 8) return id || '(空)';
   return id.slice(0, 4) + '…' + id.slice(-4);
+}
+
+function loadDynamicNotifyGroupId() {
+  try {
+    if (!fs.existsSync(DYNAMIC_NOTIFY_GROUP_FILE)) return '';
+    return String(fs.readFileSync(DYNAMIC_NOTIFY_GROUP_FILE, 'utf8') || '').trim();
+  } catch (e) {
+    return '';
+  }
+}
+let runtimeNotifyGroupId = loadDynamicNotifyGroupId();
+function rememberRuntimeNotifyGroupId(groupId, reason) {
+  const gid = String(groupId || '').trim();
+  if (!gid || !/^C/.test(gid) || gid === runtimeNotifyGroupId) return;
+  runtimeNotifyGroupId = gid;
+  try {
+    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.writeFileSync(DYNAMIC_NOTIFY_GROUP_FILE, gid + '\n', 'utf8');
+  } catch (e) {}
+  appendBotLog('[行政群組] 自動綁定 groupId=' + maskId(gid) + ' reason=' + String(reason || 'unknown'));
 }
 
 function extractLinePushError(err) {
@@ -3423,6 +3445,7 @@ async function finalizeRescheduleFromSession(event, userId) {
 async function handleEvent(event) {
   // 群組訊息：預約查詢 / 財務報表
   if (event.source.type === 'group') {
+    if (event.source.groupId) rememberRuntimeNotifyGroupId(event.source.groupId, 'group-event');
     if (event.type === 'message' && event.message.type === 'text') {
       const text = event.message.text.trim();
       if (process.env.LOG_GROUP_MESSAGE === '1' && event.source.groupId) {
@@ -5000,6 +5023,11 @@ app.listen(PORT, () => {
   console.log('[設定] 行政推播目標群組：' + maskId(NOTIFY_GROUP_ID) + (DEFAULT_NOTIFY_FALLBACK ? ' — ⚠️ 使用程式內預設 ID，請在 .env 設定 LINE_NOTIFY_GROUP_ID 為你的行政群' : ' — 來自環境變數'));
   console.log('[設定] 行政推播候選群組：' + getAdminNotifyTargets().map((t) => t.source + ':' + maskId(t.id)).join(','));
   console.log('[設定] 行政群組 ID 來源：' + NOTIFY_GROUP_ID_SOURCE + '｜診斷日志=' + (ENABLE_NOTIFY_DEBUG_LOG ? 'ON' : 'OFF'));
+  if (runtimeNotifyGroupId) {
+    console.log('[設定] 已載入自動綁定行政群：' + maskId(runtimeNotifyGroupId) + '（' + DYNAMIC_NOTIFY_GROUP_FILE + '）');
+  } else {
+    console.log('[設定] 尚未有自動綁定行政群（在行政群發一則訊息後會自動記錄）');
+  }
   if (DEFAULT_NOTIFY_FALLBACK) {
     console.warn('[提示] 若行政群沒收到推播：① Channel 與入群的是同一支 Bot ② 群組 ID 正確。可暫設 LOG_GROUP_MESSAGE=1 重啟後在群裡發話，從主控台複製 groupId 到 .env。');
   }
