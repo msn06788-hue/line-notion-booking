@@ -65,22 +65,20 @@ const NARRATIVE_VIP_FIXED_MULTIPLIER = (() => {
 /** 設為 true 時：若已設定客戶名冊庫，則不再使用 LINE_ID_TO_TIER_JSON 備援 */
 const CUSTOMER_TIER_STRICT_NOTION =
   process.env.CUSTOMER_TIER_STRICT_NOTION === '1' || /^true$/i.test(String(process.env.CUSTOMER_TIER_STRICT_NOTION || ''));
-const BUILTIN_NOTIFY_GROUP_ID = 'C6f36b9fa93777db373fa52dedbc43d66';
 const LINE_NOTIFY_GROUP_ID_ENV = (process.env.LINE_NOTIFY_GROUP_ID || '').trim();
 const LINE_ADMIN_GROUP_ID_ENV = (process.env.LINE_ADMIN_GROUP_ID || '').trim();
-const NOTIFY_GROUP_ID = (LINE_NOTIFY_GROUP_ID_ENV || LINE_ADMIN_GROUP_ID_ENV || '').trim() || BUILTIN_NOTIFY_GROUP_ID;
-const DEFAULT_NOTIFY_FALLBACK = !(LINE_NOTIFY_GROUP_ID_ENV || LINE_ADMIN_GROUP_ID_ENV);
+const NOTIFY_GROUP_ID = (LINE_NOTIFY_GROUP_ID_ENV || LINE_ADMIN_GROUP_ID_ENV || '').trim();
+const DEFAULT_NOTIFY_FALLBACK = !NOTIFY_GROUP_ID;
 const NOTIFY_GROUP_ID_SOURCE = LINE_NOTIFY_GROUP_ID_ENV
   ? 'LINE_NOTIFY_GROUP_ID'
   : LINE_ADMIN_GROUP_ID_ENV
     ? 'LINE_ADMIN_GROUP_ID'
-    : 'BUILTIN_DEFAULT';
+    : 'UNSET';
 function getAdminNotifyTargets() {
   const raw = [
     { id: runtimeNotifyGroupId, source: 'AUTO_DISCOVERED_GROUP_ID' },
     { id: LINE_NOTIFY_GROUP_ID_ENV, source: 'LINE_NOTIFY_GROUP_ID' },
     { id: LINE_ADMIN_GROUP_ID_ENV, source: 'LINE_ADMIN_GROUP_ID' },
-    { id: BUILTIN_NOTIFY_GROUP_ID, source: 'BUILTIN_DEFAULT' },
   ];
   const out = [];
   const seen = new Set();
@@ -5020,7 +5018,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('✅ 啟動 Port: ' + PORT);
   console.log('[設定] 後台日誌目錄：' + LOG_DIR + '（line-bot.log）');
-  console.log('[設定] 行政推播目標群組：' + maskId(NOTIFY_GROUP_ID) + (DEFAULT_NOTIFY_FALLBACK ? ' — ⚠️ 使用程式內預設 ID，請在 .env 設定 LINE_NOTIFY_GROUP_ID 為你的行政群' : ' — 來自環境變數'));
+  console.log('[設定] 行政推播目標群組：' + maskId(NOTIFY_GROUP_ID) + (DEFAULT_NOTIFY_FALLBACK ? ' — ⚠️ 未設定，請在 .env 設定 LINE_NOTIFY_GROUP_ID 或 LINE_ADMIN_GROUP_ID' : ' — 來自環境變數'));
   console.log('[設定] 行政推播候選群組：' + getAdminNotifyTargets().map((t) => t.source + ':' + maskId(t.id)).join(','));
   console.log('[設定] 行政群組 ID 來源：' + NOTIFY_GROUP_ID_SOURCE + '｜診斷日志=' + (ENABLE_NOTIFY_DEBUG_LOG ? 'ON' : 'OFF'));
   if (runtimeNotifyGroupId) {
