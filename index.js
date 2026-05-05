@@ -71,6 +71,13 @@ const NOTIFY_GROUP_ID = (
   ''
 ).trim() || 'C6f36b9fa93777db373fa52dedbc43d66';
 const DEFAULT_NOTIFY_FALLBACK = !((process.env.LINE_NOTIFY_GROUP_ID || process.env.LINE_ADMIN_GROUP_ID || '').trim());
+const NOTIFY_GROUP_ID_SOURCE = (process.env.LINE_NOTIFY_GROUP_ID || '').trim()
+  ? 'LINE_NOTIFY_GROUP_ID'
+  : (process.env.LINE_ADMIN_GROUP_ID || '').trim()
+    ? 'LINE_ADMIN_GROUP_ID'
+    : 'BUILTIN_DEFAULT';
+const ENABLE_NOTIFY_DEBUG_LOG =
+  process.env.ENABLE_NOTIFY_DEBUG_LOG === '1' || /^true$/i.test(String(process.env.ENABLE_NOTIFY_DEBUG_LOG || ''));
 const LOG_DIR = process.env.LOG_DIR || path.join(process.cwd(), 'logs');
 const CONTACT_PHONE = (process.env.CONTACT_PHONE || '0939-607867').trim();
 const BANK_NAME = process.env.BANK_NAME || '星展銀行 810';
@@ -2246,6 +2253,18 @@ async function appendSiteVisitToNotion(userId, displayName, bodyText, phone, par
 
 async function notifyGroup(booking, action) {
   action = action || 'new';
+  if (ENABLE_NOTIFY_DEBUG_LOG) {
+    appendBotLog(
+      '[notifyGroup] start action=' +
+        action +
+        ' target=' +
+        maskId(NOTIFY_GROUP_ID) +
+        ' source=' +
+        NOTIFY_GROUP_ID_SOURCE +
+        ' user=' +
+        maskId(booking && booking.userId)
+    );
+  }
   if (!NOTIFY_GROUP_ID) {
     appendBotLog('[行政群組] 略過：LINE_NOTIFY_GROUP_ID 未設定');
     if (Date.now() - lastAlertNoGroupMs > 3600000) {
@@ -2317,13 +2336,24 @@ async function notifyGroup(booking, action) {
 
   let anyOk = false;
   if (action === 'cancel' || action === 'reschedule') {
-    if (await linePushLogged(NOTIFY_GROUP_ID, { type: 'text', text: plainSummary }, '行政群組·文字(' + action + ')')) anyOk = true;
-    if (await linePushLogged(NOTIFY_GROUP_ID, message, '行政群組·Flex(' + action + ')')) anyOk = true;
+    const okText = await linePushLogged(NOTIFY_GROUP_ID, { type: 'text', text: plainSummary }, '行政群組·文字(' + action + ')');
+    if (ENABLE_NOTIFY_DEBUG_LOG) appendBotLog('[notifyGroup] text action=' + action + ' ok=' + okText);
+    if (okText) anyOk = true;
+    const okFlex = await linePushLogged(NOTIFY_GROUP_ID, message, '行政群組·Flex(' + action + ')');
+    if (ENABLE_NOTIFY_DEBUG_LOG) appendBotLog('[notifyGroup] flex action=' + action + ' ok=' + okFlex);
+    if (okFlex) anyOk = true;
   } else {
-    if (await linePushLogged(NOTIFY_GROUP_ID, message, '行政群組·Flex(new)')) anyOk = true;
-    else if (await linePushLogged(NOTIFY_GROUP_ID, { type: 'text', text: plainSummary }, '行政群組·文字(new·fallback)')) anyOk = true;
+    const okFlexNew = await linePushLogged(NOTIFY_GROUP_ID, message, '行政群組·Flex(new)');
+    if (ENABLE_NOTIFY_DEBUG_LOG) appendBotLog('[notifyGroup] flex action=new ok=' + okFlexNew);
+    if (okFlexNew) anyOk = true;
+    else {
+      const okTextFallback = await linePushLogged(NOTIFY_GROUP_ID, { type: 'text', text: plainSummary }, '行政群組·文字(new·fallback)');
+      if (ENABLE_NOTIFY_DEBUG_LOG) appendBotLog('[notifyGroup] text-fallback action=new ok=' + okTextFallback);
+      if (okTextFallback) anyOk = true;
+    }
   }
 
+  if (ENABLE_NOTIFY_DEBUG_LOG) appendBotLog('[notifyGroup] done action=' + action + ' anyOk=' + anyOk);
   if (!anyOk) {
     await sendOwnerAlert(
       '行政群組推播全失敗（文字與 Flex 皆失敗）',
@@ -4874,6 +4904,30 @@ app.get('/cron/unpaid-ultimatum', async (req, res) => {
   res.json({ ok: true, time: new Date().toISOString(), job: 'unpaid-ultimatum' });
 });
 
+/** 診斷用：手動測試行政群推播（不影響預約流程） */
+app.get('/debug/notify-group', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader !== 'Bearer ' + process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const text =
+    String(req.query.text || '').trim() ||
+    '🧪 行政群推播診斷\n' +
+      'time=' +
+      new Date().toISOString() +
+      '\nsource=' +
+      NOTIFY_GROUP_ID_SOURCE +
+      '\ntarget=' +
+      maskId(NOTIFY_GROUP_ID);
+  const ok = await linePushLogged(NOTIFY_GROUP_ID, { type: 'text', text: text.slice(0, 4900) }, 'debug/notify-group');
+  return res.json({
+    ok,
+    target: maskId(NOTIFY_GROUP_ID),
+    source: NOTIFY_GROUP_ID_SOURCE,
+    usedFallbackDefault: DEFAULT_NOTIFY_FALLBACK,
+  });
+});
+
 async function handleEventSafe(event) {
   try {
     await handleEvent(event);
@@ -4903,6 +4957,7 @@ app.listen(PORT, () => {
   console.log('✅ 啟動 Port: ' + PORT);
   console.log('[設定] 後台日誌目錄：' + LOG_DIR + '（line-bot.log）');
   console.log('[設定] 行政推播目標群組：' + maskId(NOTIFY_GROUP_ID) + (DEFAULT_NOTIFY_FALLBACK ? ' — ⚠️ 使用程式內預設 ID，請在 .env 設定 LINE_NOTIFY_GROUP_ID 為你的行政群' : ' — 來自環境變數'));
+  console.log('[設定] 行政群組 ID 來源：' + NOTIFY_GROUP_ID_SOURCE + '｜診斷日志=' + (ENABLE_NOTIFY_DEBUG_LOG ? 'ON' : 'OFF'));
   if (DEFAULT_NOTIFY_FALLBACK) {
     console.warn('[提示] 若行政群沒收到推播：① Channel 與入群的是同一支 Bot ② 群組 ID 正確。可暫設 LOG_GROUP_MESSAGE=1 重啟後在群裡發話，從主控台複製 groupId 到 .env。');
   }
