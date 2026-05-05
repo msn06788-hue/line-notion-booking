@@ -76,10 +76,12 @@ const NOTIFY_GROUP_ID_SOURCE = LINE_NOTIFY_GROUP_ID_ENV
     : 'UNSET';
 function getAdminNotifyTargets() {
   const raw = [
-    { id: runtimeNotifyGroupId, source: 'AUTO_DISCOVERED_GROUP_ID' },
     { id: LINE_NOTIFY_GROUP_ID_ENV, source: 'LINE_NOTIFY_GROUP_ID' },
     { id: LINE_ADMIN_GROUP_ID_ENV, source: 'LINE_ADMIN_GROUP_ID' },
   ];
+  if (!LINE_NOTIFY_GROUP_ID_ENV && !LINE_ADMIN_GROUP_ID_ENV) {
+    raw.push({ id: runtimeNotifyGroupId, source: 'AUTO_DISCOVERED_GROUP_ID' });
+  }
   const out = [];
   const seen = new Set();
   for (const item of raw) {
@@ -92,7 +94,8 @@ function getAdminNotifyTargets() {
 }
 const ENABLE_NOTIFY_DEBUG_LOG =
   process.env.ENABLE_NOTIFY_DEBUG_LOG === '1' || /^true$/i.test(String(process.env.ENABLE_NOTIFY_DEBUG_LOG || ''));
-const LOG_DIR = process.env.LOG_DIR || path.join(process.cwd(), 'logs');
+const IS_VERCEL_RUNTIME = !!process.env.VERCEL || process.env.AWS_EXECUTION_ENV === 'AWS_Lambda_nodejs20.x';
+const LOG_DIR = process.env.LOG_DIR || (IS_VERCEL_RUNTIME ? '/tmp/logs' : path.join(process.cwd(), 'logs'));
 const DYNAMIC_NOTIFY_GROUP_FILE = path.join(LOG_DIR, 'notify-group.id');
 const CONTACT_PHONE = (process.env.CONTACT_PHONE || '0939-607867').trim();
 const BANK_NAME = process.env.BANK_NAME || '星展銀行 810';
@@ -118,12 +121,18 @@ const BOOKING_MAX_DAYS_AHEAD = Math.min(Math.max(Number(process.env.BOOKING_MAX_
 const app = express();
 
 let lastAlertNoGroupMs = 0;
+let logWriteWarned = false;
 function appendBotLog(line) {
+  const logLine = new Date().toISOString() + ' ' + line;
+  console.log(logLine);
   try {
     if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
-    fs.appendFileSync(path.join(LOG_DIR, 'line-bot.log'), new Date().toISOString() + ' ' + line + '\n');
+    fs.appendFileSync(path.join(LOG_DIR, 'line-bot.log'), logLine + '\n');
   } catch (e) {
-    console.error('[日誌寫入失敗]', e.message);
+    if (!logWriteWarned) {
+      logWriteWarned = true;
+      console.warn('[日誌寫入停用] ' + e.message + '（仍會輸出到 console）');
+    }
   }
 }
 
@@ -3443,7 +3452,9 @@ async function finalizeRescheduleFromSession(event, userId) {
 async function handleEvent(event) {
   // 群組訊息：預約查詢 / 財務報表
   if (event.source.type === 'group') {
-    if (event.source.groupId) rememberRuntimeNotifyGroupId(event.source.groupId, 'group-event');
+    if (!LINE_NOTIFY_GROUP_ID_ENV && !LINE_ADMIN_GROUP_ID_ENV && event.source.groupId) {
+      rememberRuntimeNotifyGroupId(event.source.groupId, 'group-event');
+    }
     if (event.type === 'message' && event.message.type === 'text') {
       const text = event.message.text.trim();
       if (process.env.LOG_GROUP_MESSAGE === '1' && event.source.groupId) {
