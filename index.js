@@ -3499,6 +3499,12 @@ async function handleEvent(event) {
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
     const step = getStep(userId);
+    const isConfirmCachedPhoneText =
+      text === '確認電話' ||
+      text === '確認電話無誤' ||
+      text === '✅ 確認電話無誤' ||
+      text === '確認聯絡電話' ||
+      text === '確認號碼';
 
     /** 與 LINE 圖文選單「預約取消/改期」等文案一致（含斜線與無連接詞） */
     const manageBookingKeywords = [
@@ -3754,6 +3760,16 @@ async function handleEvent(event) {
 
     // 老客沿用電話確認中
     if (step === 'confirmPhone') {
+      if (isConfirmCachedPhoneText) {
+        const cd = getData(userId);
+        if (cd && cd.cachedPhone) {
+          await persistKnownPhoneForUser(userId, cd.cachedPhone);
+          setSession(userId, 'inputHeadcount', { phone: cd.cachedPhone });
+          return reply(event, { type: 'text', text: '電話已確認。\n\n請問這次預約幾位？（請直接輸入數字，例如：15）' });
+        }
+        setSession(userId, 'inputPhone', { eventType: cd && cd.eventType ? cd.eventType : undefined });
+        return reply(event, { type: 'text', text: '找不到可沿用的電話，請直接輸入您的聯絡電話（8~10碼數字）：\n例如：0939607867' });
+      }
       const cleaned = text.replace(/[-\s]/g, '');
       if (/^\d{8,10}$/.test(cleaned)) {
         await persistKnownPhoneForUser(userId, text);
@@ -3891,7 +3907,14 @@ async function handleEvent(event) {
     if (action === 'blocked') return reply(event, { type: 'text', text: '⛔ 此預約已無法線上操作。\n\n請直接聯繫主理人：\n📞 ' + CONTACT_PHONE });
 
     if (action === 'confirmCachedPhone') {
-      if (getStep(userId) !== 'confirmPhone') return reply(event, { type: 'text', text: '請先完成預約步驟，或輸入「立即預約」重新開始。' });
+      if (getStep(userId) === 'inputHeadcount') {
+        const cdReady = getData(userId);
+        return reply(event, {
+          type: 'text',
+          text: '電話已確認，請直接輸入這次預約人數（數字），例如：15' + (cdReady && cdReady.phone ? '\n目前電話：' + cdReady.phone : ''),
+        });
+      }
+      if (getStep(userId) !== 'confirmPhone') return reply(event, { type: 'text', text: '目前不在電話確認步驟。請輸入「立即預約」重新開始。' });
       const cd = getData(userId);
       if (!cd.cachedPhone) return reply(event, { type: 'text', text: '資料已過期，請輸入「立即預約」重新開始。' });
       await persistKnownPhoneForUser(userId, cd.cachedPhone);
