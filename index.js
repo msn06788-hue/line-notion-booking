@@ -1885,6 +1885,9 @@ const BOOKING_FLOW_STEPS_BLOCK_SITE_VISIT = new Set([
   'inputCode',
 ]);
 
+/** Quick Reply：填寫會勘（勿觸發「site+visit」英文意圖誤判） */
+const SITE_VISIT_QUICK_ACTION_FILL = '__SITE_VISIT_FILL__';
+
 function normalizeSiteVisitQuery(raw) {
   return String(raw || '').trim().replace(/\s+/g, '');
 }
@@ -1893,6 +1896,7 @@ function matchesSiteVisitIntent(text) {
   const q = normalizeSiteVisitQuery(text);
   const low = q.toLowerCase();
   if (q.length < 2) return false;
+  if (q === SITE_VISIT_QUICK_ACTION_FILL) return false;
 
   const keys = [
     '會勘',
@@ -1944,7 +1948,7 @@ function matchesSiteVisitIntent(text) {
   for (let i = 0; i < en.length; i++) {
     if (low.includes(en[i])) return true;
   }
-  if (low.includes('site') && low.includes('visit')) return true;
+  if (/\bsite[\s_-]*visit\b/.test(low)) return true;
 
   if (q.includes('看') && (q.includes('場地') || q.includes('空間') || q.includes('現場') || q.includes('環境'))) return true;
 
@@ -2342,9 +2346,6 @@ function buildMainMenu() {
     },
   };
 }
-
-/** Quick Reply 觸發會勘填寫（勿與真人打字衝突） */
-const SITE_VISIT_QUICK_ACTION_FILL = '__SITE_VISIT_FILL__';
 
 function buildSiteVisitOfferQuickReply() {
   return {
@@ -3472,6 +3473,18 @@ async function handleEvent(event) {
 
     if (text === '取消' || text === '重新開始') { clearSession(userId); return reply(event, buildMainMenu()); }
 
+    if (text === SITE_VISIT_QUICK_ACTION_FILL) {
+      if (BOOKING_FLOW_STEPS_BLOCK_SITE_VISIT.has(step)) {
+        return reply(event, {
+          type: 'text',
+          text: '您目前正在預約流程中；若要改填會勘，請先輸入「取消」，再按「📋 填寫會勘資料」。',
+        });
+      }
+      clearSession(userId);
+      setSession(userId, 'siteVisitAwaiting', {});
+      return reply(event, { type: 'text', text: SITE_VISIT_GUIDE_REPLY });
+    }
+
     if (step === 'bookingVsSiteVisitChoose') {
       const qPick = text.trim();
       if (qPick === '會勘場地' || qPick === '①' || /^會勘場地/.test(qPick)) {
@@ -3488,10 +3501,6 @@ async function handleEvent(event) {
     }
 
     if (step === 'siteVisitPrompt') {
-      if (text === SITE_VISIT_QUICK_ACTION_FILL) {
-        setSession(userId, 'siteVisitAwaiting', {});
-        return reply(event, { type: 'text', text: SITE_VISIT_GUIDE_REPLY });
-      }
       if (text === '選單' || text === 'menu') {
         clearSession(userId);
         return reply(event, buildMainMenu());
