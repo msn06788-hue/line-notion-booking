@@ -9,6 +9,7 @@
  * - 客戶層級：NOTION_CUSTOMER_DATABASE_ID、客戶層級、可選臨時價格倍率；另有 GLOBAL_PRICE_MULTIPLIER、蓁愛表 JSON（見程式內註解）
  * - 客戶電話：名冊庫建議「電話」欄（類型：電話）；NOTION_CUSTOMER_PHONE_PROPERTY（預設 聯絡電話）。曾留號會寫回名冊，下次預約不重複詢問
  * - 場地會勘：命中意圖後先給 Quick Reply（填會勘資料／價目／主選單）；送出後寫入預約庫 NOTION_DATABASE_ID，預約類型選項預設「會勘場地」（NOTION_SITE_VISIT_BOOKING_TYPE_SELECT）；預約時段選項見 NOTION_SITE_VISIT_BOOKING_SLOT_SELECT。「我要預約」與勘場／會勘意圖並存時先詢問「會勘場地／預約場地」
+ * - Meta Messenger（Facebook 粉專）：GET/POST /webhook/messenger（訂閱驗證；收 messaging）。身分鍵為 m:+PSID，會勘流程與 LINE 共用；正式選日期／時段走 LINE_OA_BOOKING_URL。環境變數：MESSENGER_PAGE_ACCESS_TOKEN、MESSENGER_VERIFY_TOKEN、可選 MESSENGER_APP_SECRET（驗證 X-Hub-Signature-256）
  * - 活動／課程押金：VENUE_ACTIVITY_DEPOSIT_NT（預設 3000）；講座／其他不收；蓁愛講師免押金
  */
 const express = require('express');
@@ -80,6 +81,12 @@ const PAYMENT_NOTE_URL = (process.env.PAYMENT_INFO_NOTION_URL || '').trim();
 /** 手機上較容易喚起 Google Maps App 的格式：…/maps/dir/?api=1&destination=25.033,121.565 或 destination=編碼後的地址（勿用 share.google 短鍵若要在 App 開） */
 const NAV_GOOGLE_MAPS_URI = (process.env.NAV_GOOGLE_MAPS_URI || 'https://share.google/scBlKep6NLkHHNwsQ').trim();
 const NAV_APPLE_MAPS_URI = (process.env.NAV_APPLE_MAPS_URI || '').trim();
+/** Meta Messenger（粉專）：與 LINE 分流會勘／預約；預約完整選時段建議走 LINE_OA_BOOKING_URL */
+const MESSENGER_PAGE_ACCESS_TOKEN = (process.env.MESSENGER_PAGE_ACCESS_TOKEN || '').trim();
+const MESSENGER_VERIFY_TOKEN = (process.env.MESSENGER_VERIFY_TOKEN || '').trim();
+const MESSENGER_APP_SECRET = (process.env.MESSENGER_APP_SECRET || '').trim();
+/** 客人點「立即預約」時開啟的 LINE 官方帳號／預約連結（加好友或 liff 皆可） */
+const LINE_OA_BOOKING_URL = (process.env.LINE_OA_BOOKING_URL || process.env.LINE_OFFICIAL_URL || '').trim();
 /** 預訂後須於幾日內匯款（曆日倍數 24h），預設 3；最後 24h 會再推播催繳 */
 const PAYMENT_GRACE_DAYS = Math.min(Math.max(Number(process.env.PAYMENT_GRACE_DAYS) || 3, 1), 60);
 /** Notion 核取方塊：匯款最後提醒已送出（可選，若無此欄則改寫入 logs/unpaid-ultimatum-sent.ids） */
@@ -3530,7 +3537,7 @@ async function handleEvent(event) {
       const displayNameSv = await getLineDisplayName(userId);
       await notifyGroupSiteVisitRequest(userId, displayNameSv, phoneSv, parsedIsoSv, trimmedSv);
       await appendSiteVisitToNotion(userId, displayNameSv, trimmedSv, phoneSv, parsedIsoSv);
-      await persistKnownPhoneForUser(userId, phoneSv);
+      if (!String(userId).startsWith('m:')) await persistKnownPhoneForUser(userId, phoneSv);
       clearSession(userId);
       return reply(event, { type: 'text', text: SITE_VISIT_SUBMITTED_REPLY });
     }
@@ -4399,6 +4406,423 @@ async function scanAndNotifyPayments() {
     console.error('[收款通知] 掃描失敗:', e.message);
   }
 }
+
+// ── Meta Messenger（Facebook 粉專）──────────────────────────
+/** Session 與 LINE 共用 Map：Messenger 使用 userId = "m:"+PSID */
+function messengerUserId(psid) {
+  return 'm:' + String(psid || '');
+}
+
+function verifyMessengerSignature(req) {
+  if (!MESSENGER_APP_SECRET) return true;
+  const sig = req.headers['x-hub-signature-256'];
+  if (!sig || typeof sig !== 'string' || !sig.startsWith('sha256=')) return false;
+  const received = sig.slice(7);
+  const crypto = require('crypto');
+  const buf = req.rawBody;
+  if (!buf || !Buffer.isBuffer(buf)) return false;
+  const expected = crypto.createHmac('sha256', MESSENGER_APP_SECRET).update(buf).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(received, 'hex'), Buffer.from(expected, 'hex'));
+  } catch (e) {
+    return false;
+  }
+}
+
+async function sendMessengerApi(psid, body) {
+  if (!MESSENGER_PAGE_ACCESS_TOKEN) {
+    appendBotLog('[Messenger] 未設定 MESSENGER_PAGE_ACCESS_TOKEN');
+    return false;
+  }
+  const url =
+    'https://graph.facebook.com/v21.0/me/messages?access_token=' + encodeURIComponent(MESSENGER_PAGE_ACCESS_TOKEN);
+  const payload = Object.assign({ recipient: { id: psid }, messaging_type: 'RESPONSE' }, body);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      appendBotLog('[Messenger] Graph API ' + res.status + ' ' + JSON.stringify(j).slice(0, 500));
+      return false;
+    }
+    return true;
+  } catch (e) {
+    appendBotLog('[Messenger] 傳送失敗 ' + e.message);
+    return false;
+  }
+}
+
+async function sendMessengerText(psid, text) {
+  const t = String(text || '').slice(0, 2000);
+  return sendMessengerApi(psid, { message: { text: t } });
+}
+
+/** Quick Reply 每個 title 須 ≤20 字元（Meta 限制） */
+async function sendMessengerQuickText(psid, text, quickReplies) {
+  const qr = (quickReplies || []).slice(0, 13).map(function (q) {
+    return {
+      content_type: 'text',
+      title: String(q.title || '').slice(0, 20),
+      payload: String(q.payload || '').slice(0, 1000),
+    };
+  });
+  return sendMessengerApi(psid, { message: { text: String(text || '').slice(0, 2000), quick_replies: qr } });
+}
+
+async function getMessengerProfileName(psid) {
+  if (!MESSENGER_PAGE_ACCESS_TOKEN) return '';
+  try {
+    const url =
+      'https://graph.facebook.com/v21.0/' +
+      encodeURIComponent(psid) +
+      '?fields=name&access_token=' +
+      encodeURIComponent(MESSENGER_PAGE_ACCESS_TOKEN);
+    const res = await fetch(url);
+    const j = await res.json();
+    return j && j.name ? String(j.name) : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function buildMessengerPricePlainText(userId) {
+  const tierName = getTierDisplayName(userId);
+  const head =
+    tierName && getCustomerTier(userId) !== 'standard'
+      ? '👤 您的帳號適用「' + tierName + '」專屬價（以下已換算）。\n\n'
+      : '';
+  const u = userId;
+  const lines = [];
+  lines.push('敘事空域 💰 價目表');
+  lines.push('');
+  lines.push('📌 包場時段｜平日');
+  lines.push(
+    '早上 9:00~12:30　' +
+      formatPrice(getPriceForUser(u, 'fixed', 'morning', false)) +
+      '\n下午 13:30~17:00　' +
+      formatPrice(getPriceForUser(u, 'fixed', 'afternoon', false)) +
+      '\n晚上 18:00~21:30　' +
+      formatPrice(getPriceForUser(u, 'fixed', 'evening', false)) +
+      '\n全天包場（8小時）　' +
+      formatPrice(getPriceForUser(u, 'fixed', 'fullday', false))
+  );
+  lines.push('');
+  lines.push('📌 包場時段｜假日');
+  lines.push(
+    '早上 9:00~12:30　' +
+      formatPrice(getPriceForUser(u, 'fixed', 'morning', true)) +
+      '\n下午 13:30~17:00　' +
+      formatPrice(getPriceForUser(u, 'fixed', 'afternoon', true)) +
+      '\n晚上 18:00~21:30　' +
+      formatPrice(getPriceForUser(u, 'fixed', 'evening', true)) +
+      '\n全天包場（8小時）　' +
+      formatPrice(getPriceForUser(u, 'fixed', 'fullday', true))
+  );
+  lines.push('');
+  lines.push('⏰ 單一鐘點（每小時）｜平日');
+  lines.push(
+    '早上　' +
+      formatPrice(getPriceForUser(u, 'hourly', 'morning', false)) +
+      '　下午　' +
+      formatPrice(getPriceForUser(u, 'hourly', 'afternoon', false)) +
+      '　晚上　' +
+      formatPrice(getPriceForUser(u, 'hourly', 'evening', false))
+  );
+  lines.push('假日');
+  lines.push(
+    '早上　' +
+      formatPrice(getPriceForUser(u, 'hourly', 'morning', true)) +
+      '　下午　' +
+      formatPrice(getPriceForUser(u, 'hourly', 'afternoon', true)) +
+      '　晚上　' +
+      formatPrice(getPriceForUser(u, 'hourly', 'evening', true))
+  );
+  lines.push('');
+  lines.push('※ 24小時內請電話：' + CONTACT_PHONE);
+  lines.push('※ 休息換場：12:30~13:30、17:00~18:00');
+  return head + lines.join('\n');
+}
+
+function formatMessengerBookingsPlain(pages) {
+  if (!pages || pages.length === 0) return '目前沒有未來的預約紀錄（以本對話身分查詢）。\n\n正式租場若走 LINE 完成，請在 LINE 開「我的預約」。\n\n📞 ' + CONTACT_PHONE;
+  const lines = pages.map(function (p) {
+    const date = (p.properties['預約日期']?.date?.start || '').split('T')[0];
+    const slot = p.properties['預約時段']?.select?.name || '';
+    const price = p.properties['金額']?.number || 0;
+    const slotType = p.properties['預約類型']?.select?.name || '';
+    const payStatus = p.properties['付款狀態']?.select?.name || '未付款';
+    return '📌 ' + date + '｜' + slotType + '\n時段：' + slot + '\n金額：' + formatPrice(price) + '｜' + payStatus;
+  });
+  return '您的預約（本對話／Notion 身分）：\n\n' + lines.join('\n\n') + '\n\n改期／取消請致電或至 LINE「我的預約」操作。\n📞 ' + CONTACT_PHONE;
+}
+
+function siteVisitGuideMessenger() {
+  return SITE_VISIT_GUIDE_REPLY.replace(/LINE 顯示名稱/g, 'Facebook 顯示名稱');
+}
+
+async function sendMessengerBookingDeepLink(psid) {
+  if (LINE_OA_BOOKING_URL) {
+    await sendMessengerApi(psid, {
+      message: {
+        attachment: {
+          type: 'template',
+          payload: {
+            template_type: 'button',
+            text:
+              '選日期與時段與 LINE 版相同。請點下方開啟 LINE 完成預約；會勘可在對話直接填寫。',
+            buttons: [{ type: 'web_url', url: LINE_OA_BOOKING_URL, title: '開啟 LINE 預約', webview_height_ratio: 'full' }],
+          },
+        },
+      },
+    });
+  } else {
+    await sendMessengerText(
+      psid,
+      '請加入我們 LINE 官方帳號，輸入「立即預約」即可選日期與時段。\n\n📞 ' + CONTACT_PHONE
+    );
+  }
+}
+
+async function sendMessengerMainMenu(psid) {
+  await sendMessengerQuickText(psid, '謝謝您聯繫我們 🏛️\n請選擇：', [
+    { title: '立即預約', payload: 'BOOKING' },
+    { title: '價目表', payload: 'PRICE' },
+    { title: '會勘', payload: 'SITE_VISIT_ENTRY' },
+    { title: '我的預約', payload: 'MY_BOOKING' },
+  ]);
+}
+
+async function sendMessengerSiteVisitEntryOffer(psid) {
+  await sendMessengerQuickText(psid, buildSiteVisitEntryOffer().text, [
+    { title: '填寫會勘', payload: 'SITE_VISIT_FILL' },
+    { title: '價目表', payload: 'PRICE' },
+    { title: '主選單', payload: 'MENU' },
+  ]);
+}
+
+async function sendMessengerSiteVisitNudge(psid) {
+  await sendMessengerQuickText(
+    psid,
+    '請點「填寫會勘」開始；想看費用點「價目表」，或「主選單」返回。',
+    [
+      { title: '填寫會勘', payload: 'SITE_VISIT_FILL' },
+      { title: '價目表', payload: 'PRICE' },
+      { title: '主選單', payload: 'MENU' },
+    ]
+  );
+}
+
+async function processMessengerPostback(psid, payload) {
+  const p = String(payload || '');
+  if (p === 'GET_STARTED' || p.startsWith('GET_STARTED')) {
+    await sendMessengerText(
+      psid,
+      '很高興認識您，歡迎來到敘事空域 🏛️\n\n• 「立即預約」— 開啟 LINE 選日期／時段（與 LINE 版相同）\n• 「會勘」— 現場看場、留資料\n• 「價目表」— 費用摘要'
+    );
+    await sendMessengerMainMenu(psid);
+  }
+}
+
+async function processMessengerText(psid, text, quickPayload) {
+  const userId = messengerUserId(psid);
+  const t = (text || '').trim();
+  const qp = (quickPayload || '').trim();
+  const step = getStep(userId);
+
+  function isPriceIntentMessage(msg) {
+    return (
+      msg === '價目表' ||
+      msg === '價目指南' ||
+      msg === '查看價目' ||
+      msg === '查看費用' ||
+      msg === '費用' ||
+      msg === '報價' ||
+      (msg.includes('價目') && msg.length <= 20)
+    );
+  }
+  function isStartBookingIntentMessage(msg) {
+    return (
+      msg === '立即預約' ||
+      msg === '預約' ||
+      msg === '我要預約' ||
+      msg === '開始預約' ||
+      msg === '預約場地' ||
+      /立即預約/.test(msg)
+    );
+  }
+
+  if (t === '取消' || t === '重新開始') {
+    clearSession(userId);
+    return sendMessengerMainMenu(psid);
+  }
+
+  if (
+    qp === 'SITE_VISIT_FILL' ||
+    t === SITE_VISIT_QUICK_ACTION_FILL ||
+    t === '填寫會勘' ||
+    t === '填寫會勘資料' ||
+    t === '📋 填寫會勘資料'
+  ) {
+    if (BOOKING_FLOW_STEPS_BLOCK_SITE_VISIT.has(step)) {
+      return sendMessengerText(
+        psid,
+        '您目前正在預約相關步驟；若要改填會勘，請先輸入「取消」再按「填寫會勘」。\n（完整選日期請使用 LINE。）'
+      );
+    }
+    clearSession(userId);
+    setSession(userId, 'siteVisitAwaiting', {});
+    return sendMessengerText(psid, siteVisitGuideMessenger());
+  }
+
+  if (qp === 'PRICE' || qp === 'MENU' || qp === 'BOOKING' || qp === 'SITE_VISIT_ENTRY' || qp === 'MY_BOOKING') {
+    if (qp === 'PRICE') return sendMessengerText(psid, buildMessengerPricePlainText(userId));
+    if (qp === 'MENU') return sendMessengerMainMenu(psid);
+    if (qp === 'BOOKING') return sendMessengerBookingDeepLink(psid);
+    if (qp === 'SITE_VISIT_ENTRY') {
+      clearSession(userId);
+      setSession(userId, 'siteVisitPrompt', {});
+      return sendMessengerSiteVisitEntryOffer(psid);
+    }
+    if (qp === 'MY_BOOKING') {
+      const pagesMb = await getUserBookings(userId);
+      return sendMessengerText(psid, formatMessengerBookingsPlain(pagesMb));
+    }
+  }
+
+  if (step === 'bookingVsSiteVisitChoose') {
+    const qPick = t;
+    if (qPick === '會勘場地' || qPick === '①' || /^會勘場地/.test(qPick)) {
+      clearSession(userId);
+      setSession(userId, 'siteVisitPrompt', {});
+      return sendMessengerSiteVisitEntryOffer(psid);
+    }
+    if (qPick === '預約場地' || qPick === '②' || /^預約場地/.test(qPick)) {
+      clearSession(userId);
+      return sendMessengerBookingDeepLink(psid);
+    }
+    return sendMessengerText(psid, BOOKING_VS_SITE_VISIT_BOGUS);
+  }
+
+  if (step === 'siteVisitPrompt') {
+    if (t === '選單' || t === 'menu') {
+      clearSession(userId);
+      return sendMessengerMainMenu(psid);
+    }
+    if (isPriceIntentMessage(t)) return sendMessengerText(psid, buildMessengerPricePlainText(userId));
+    return sendMessengerSiteVisitNudge(psid);
+  }
+
+  if (step === 'siteVisitAwaiting') {
+    const trimmedSv = t;
+    if (!trimmedSv) {
+      return sendMessengerText(
+        psid,
+        '請貼上「電話」與「會勘時間」（姓名會用您的 Facebook 名稱）。\n也可再輸入「會勘」看說明。'
+      );
+    }
+    const phoneSv = extractTaiwanMobileFromSiteVisitText(trimmedSv);
+    const parsedIsoSv = parseSiteVisitLooseDateTime(trimmedSv);
+    if (!phoneSv) return sendMessengerText(psid, SITE_VISIT_REJECT_NO_PHONE);
+    if (!parsedIsoSv) return sendMessengerText(psid, SITE_VISIT_REJECT_NO_TIME);
+    const displayNameSv = (await getMessengerProfileName(psid)) || '會勘客人';
+    await notifyGroupSiteVisitRequest(userId, displayNameSv, phoneSv, parsedIsoSv, trimmedSv);
+    await appendSiteVisitToNotion(userId, displayNameSv, trimmedSv, phoneSv, parsedIsoSv);
+    clearSession(userId);
+    return sendMessengerText(psid, SITE_VISIT_SUBMITTED_REPLY);
+  }
+
+  if (step !== 'inputCode' && needsBookingVsSiteVisitClarification(t, step)) {
+    clearSession(userId);
+    setSession(userId, 'bookingVsSiteVisitChoose', {});
+    return sendMessengerText(psid, BOOKING_VS_SITE_VISIT_PROMPT);
+  }
+
+  if (step !== 'inputCode' && !BOOKING_FLOW_STEPS_BLOCK_SITE_VISIT.has(step) && matchesSiteVisitIntent(t)) {
+    clearSession(userId);
+    setSession(userId, 'siteVisitPrompt', {});
+    return sendMessengerSiteVisitEntryOffer(psid);
+  }
+
+  if (isStartBookingIntentMessage(t)) return sendMessengerBookingDeepLink(psid);
+  if (isPriceIntentMessage(t)) return sendMessengerText(psid, buildMessengerPricePlainText(userId));
+  if (t === '選單' || t === 'menu') return sendMessengerMainMenu(psid);
+
+  if (t === '我的預約') {
+    const pages = await getUserBookings(userId);
+    return sendMessengerText(psid, formatMessengerBookingsPlain(pages));
+  }
+
+  const faqIdle = guestFaqIfHit(t);
+  if (faqIdle) return sendMessengerText(psid, faqIdle);
+
+  return sendMessengerMainMenu(psid);
+}
+
+async function processMessengerMessagingEvent(ev) {
+  const psid = ev.sender && ev.sender.id;
+  if (!psid) return;
+  if (ev.message && ev.message.is_echo) return;
+  const userId = messengerUserId(psid);
+  try {
+    await resolveCustomerTier(userId);
+  } catch (e) {
+    /* ignore */
+  }
+  if (ev.postback && ev.postback.payload) {
+    await processMessengerPostback(psid, ev.postback.payload);
+    return;
+  }
+  if (ev.message && ev.message.text != null) {
+    const text = String(ev.message.text).trim();
+    const qp = ev.message.quick_reply && ev.message.quick_reply.payload;
+    await processMessengerText(psid, text, qp);
+  }
+}
+
+const messengerBodyParser = express.json({
+  verify: function (req, res, buf) {
+    req.rawBody = buf;
+  },
+});
+
+app.get('/webhook/messenger', (req, res) => {
+  if (!MESSENGER_VERIFY_TOKEN) return res.status(503).send('Messenger verify token not configured');
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === MESSENGER_VERIFY_TOKEN && challenge) {
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+app.post('/webhook/messenger', messengerBodyParser, (req, res) => {
+  if (!MESSENGER_PAGE_ACCESS_TOKEN) return res.status(503).json({ ok: false, error: 'MESSENGER_PAGE_ACCESS_TOKEN not set' });
+  if (!verifyMessengerSignature(req)) {
+    appendBotLog('[Messenger] X-Hub-Signature-256 驗證失敗');
+    return res.status(403).send('Forbidden');
+  }
+  const body = req.body || {};
+  if (body.object !== 'page') return res.sendStatus(404);
+  res.sendStatus(200);
+  setImmediate(function () {
+    const tasks = [];
+    for (const entry of body.entry || []) {
+      for (const ev of entry.messaging || []) {
+        tasks.push(
+          processMessengerMessagingEvent(ev).catch(function (err) {
+            console.error('[Messenger]', err);
+            appendBotLog('[Messenger] ' + (err && err.message));
+          })
+        );
+      }
+    }
+    Promise.all(tasks).catch(function () {});
+  });
+});
 
 // ── Webhook ───────────────────────────────────────────────
 // Cron Job 路由
